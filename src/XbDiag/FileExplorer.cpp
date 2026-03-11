@@ -1451,12 +1451,8 @@ static void FtpTick()
         }
         else
         {
-            // Send buffer near full — probe for disconnect even while paused.
-            // A zero-byte recv just checks if the socket is still alive.
-            char probe[1];
-            int n = recv(s_ftp.ctrlSock, probe, 0, 0);
-            if (n == 0 || (n < 0 && WSAGetLastError() != WSAEWOULDBLOCK))
-                goto ctrl_disconnect;
+            // Send buffer near full — skip recv this tick, drain loop will
+            // clear space. Commands already in recvBuf still get parsed below.
         }
 
         // Parse and dispatch all complete commands already in recvBuf.
