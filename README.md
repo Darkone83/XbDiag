@@ -1,3 +1,7 @@
+<center>
+<img src=" https://github.com/Darkone83/XbDiag/blob/main/img/logo.png" width=256 height=256> <img src="https://github.com/Darkone83/XbDiag/blob/main/img/DC%20logo.png" width=256 height=256>
+</center>
+
 # XbDiag
 
 **A hardware diagnostic suite for the original Xbox console.**
