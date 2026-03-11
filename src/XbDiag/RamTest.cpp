@@ -133,6 +133,14 @@ static TestState   s_testState = STATE_IDLE;
 static WORD        s_prevBtns = 0;
 static bool        s_skipFirstTick = true;
 
+// CSV export state — reset each time a new test starts
+static bool        s_exportDone = false;
+static bool        s_exportOK = false;
+
+// View toggle
+enum RamView { VIEW_MAIN = 0, VIEW_CHIPHELP };
+static RamView     s_view = VIEW_MAIN;
+
 // Quick test position
 static int         s_curBank = 0;
 static int         s_curChunk = 0;
@@ -201,6 +209,8 @@ static void ResetTest()
     s_failCount = 0;
     s_skipCount = 0;
     s_totalErrors = 0;
+    s_exportDone = false;
+    s_exportOK = false;
 }
 
 static void ResetStressBank()
@@ -233,6 +243,7 @@ void RamTest_OnEnter()
 
     ResetTest();
     s_testState = STATE_IDLE;
+    s_view = VIEW_MAIN;
 }
 
 // ============================================================================
@@ -567,6 +578,189 @@ static void StressTestStep()
 }
 
 // ============================================================================
+// ExportRamResult  — writes D:\ramresult.csv
+//
+// Only valid to call when s_testState == STATE_QUICK_DONE or STRESS_DONE.
+// CSV layout:
+//   Header rows with test metadata
+//   Column header: Bank,Chunk,StartMB,EndMB,State,Errors
+//   One row per chunk (all banks, all chunks up to s_chunksPerBank)
+//   Footer rows: summary totals
+// ============================================================================
+
+static void ExportRamResult()
+{
+    HANDLE hf = CreateFile(
+        "D:\\ramresult.csv",
+        GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    if (hf == INVALID_HANDLE_VALUE)
+    {
+        s_exportDone = true;
+        s_exportOK = false;
+        return;
+    }
+
+    char line[160];
+    DWORD written;
+
+    // Helper lambda-style: write one line + CRLF
+#define WLINE(s) do { \
+    DWORD _len = 0; \
+    const char* _p = (s); \
+    while (_p[_len]) _len++; \
+    WriteFile(hf, _p, _len, &written, NULL); \
+    WriteFile(hf, "\r\n", 2, &written, NULL); \
+} while(0)
+
+    // --- Metadata header ---
+    WLINE("XbDiag RAM Test Result");
+
+    bool isStress = (s_testState == STATE_STRESS_DONE);
+    WLINE(isStress ? "Test Type,Stress Soak" : "Test Type,Quick");
+
+    // Config
+    StrCat2(line, sizeof(line), "RAM Config,",
+        s_is128MB ? "128MB (4x32MB dual rank)" : "64MB (4x16MB single rank)");
+    WLINE(line);
+
+    // Total / avail
+    char mbBuf[12];
+    IntToStr((int)s_totalPhysMB, mbBuf, sizeof(mbBuf));
+    StrCat3(line, sizeof(line), "Total MB,", mbBuf, "");
+    WLINE(line);
+
+    IntToStr((int)s_availPhysMB, mbBuf, sizeof(mbBuf));
+    StrCat3(line, sizeof(line), "Available MB,", mbBuf, "");
+    WLINE(line);
+
+    // Stress-specific metadata
+    if (isStress)
+    {
+        char swBuf[8];
+        IntToStr(s_soakSweep, swBuf, sizeof(swBuf));
+        StrCat3(line, sizeof(line), "Sweeps Completed,", swBuf, "");
+        WLINE(line);
+
+        char errBuf[16];
+        UIntToStr(s_soakTotalErr, errBuf, sizeof(errBuf));
+        StrCat3(line, sizeof(line), "Total Errors (all sweeps),", errBuf, "");
+        WLINE(line);
+
+        // Duration
+        DWORD sec = s_soakDurationMs / 1000;
+        char mm[4], ss[4];
+        IntToStr((int)(sec / 60), mm, sizeof(mm));
+        IntToStr((int)(sec % 60), ss, sizeof(ss));
+        line[0] = 0;
+        StrCat2(line, sizeof(line), line, "Soak Duration,");
+        StrCat2(line, sizeof(line), line, mm);
+        StrCat2(line, sizeof(line), line, "m ");
+        StrCat2(line, sizeof(line), line, ss);
+        StrCat2(line, sizeof(line), line, "s");
+        WLINE(line);
+    }
+
+    WLINE("");
+
+    // --- Column header ---
+    WLINE("Bank,Chunk,Start MB,End MB,State,Errors");
+
+    // --- Per-chunk rows ---
+    DWORD chunkMB = s_is128MB ? 4 : 2;   // each chunk in MB
+    for (int b = 0; b < NUM_BANKS; ++b)
+    {
+        for (int c = 0; c < s_chunksPerBank; ++c)
+        {
+            const ChunkResult& cr = s_chunks[b][c];
+
+            const char* stateStr;
+            switch (cr.state)
+            {
+            case CHUNK_PASS:     stateStr = "PASS";     break;
+            case CHUNK_FAIL:     stateStr = "FAIL";     break;
+            case CHUNK_SKIPPED:  stateStr = "SKIPPED";  break;
+            case CHUNK_TESTING:  stateStr = "TESTING";  break;
+            default:             stateStr = "UNTESTED"; break;
+            }
+
+            // Start/end MB within the full 64/128MB space
+            DWORD bankBaseMB = (DWORD)b * (s_is128MB ? 32 : 16);
+            DWORD startMB = bankBaseMB + (DWORD)c * chunkMB;
+            DWORD endMB = startMB + chunkMB;
+
+            char bBuf[4], cBuf[4], sMB[8], eMB[8], eBuf[12];
+            IntToStr(b, bBuf, sizeof(bBuf));
+            IntToStr(c, cBuf, sizeof(cBuf));
+            IntToStr((int)startMB, sMB, sizeof(sMB));
+            IntToStr((int)endMB, eMB, sizeof(eMB));
+            UIntToStr(cr.errorCount, eBuf, sizeof(eBuf));
+
+            line[0] = 0;
+            StrCat2(line, sizeof(line), line, bBuf);
+            StrCat2(line, sizeof(line), line, ",");
+            StrCat2(line, sizeof(line), line, cBuf);
+            StrCat2(line, sizeof(line), line, ",");
+            StrCat2(line, sizeof(line), line, sMB);
+            StrCat2(line, sizeof(line), line, ",");
+            StrCat2(line, sizeof(line), line, eMB);
+            StrCat2(line, sizeof(line), line, ",");
+            StrCat2(line, sizeof(line), line, stateStr);
+            StrCat2(line, sizeof(line), line, ",");
+            StrCat2(line, sizeof(line), line, eBuf);
+            WLINE(line);
+        }
+    }
+
+    WLINE("");
+
+    // --- Summary footer ---
+    WLINE("--- Summary ---");
+
+    char cntBuf[12];
+    IntToStr(s_testedCount, cntBuf, sizeof(cntBuf));
+    StrCat3(line, sizeof(line), "Chunks Tested,", cntBuf, "");
+    WLINE(line);
+
+    IntToStr(s_passCount, cntBuf, sizeof(cntBuf));
+    StrCat3(line, sizeof(line), "Chunks Passed,", cntBuf, "");
+    WLINE(line);
+
+    IntToStr(s_failCount, cntBuf, sizeof(cntBuf));
+    StrCat3(line, sizeof(line), "Chunks Failed,", cntBuf, "");
+    WLINE(line);
+
+    IntToStr(s_skipCount, cntBuf, sizeof(cntBuf));
+    StrCat3(line, sizeof(line), "Chunks Skipped,", cntBuf, "");
+    WLINE(line);
+
+    UIntToStr(s_totalErrors, cntBuf, sizeof(cntBuf));
+    StrCat3(line, sizeof(line), "Total Bit Errors,", cntBuf, "");
+    WLINE(line);
+
+    bool pass = (s_failCount == 0);
+    WLINE(pass ? "Overall Result,PASS" : "Overall Result,FAIL");
+
+    WLINE("");
+
+    // --- Bank location guide ---
+    WLINE("--- Physical Bank Identification ---");
+    WLINE("RAM chips are arranged around the NV2A GPU (large center chip on the motherboard).");
+    WLINE("Clockwise from front-left: U1 (Bank 0)  U2 (Bank 1)  U3 (Bank 2)  U4 (Bank 3).");
+    WLINE("64MB:  4 chips total  1 chip per bank  (U1 U2 U3 U4).");
+    WLINE("128MB: 8 chips total  2 chips per bank (U1A+U1B  U2A+U2B  U3A+U3B  U4A+U4B).");
+    WLINE("128MB chunk mapping: chunks 0-7 = first chip (A)  chunks 8-15 = second chip (B).");
+    WLINE("A failing bank row in the grid directly maps to the chip(s) listed above.");
+
+#undef WLINE
+
+    CloseHandle(hf);
+    s_exportDone = true;
+    s_exportOK = true;
+}
+
+// ============================================================================
 // Input helper
 // ============================================================================
 
@@ -638,6 +832,162 @@ static DWORD ChunkColor(ChunkState st, bool activeFlash)
 }
 
 // ============================================================================
+// RenderChipHelp  — dedicated chip identification card
+// ============================================================================
+
+static void RenderChipHelp(const DiagLogo& logo)
+{
+    g_pDevice->BeginScene();
+
+    DrawPageChrome(logo, "MEMORY TEST  --  CHIP HELP", "[WHITE] / [B]  Back to Test");
+
+    const float X = LM;
+    const float STS = 1.15f;
+    const float SLH = LINE_H - 3.f;
+    const float DIAG_W = 340.f;          // width reserved for diagram column
+    const float NX = X + DIAG_W;      // notes column start
+
+    float y = CONTENT_Y + 6.f;
+
+    // ---- Title + config ----------------------------------------------------
+    DrawText(X, y, "CHIP IDENTIFICATION GUIDE", 1.3f, COL_YELLOW);
+    y += LINE_H;
+    DrawText(X, y, s_is128MB
+        ? "CONFIG : 128MB  4 banks x 32MB  2 chips/bank  (8 chips total)"
+        : "CONFIG : 64MB   4 banks x 16MB  1 chip/bank   (4 chips total)",
+        STS, COL_CYAN);
+    y += LINE_H;
+    HLine(y, X, SW - LM, COL_BORDER);
+    y += 6.f;
+
+    // ---- Diagram (left) + Notes (right) ------------------------------------
+    float dy = y;   // diagram y
+    float ny = y;   // notes y
+
+    // Diagram: chip boxes around GPU using FillRect
+    const float CX = X + 160.f;
+    const float BW = 60.f;
+    const float BH = 16.f;
+    const float GW = 80.f;
+    const float GH = 60.f;
+    const float GX = CX - GW * 0.5f;
+    const float GAP = 18.f;
+
+    // FRONT label
+    DrawText(CX - 24.f, dy, "FRONT", STS, COL_DIM);
+    dy += SLH;
+
+    // U1 (top)
+    FillRect(CX - BW * 0.5f, dy, CX + BW * 0.5f, dy + BH, D3DCOLOR_ARGB(80, 0, 180, 220));
+    DrawText(CX - 22.f, dy + 1.f, "U1  Bank 0", STS, COL_CYAN);
+    dy += BH + GAP;
+
+    // Middle row
+    float midY = dy;
+    // U4 (left)
+    FillRect(GX - GAP - BW, midY + (GH - BH) * 0.5f, GX - GAP, midY + (GH - BH) * 0.5f + BH,
+        D3DCOLOR_ARGB(80, 0, 180, 220));
+    DrawText(GX - GAP - BW + 4.f, midY + (GH - BH) * 0.5f + 1.f, "U4  B3", STS, COL_CYAN);
+    // GPU box
+    FillRect(GX, midY, GX + GW, midY + GH, D3DCOLOR_ARGB(50, 80, 80, 80));
+    HLine(midY, GX, GX + GW, COL_BORDER);
+    HLine(midY + GH, GX, GX + GW, COL_BORDER);
+    VLine(GX, midY, midY + GH, COL_BORDER);
+    VLine(GX + GW, midY, midY + GH, COL_BORDER);
+    DrawText(GX + 12.f, midY + 16.f, "NV2A", STS, COL_DIM);
+    DrawText(GX + 16.f, midY + 32.f, "GPU", STS, COL_DIM);
+    // U2 (right)
+    FillRect(GX + GW + GAP, midY + (GH - BH) * 0.5f, GX + GW + GAP + BW, midY + (GH - BH) * 0.5f + BH,
+        D3DCOLOR_ARGB(80, 0, 180, 220));
+    DrawText(GX + GW + GAP + 4.f, midY + (GH - BH) * 0.5f + 1.f, "U2  B1", STS, COL_CYAN);
+    dy += GH + GAP;
+
+    // U3 (bottom)
+    FillRect(CX - BW * 0.5f, dy, CX + BW * 0.5f, dy + BH, D3DCOLOR_ARGB(80, 0, 180, 220));
+    DrawText(CX - 22.f, dy + 1.f, "U3  Bank 2", STS, COL_CYAN);
+    dy += BH + SLH;
+
+    // REAR label
+    DrawText(CX - 22.f, dy, "REAR", STS, COL_DIM);
+    dy += SLH;
+
+    // Notes (right column)
+    DrawText(NX, ny, "RAM chips surround the NV2A GPU", STS, COL_WHITE);         ny += SLH;
+    DrawText(NX, ny, "(large center chip on the board).", STS, COL_WHITE);        ny += SLH;
+    DrawText(NX, ny, "U1 = front    U2 = right side", STS, COL_DIM);             ny += SLH;
+    DrawText(NX, ny, "U3 = rear     U4 = left side", STS, COL_DIM);              ny += LINE_H;
+
+    if (s_is128MB)
+    {
+        DrawText(NX, ny, "128MB: 2 chips per bank.", STS, COL_CYAN);              ny += SLH;
+        DrawText(NX, ny, "Chunks 0-7  = A chip (inner)", STS, COL_WHITE);         ny += SLH;
+        DrawText(NX, ny, "Chunks 8-15 = B chip (outer)", STS, COL_WHITE);         ny += LINE_H;
+        DrawText(NX, ny, "To narrow down A vs B:", STS, COL_DIM);                 ny += SLH;
+        DrawText(NX, ny, "check which chunk range has errors.", STS, COL_DIM);    ny += SLH;
+    }
+    else
+    {
+        DrawText(NX, ny, "64MB: 1 chip per bank.", STS, COL_CYAN);                ny += SLH;
+        DrawText(NX, ny, "Any fail = that bank's chip.", STS, COL_WHITE);          ny += LINE_H;
+        DrawText(NX, ny, "Multiple banks failing may", STS, COL_DIM);             ny += SLH;
+        DrawText(NX, ny, "indicate NV2A or power issue.", STS, COL_DIM);           ny += SLH;
+    }
+
+    // Advance past whichever column is taller
+    y = (dy > ny ? dy : ny) + 6.f;
+    HLine(y, X, SW - LM, COL_BORDER);
+    y += 5.f;
+
+    // ---- Full-width bank table ---------------------------------------------
+    const float TC_BNK = X;
+    const float TC_ADDR = X + 46.f;
+    const float TC_CHIP = X + 280.f;
+    const float TC_LOC = X + 348.f;
+    const float TC_DIAG = X + 490.f;
+
+    DrawText(TC_BNK, y, "BNK", STS, COL_DIM);
+    DrawText(TC_ADDR, y, "ADDRESS RANGE", STS, COL_DIM);
+    DrawText(TC_CHIP, y, "CHIP(S)", STS, COL_DIM);
+    DrawText(TC_LOC, y, "LOCATION", STS, COL_DIM);
+    DrawText(TC_DIAG, y, "IF FAILING", STS, COL_DIM);
+    y += SLH;
+    HLine(y, X, SW - LM, D3DCOLOR_XRGB(40, 44, 80));
+    y += 3.f;
+
+    struct BankRow { const char* range; const char* c64; const char* c128; const char* loc; const char* d64; const char* d128; };
+    BankRow rows[4];
+    rows[0] = { "0x00000000 - 0x0FFFFFFF", "U1", "U1A+U1B", "Front / near drive", "Replace U1", "0-7=U1A 8-15=U1B" };
+    rows[1] = { "0x10000000 - 0x1FFFFFFF", "U2", "U2A+U2B", "Right of GPU",       "Replace U2", "0-7=U2A 8-15=U2B" };
+    rows[2] = { "0x20000000 - 0x2FFFFFFF", "U3", "U3A+U3B", "Rear of GPU",        "Replace U3", "0-7=U3A 8-15=U3B" };
+    rows[3] = { "0x30000000 - 0x3FFFFFFF", "U4", "U4A+U4B", "Left of GPU",        "Replace U4", "0-7=U4A 8-15=U4B" };
+
+    for (int b = 0; b < NUM_BANKS; ++b)
+    {
+        bool hasFail = false;
+        for (int c = 0; c < s_chunksPerBank; ++c)
+            if (s_chunks[b][c].state == CHUNK_FAIL) { hasFail = true; break; }
+
+        if (hasFail || (b & 1))
+            FillRect(X - 4.f, y - 1.f, SW - LM + 4.f, y + SLH + 2.f,
+                hasFail ? D3DCOLOR_ARGB(35, 200, 20, 20) : D3DCOLOR_ARGB(18, 40, 60, 120));
+
+        DWORD ac = hasFail ? COL_RED : COL_CYAN;
+        DWORD dc = hasFail ? COL_RED : COL_DIM;
+        char  bl[3] = { 'B', (char)('0' + b), 0 };
+
+        DrawText(TC_BNK, y, bl, STS, ac);
+        DrawText(TC_ADDR, y, rows[b].range, STS, COL_CYAN);
+        DrawText(TC_CHIP, y, s_is128MB ? rows[b].c128 : rows[b].c64, STS, hasFail ? COL_RED : COL_WHITE);
+        DrawText(TC_LOC, y, rows[b].loc, STS, dc);
+        DrawText(TC_DIAG, y, s_is128MB ? rows[b].d128 : rows[b].d64, STS, dc);
+        y += SLH + 2.f;
+    }
+
+    g_pDevice->EndScene();
+    g_pDevice->Present(NULL, NULL, NULL, NULL);
+}
+
+// ============================================================================
 // Render
 // ============================================================================
 
@@ -652,8 +1002,12 @@ static void Render(const DiagLogo& logo)
         hints = "[B] Abort";
     else if (s_testState == STATE_IDLE)
         hints = "[A] Quick    [X] 15min Stress    [Y] 30min Stress    [B] Back";
+    else if (s_exportDone)
+        hints = s_exportOK
+        ? "[A] Quick    [X] 15min    [Y] 30min    [B] Back    Saved: D:\\ramresult.csv"
+        : "[A] Quick    [X] 15min    [Y] 30min    [B] Back    Export FAILED";
     else
-        hints = "[A] Quick    [X] 15min Stress    [Y] 30min Stress    [B] Back";
+        hints = "[A] Quick    [X] 15min Stress    [Y] 30min Stress    [BLACK] Export    [B] Back";
 
     DrawPageChrome(logo, "MEMORY TEST", hints);
 
@@ -926,6 +1280,7 @@ static void Render(const DiagLogo& logo)
         const float CELL_H = 38.f;
         const float CELL_PAD = 2.f;
         const float ROW_PAD = 8.f;
+        const float SLH = LINE_H - 2.f;
         bool        flash = ((GetTickCount() / 200) & 1) != 0;
         float       gridY = CONTENT_Y + 6.f + LH + 7.f;
 
@@ -1030,14 +1385,20 @@ static void Render(const DiagLogo& logo)
 
             if (s_is128MB)
             {
-                DrawText(GRID_LM, gy, "128MB: 2 chips/bank  Chunks 0-7=CHIP1  8-15=CHIP2",
+                DrawText(GRID_LM, gy,
+                    "128MB: 2 chips/bank  Chunks 0-7=CHIP1  8-15=CHIP2",
                     1.1f, COL_CYAN);
             }
             else
             {
-                DrawText(GRID_LM, gy, "64MB: 1 chip/bank  Any fail = that bank chip suspect",
+                DrawText(GRID_LM, gy,
+                    "64MB: 1 chip/bank  Any fail = that bank chip suspect",
                     1.1f, COL_CYAN);
             }
+            gy += SLH + 2.f;
+            DrawText(GRID_LM, gy,
+                "[WHITE] Chip Help  -- bank locations and diagnosis guide",
+                1.05f, COL_YELLOW);
         }
     }
 
@@ -1085,6 +1446,34 @@ void RamTest_Tick(const DiagLogo& logo)
         }
         s_prevBtns = cur;
         return;
+    }
+
+    // [WHITE] Toggle chip help card (available any time)
+    if (EdgeDown(cur, s_prevBtns, BTN_WHITE))
+    {
+        s_view = (s_view == VIEW_MAIN) ? VIEW_CHIPHELP : VIEW_MAIN;
+        s_prevBtns = cur;
+        if (s_view == VIEW_CHIPHELP) { RenderChipHelp(logo); return; }
+        Render(logo);
+        return;
+    }
+
+    // On chip help card: only B or WHITE closes it — no other input processed
+    if (s_view == VIEW_CHIPHELP)
+    {
+        if (EdgeDown(cur, s_prevBtns, BTN_B))
+            s_view = VIEW_MAIN;
+        s_prevBtns = cur;
+        RenderChipHelp(logo);
+        return;
+    }
+
+    // [BLACK] Export CSV — only when a test is done and not yet exported
+    if (EdgeDown(cur, s_prevBtns, BTN_BLACK))
+    {
+        bool done = (s_testState == STATE_QUICK_DONE || s_testState == STATE_STRESS_DONE);
+        if (done && !s_exportDone)
+            ExportRamResult();
     }
 
     // [A] Quick test
@@ -1138,5 +1527,8 @@ void RamTest_Tick(const DiagLogo& logo)
     else if (s_testState == STATE_STRESS)
         StressTestStep();
 
-    Render(logo);
+    if (s_view == VIEW_CHIPHELP)
+        RenderChipHelp(logo);
+    else
+        Render(logo);
 }

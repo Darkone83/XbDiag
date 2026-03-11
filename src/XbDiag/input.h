@@ -51,8 +51,9 @@ WORD GetButtons();
 //   rx,ry = right stick  (-32768 .. 32767)
 void GetSticks(int& lx, int& ly, int& rx, int& ry);
 
-// Returns raw analog button values (0..255) for triggers and black/white.
-void GetTriggers(int& lt, int& rt, int& black, int& white);
+// Returns raw analog button values (0..255) for triggers, black/white, and face buttons.
+void GetTriggers(int& lt, int& rt, int& black, int& white,
+    int& btnA, int& btnB, int& btnX, int& btnY);
 
 // Sets rumble motors on the first connected pad.
 //   left  = left  (low-frequency) motor  0..65535

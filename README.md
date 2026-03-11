@@ -22,8 +22,8 @@ XbDiag is a native RXDK application that runs directly on an original Xbox hardw
 | 04 | **Temp Monitor** | Live CPU and board temperatures via ADM1032 (rev 1.0–1.5) or PIC/Xcalibur (rev 1.6), with scrolling history graph |
 | 05 | **EEPROM Viewer** | Full 256-byte EEPROM decode — serial number, region, HDD key, LAN MAC, confounder, checksum, and binary export |
 | 06 | **Video Info** | Encoder type and chip ID (Conexant/Focus/Xcalibur), AV pack type, backbuffer resolution, refresh rate |
-| 07 | **HDD Info** | ATA IDENTIFY — model, serial, firmware revision, capacity (LBA28/LBA48), UDMA mode, security lock state, export to TXT |
-| 08 | **Controller Test** | Digital buttons, analog sticks, triggers, Black/White — live visualizer plus a dedicated rumble motor subcard |
+| 07 | **HDD Info** | ATA IDENTIFY — model, serial, firmware revision, capacity (LBA28/LBA48), UDMA mode, security lock state, export to TXT, also includes SMART support |
+| 08 | **Controller Test** | Digital buttons (including analog pressure), analog sticks, triggers, Black/White — live visualizer plus a dedicated rumble motor subcard |
 | 09 | **About** | Version info, credits, fun Xbox hardware facts ticker |
 
 ---
@@ -64,8 +64,11 @@ Place the built `default.xbe` and the `tex\` folder together in the same directo
 Diagnostic output files written by the tool
 
 ```
-\eeprom.bin   (written by EEPROM Viewer export)
-\hddinfo.txt  (written by HDD Info export)
+\eeprom.bin    (written by EEPROM Viewer export)
+\hddinfo.txt   (written by HDD Info export)
+\sysinfo.txt   (written by System Info export)
+\smart.txt     (written by HDD Info SMART export)
+\ramresult.csv (written by RAM Test export)
 ```
 
 ---
@@ -128,4 +131,9 @@ XbDiag uses software-shifted 8-bit addresses (hardware 7-bit address left-shifte
 
 Built by **Team Resurgent** and **Darkone83**.
 
-SMBus address conventions and HAL usage cross-referenced against [PrometheOS](https://github.com/Team-Resurgent/PrometheOS) by Team Resurgent, the authoritative reference for Xbox kernel HAL usage.
+Additional credits:
+
+Team Resurgent X Equinox [PrometheOSxbe]
+Rocky5 [XBMC4Gamers-source]
+
+These sources were referenced for various functions through out XbDiag to ensure compability

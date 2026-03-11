@@ -306,7 +306,9 @@ static void RenderRumble(const DiagLogo& logo, int lt, int rt)
 // ============================================================================
 
 static void Render(const DiagLogo& logo, WORD cur,
-    int lx, int ly, int rx, int ry, int lt, int rt)
+    int lx, int ly, int rx, int ry,
+    int lt, int rt, int blk, int wht,
+    int btnA, int btnB, int btnX, int btnY)
 {
     float B = CONTENT_Y;  // base Y
 
@@ -338,10 +340,21 @@ static void Render(const DiagLogo& logo, WORD cur,
 
     // BLACK and WHITE centered around X_MID + 80
     float metaRCX = X_MID + 90.f;
-    Box(metaRCX - WBW * 0.5f - 4.f, metaY,
-        WBW, WBH, "BLK", 1.1f, (cur & BTN_BLACK) != 0);
-    Box(metaRCX + WBW * 0.5f + 4.f, metaY,
-        WBW, WBH, "WHT", 1.1f, (cur & BTN_WHITE) != 0);
+    float blkCX = metaRCX - WBW * 0.5f - 4.f;
+    float whtCX = metaRCX + WBW * 0.5f + 4.f;
+    Box(blkCX, metaY, WBW, WBH, "BLK", 1.1f, (cur & BTN_BLACK) != 0);
+    Box(whtCX, metaY, WBW, WBH, "WHT", 1.1f, (cur & BTN_WHITE) != 0);
+
+    // Analog value readout below BLACK/WHITE
+    {
+        char bv[5], wv[5];
+        IntToStr(blk, bv, sizeof(bv));
+        IntToStr(wht, wv, sizeof(wv));
+        DWORD bc = blk > 30 ? COL_CYAN : COL_DIM;
+        DWORD wc = wht > 30 ? COL_CYAN : COL_DIM;
+        DrawText(blkCX - TW(bv, 1.05f) * 0.5f, metaY + WBH * 0.5f + 4.f, bv, 1.05f, bc);
+        DrawText(whtCX - TW(wv, 1.05f) * 0.5f, metaY + WBH * 0.5f + 4.f, wv, 1.05f, wc);
+    }
 
     // =========================================================
     // ANALOG STICKS  — one third from each side
@@ -399,6 +412,24 @@ static void Render(const DiagLogo& logo, WORD cur,
     Box(fCX - BW - BG, fY, BW, BH, "X", 1.2f, (cur & BTN_X) != 0);
     Box(fCX + BW + BG, fY, BW, BH, "B", 1.2f, (cur & BTN_B) != 0);
 
+    // Analog value readout next to each face button
+    {
+        char va[5], vb[5], vx[5], vy[5];
+        IntToStr(btnA, va, sizeof(va));
+        IntToStr(btnB, vb, sizeof(vb));
+        IntToStr(btnX, vx, sizeof(vx));
+        IntToStr(btnY, vy, sizeof(vy));
+        const float VS = 1.0f;
+        DWORD ca = btnA > 30 ? COL_GREEN : COL_DIM;
+        DWORD cb = btnB > 30 ? COL_RED : COL_DIM;
+        DWORD cx = btnX > 30 ? COL_CYAN : COL_DIM;
+        DWORD cy = btnY > 30 ? COL_YELLOW : COL_DIM;
+        DrawText(fCX + BW + BG + 4.f, fY + BH + BG - 5.f, va, VS, ca);
+        DrawText(fCX - BW - BG - TW(vy, VS), fY - BH - BG - 5.f, vy, VS, cy);
+        DrawText(fCX - BW - BG - BW * 0.5f - TW(vx, VS), fY - 5.f, vx, VS, cx);
+        DrawText(fCX + BW + BG + BW * 0.5f + 4.f, fY - 5.f, vb, VS, cb);
+    }
+
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
@@ -414,8 +445,8 @@ void ControllerTest_Tick(const DiagLogo& logo)
     int lx, ly, rx, ry;
     GetSticks(lx, ly, rx, ry);
 
-    int lt, rt, blk, wht;
-    GetTriggers(lt, rt, blk, wht);
+    int lt, rt, blk, wht, btnA, btnB, btnX, btnY;
+    GetTriggers(lt, rt, blk, wht, btnA, btnB, btnX, btnY);
 
     // ── Rumble subcard ──────────────────────────────────────────────────────
     if (s_rumbleMode)
@@ -469,5 +500,5 @@ void ControllerTest_Tick(const DiagLogo& logo)
     }
 
     s_prev = cur;
-    Render(logo, cur, lx, ly, rx, ry, lt, rt);
+    Render(logo, cur, lx, ly, rx, ry, lt, rt, blk, wht, btnA, btnB, btnX, btnY);
 }

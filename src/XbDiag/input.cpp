@@ -173,11 +173,12 @@ void GetSticks(int& lx, int& ly, int& rx, int& ry)
 }
 
 // -----------------------------------------------------------------------------
-// GetTriggers – returns raw 0..255 analog values for LT/RT/Black/White
+// GetTriggers – returns raw 0..255 analog values for all analog buttons
 // -----------------------------------------------------------------------------
-void GetTriggers(int& lt, int& rt, int& black, int& white)
+void GetTriggers(int& lt, int& rt, int& black, int& white,
+    int& btnA, int& btnB, int& btnX, int& btnY)
 {
-    lt = rt = black = white = 0;
+    lt = rt = black = white = btnA = btnB = btnX = btnY = 0;
 
     for (int i = 0; i < MAX_PORTS; ++i)
     {
@@ -189,6 +190,10 @@ void GetTriggers(int& lt, int& rt, int& black, int& white)
         rt = a[XINPUT_GAMEPAD_RIGHT_TRIGGER];
         black = a[XINPUT_GAMEPAD_BLACK];
         white = a[XINPUT_GAMEPAD_WHITE];
+        btnA = a[XINPUT_GAMEPAD_A];
+        btnB = a[XINPUT_GAMEPAD_B];
+        btnX = a[XINPUT_GAMEPAD_X];
+        btnY = a[XINPUT_GAMEPAD_Y];
         return;
     }
 }

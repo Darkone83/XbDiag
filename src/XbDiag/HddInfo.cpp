@@ -78,7 +78,13 @@ static const int MSTATE_MENU = 0;
 #define ATA_SR_DRQ      0x08
 #define ATA_SR_ERR      0x01
 
-#define ATA_CMD_IDENTIFY 0xEC
+#define ATA_CMD_IDENTIFY  0xEC
+#define ATA_CMD_SMART     0xB0
+#define SMART_SUBCMD_READ 0xD0   // SMART READ DATA — 512 bytes, 30 attributes
+#define SMART_LBA_MID     0x4F   // magic values required by ATA spec for SMART
+#define SMART_LBA_HI      0xC2
+#define SMART_MAX_ATTRS   30
+#define SMART_ATTR_SIZE   12     // bytes per attribute entry in the 512-byte blob
 
 // ============================================================================
 // Layout
@@ -129,11 +135,22 @@ struct HddData
     // Export
     bool  exportDone;
     bool  exportOK;
+
+    // SMART
+    bool  smartSupported;    // word 82 bit 0 from IDENTIFY
+    bool  smartOK;           // SMART READ DATA succeeded
+    bool  smartExportDone;
+    bool  smartExportOK;
+    BYTE  smartBuf[512];     // raw SMART READ DATA response
 };
+
+// View toggle — Info (drive + EEPROM) or SMART attribute table
+enum HddView { VIEW_INFO = 0, VIEW_SMART };
 
 static HddData s_data;
 static WORD    s_prevBtns;
 static bool    s_loaded;
+static HddView s_view;
 
 // ============================================================================
 // Helpers
@@ -235,6 +252,144 @@ static bool AtaIdentify(WORD buf[256])
         buf[i] = w;
     }
     return true;
+}
+
+// Issue ATA SMART READ DATA (0xB0 / 0xD0) — fills buf[512].
+// Returns false if drive NAKs, times out, or SMART is not supported.
+static bool SmartReadData(BYTE buf[512])
+{
+    // Select master drive (same as AtaIdentify)
+    BYTE devsel = 0xA0;
+    __asm { mov dx, ATA_REG_DEVICE }
+    __asm { mov al, devsel         }
+    __asm { out dx, al             }
+
+    // Settle: 5 status reads
+    for (int i = 0; i < 5; ++i)
+    {
+        BYTE dummy = 0;
+        __asm { mov dx, ATA_REG_STATUS }
+        __asm { in  al, dx             }
+        __asm { mov dummy, al          }
+    }
+
+    if (!AtaWaitReady(2000)) return false;
+
+    // Feature register (0x1F1 write) = SMART subcommand 0xD0
+    BYTE feat = SMART_SUBCMD_READ;
+    __asm { mov dx, ATA_REG_ERROR }
+    __asm { mov al, feat          }
+    __asm { out dx, al            }
+
+    // Sector count = 0
+    BYTE zero = 0;
+    __asm { mov dx, ATA_REG_NSECT }
+    __asm { mov al, zero          }
+    __asm { out dx, al            }
+
+    // LBA low = 0
+    __asm { mov dx, ATA_REG_LBAL }
+    __asm { mov al, zero         }
+    __asm { out dx, al           }
+
+    // LBA mid = 0x4F (SMART magic, required by ATA spec)
+    BYTE lbam = SMART_LBA_MID;
+    __asm { mov dx, ATA_REG_LBAM }
+    __asm { mov al, lbam         }
+    __asm { out dx, al           }
+
+    // LBA high = 0xC2 (SMART magic, required by ATA spec)
+    BYTE lbah = SMART_LBA_HI;
+    __asm { mov dx, ATA_REG_LBAH }
+    __asm { mov al, lbah         }
+    __asm { out dx, al           }
+
+    // Issue SMART command
+    BYTE cmd = ATA_CMD_SMART;
+    __asm { mov dx, ATA_REG_CMD }
+    __asm { mov al, cmd         }
+    __asm { out dx, al          }
+
+    // Wait for DRQ
+    DWORD t0 = GetTickCount();
+    bool drq = false;
+    while ((GetTickCount() - t0) < 2000)
+    {
+        BYTE sr = 0;
+        __asm { mov dx, ATA_REG_STATUS }
+        __asm { in  al, dx             }
+        __asm { mov sr, al             }
+        if (sr & ATA_SR_BSY) { KeStallExecutionProcessor(100); continue; }
+        if (sr & ATA_SR_ERR) return false;
+        if (sr & ATA_SR_DRQ) { drq = true; break; }
+        KeStallExecutionProcessor(50);
+    }
+    if (!drq) return false;
+
+    // Read 256 words (512 bytes)
+    WORD* wp = (WORD*)buf;
+    for (int i = 0; i < 256; ++i)
+    {
+        WORD w = 0;
+        __asm { mov dx, ATA_REG_DATA }
+        __asm { in  ax, dx           }
+        __asm { mov w, ax            }
+        wp[i] = w;
+    }
+    return true;
+}
+
+// Return a human-readable name for a SMART attribute ID.
+// Returns NULL for unknown IDs (caller shows raw ID hex).
+static const char* SmartAttrName(BYTE id)
+{
+    switch (id)
+    {
+    case 0x01: return "Read Error Rate";
+    case 0x02: return "Throughput Perf";
+    case 0x03: return "Spin-Up Time";
+    case 0x04: return "Start/Stop Count";
+    case 0x05: return "Reallocated Sects";  // critical
+    case 0x07: return "Seek Error Rate";
+    case 0x08: return "Seek Time Perf";
+    case 0x09: return "Power-On Hours";
+    case 0x0A: return "Spin Retry Count";
+    case 0x0B: return "Calibration Retry";
+    case 0x0C: return "Power Cycle Count";
+    case 0xAA: return "Available Reservd";
+    case 0xAB: return "Program Fail Count";
+    case 0xAC: return "Erase Fail Count";
+    case 0xAD: return "Wear Level Count";
+    case 0xAE: return "Unexpected Poweroff";
+    case 0xB8: return "End-to-End Error";
+    case 0xBB: return "Uncorr ECC Count";
+    case 0xBC: return "Command Timeout";
+    case 0xBD: return "High Fly Writes";
+    case 0xBE: return "Temp Difference";
+    case 0xBF: return "G-Sense Errors";
+    case 0xC0: return "Unsafe Shutdowns";
+    case 0xC1: return "Load/Unload Cycles";
+    case 0xC2: return "Temperature";
+    case 0xC3: return "Hardware ECC Recov";
+    case 0xC4: return "Realloc Event Cnt";
+    case 0xC5: return "Pending Sectors";    // critical
+    case 0xC6: return "Uncorrectable Sects";// critical
+    case 0xC7: return "UDMA CRC Errors";
+    case 0xC8: return "Write Error Rate";
+    case 0xCA: return "Data Addr Mark Errs";
+    case 0xCB: return "Run Out Cancel";
+    case 0xF0: return "Head Flying Hours";
+    case 0xF1: return "Total LBA Written";
+    case 0xF2: return "Total LBA Read";
+    case 0xFE: return "Free Fall Protect";
+    default:   return NULL;
+    }
+}
+
+// Is this attribute ID one we consider health-critical?
+static bool SmartAttrCritical(BYTE id)
+{
+    return (id == 0x05 || id == 0xC5 || id == 0xC6);
 }
 
 // Byte-swap ATA string words into null-terminated ASCII, trim trailing spaces
@@ -384,6 +539,11 @@ static void LoadData()
         // Bit 3 = security frozen
         d.securitySupported = (w[128] & 0x01) != 0;
         d.isLocked = (w[128] & 0x04) != 0;
+
+        // SMART support: word 82 bit 0 = SMART feature set supported
+        d.smartSupported = (w[82] & 0x01) != 0;
+        if (d.smartSupported)
+            d.smartOK = SmartReadData(d.smartBuf);
     }
     else
     {
@@ -555,12 +715,125 @@ static void ExportData()
 }
 
 // ============================================================================
-// OnEnter
+// SMART export  (D:\smart.txt)
 // ============================================================================
+
+static void ExportSmart()
+{
+    HddData& d = s_data;
+    d.smartExportDone = false;
+    d.smartExportOK = false;
+
+    HANDLE hf = CreateFileA("D:\\smart.txt", GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE)
+    {
+        d.smartExportDone = true; return;
+    }
+
+    DWORD w;
+    char line[128];
+
+    const char* hdr = "XbDiag SMART Data\r\n==================\r\n";
+    WriteFile(hf, hdr, StrLen(hdr), &w, NULL);
+
+    // Drive identity header
+    StrCopy(line, sizeof(line), "Drive:    "); StrCat2(line, sizeof(line), line, d.model);
+    StrCat2(line, sizeof(line), line, "\r\n"); WriteFile(hf, line, StrLen(line), &w, NULL);
+    StrCopy(line, sizeof(line), "Serial:   "); StrCat2(line, sizeof(line), line, d.serial);
+    StrCat2(line, sizeof(line), line, "\r\n"); WriteFile(hf, line, StrLen(line), &w, NULL);
+
+    if (!d.smartOK)
+    {
+        const char* msg = "SMART: Not supported or read failed\r\n";
+        WriteFile(hf, msg, StrLen(msg), &w, NULL);
+        FlushFileBuffers(hf); CloseHandle(hf);
+        d.smartExportDone = true; d.smartExportOK = true;
+        return;
+    }
+
+    const char* col = "\r\nID    Name                 Cur  Wst  Thr  Raw\r\n"
+        "----  -------------------  ---  ---  ---  ------------\r\n";
+    WriteFile(hf, col, StrLen(col), &w, NULL);
+
+    // SMART data starts at byte 2, 30 entries of 12 bytes each
+    const BYTE* p = d.smartBuf + 2;
+    for (int i = 0; i < SMART_MAX_ATTRS; ++i, p += SMART_ATTR_SIZE)
+    {
+        BYTE id = p[0];
+        if (id == 0) continue;  // empty slot
+
+        BYTE cur = p[3];
+        BYTE wst = p[4];
+        BYTE thr = p[5];
+        // Raw value: 6 bytes little-endian, show as 48-bit hex
+        const BYTE* raw = p + 6;
+
+        char idStr[4];   IntToHex(id, 2, idStr, sizeof(idStr));
+        char curStr[4];  IntToStr(cur, curStr, sizeof(curStr));
+        char wstStr[4];  IntToStr(wst, wstStr, sizeof(wstStr));
+        char thrStr[4];  IntToStr(thr, thrStr, sizeof(thrStr));
+        char rawStr[20];
+        // Raw as 6 hex bytes space-separated
+        rawStr[0] = '\0';
+        char rb[4];
+        for (int j = 5; j >= 0; --j)   // big-endian display
+        {
+            IntToHex(raw[j], 2, rb, sizeof(rb));
+            StrCat2(rawStr, sizeof(rawStr), rawStr, rb);
+            if (j > 0) StrCat2(rawStr, sizeof(rawStr), rawStr, " ");
+        }
+
+        const char* name = SmartAttrName(id);
+        char nameBuf[22];
+        if (name)
+        {
+            StrCopy(nameBuf, sizeof(nameBuf), name);
+        }
+        else
+        {
+            StrCopy(nameBuf, sizeof(nameBuf), "Attr 0x");
+            StrCat2(nameBuf, sizeof(nameBuf), nameBuf, idStr);
+        }
+        // Pad name to 20 chars
+        int nl = (int)StrLen(nameBuf);
+        while (nl < 20) { nameBuf[nl++] = ' '; }
+        nameBuf[20] = '\0';
+
+        // Pad cur/wst/thr to 3 chars right-aligned
+        char cStr[5]; StrCopy(cStr, sizeof(cStr), cur < 100 ? (cur < 10 ? "  " : " ") : "");
+        StrCat2(cStr, sizeof(cStr), cStr, curStr);
+        char wStr[5]; StrCopy(wStr, sizeof(wStr), wst < 100 ? (wst < 10 ? "  " : " ") : "");
+        StrCat2(wStr, sizeof(wStr), wStr, wstStr);
+        char tStr[5]; StrCopy(tStr, sizeof(tStr), thr < 100 ? (thr < 10 ? "  " : " ") : "");
+        StrCat2(tStr, sizeof(tStr), tStr, thrStr);
+
+        StrCopy(line, sizeof(line), idStr);
+        StrCat2(line, sizeof(line), line, "    ");
+        StrCat2(line, sizeof(line), line, nameBuf);
+        StrCat2(line, sizeof(line), line, "  ");
+        StrCat2(line, sizeof(line), line, cStr);
+        StrCat2(line, sizeof(line), line, "  ");
+        StrCat2(line, sizeof(line), line, wStr);
+        StrCat2(line, sizeof(line), line, "  ");
+        StrCat2(line, sizeof(line), line, tStr);
+        StrCat2(line, sizeof(line), line, "  ");
+        StrCat2(line, sizeof(line), line, rawStr);
+        StrCat2(line, sizeof(line), line, "\r\n");
+        WriteFile(hf, line, StrLen(line), &w, NULL);
+    }
+
+    FlushFileBuffers(hf);
+    CloseHandle(hf);
+    d.smartExportDone = true;
+    d.smartExportOK = true;
+}
+
 
 void HddInfo_OnEnter()
 {
     s_prevBtns = 0;
+    s_view = VIEW_INFO;
     s_loaded = false;
     // Zero the data struct on every entry — LoadData uses StrCopy/StrCat2
     // into fields that assume a clean buffer, and exportDone/exportOK must
@@ -606,9 +879,9 @@ static void Render(const DiagLogo& logo)
     g_pDevice->BeginScene();
 
     const char* hint = s_data.exportDone
-        ? (s_data.exportOK ? "[A] Exported OK    [B] Back"
-            : "[A] Export failed  [B] Back")
-        : "[A] Export    [B] Back";
+        ? (s_data.exportOK ? "[A] Exported OK    [Right] SMART    [B] Back"
+            : "[A] Export failed  [Right] SMART    [B] Back")
+        : "[A] Export    [Right] SMART    [B] Back";
 
     DrawPageChrome(logo, "HDD INFO", hint);
 
@@ -698,6 +971,123 @@ static void Render(const DiagLogo& logo)
 }
 
 // ============================================================================
+// Render: SMART view
+// ============================================================================
+
+static void RenderSmart(const DiagLogo& logo)
+{
+    g_pDevice->BeginScene();
+
+    const HddData& d = s_data;
+
+    const char* hint;
+    if (!d.smartOK)
+        hint = "[Left] Drive Info    [B] Back";
+    else if (d.smartExportDone)
+        hint = d.smartExportOK
+        ? "[A] Exported OK    [Left] Drive Info    [B] Back"
+        : "[A] Export failed  [Left] Drive Info    [B] Back";
+    else
+        hint = "[A] Export    [Left] Drive Info    [B] Back";
+
+    DrawPageChrome(logo, "HDD SMART", hint);
+
+    float y = CONTENT_Y + 6.f;
+    const float LH2 = LINE_H - 1.f;
+
+    if (!d.smartSupported)
+    {
+        DrawText(LM, y, "SMART not supported by this drive.", 1.3f, COL_GRAY);
+        g_pDevice->EndScene();
+        g_pDevice->Present(NULL, NULL, NULL, NULL);
+        return;
+    }
+    if (!d.smartOK)
+    {
+        DrawText(LM, y, "SMART READ DATA failed.", 1.3f, COL_RED);
+        g_pDevice->EndScene();
+        g_pDevice->Present(NULL, NULL, NULL, NULL);
+        return;
+    }
+
+    // Column headers
+    const float CX_ID = LM;
+    const float CX_NAME = LM + 28.f;
+    const float CX_CUR = LM + 230.f;
+    const float CX_WST = LM + 264.f;
+    const float CX_THR = LM + 298.f;
+    const float CX_RAW = LM + 336.f;
+
+    DrawText(CX_ID, y, "ID", 1.1f, COL_GRAY);
+    DrawText(CX_NAME, y, "ATTRIBUTE", 1.1f, COL_GRAY);
+    DrawText(CX_CUR, y, "CUR", 1.1f, COL_GRAY);
+    DrawText(CX_WST, y, "WST", 1.1f, COL_GRAY);
+    DrawText(CX_THR, y, "THR", 1.1f, COL_GRAY);
+    DrawText(CX_RAW, y, "RAW VALUE", 1.1f, COL_GRAY);
+    y += LH2 - 2.f;
+    HLine(y, LM, SW - LM, COL_BORDER);
+    y += 3.f;
+
+    const BYTE* p = d.smartBuf + 2;
+    for (int i = 0; i < SMART_MAX_ATTRS; ++i, p += SMART_ATTR_SIZE)
+    {
+        BYTE id = p[0];
+        if (id == 0) continue;
+
+        BYTE cur = p[3];
+        BYTE wst = p[4];
+        BYTE thr = p[5];
+        const BYTE* raw = p + 6;
+
+        // Alternate row tint
+        if ((i & 1) == 0)
+            FillRect(LM - 2.f, y - 1.f, SW - LM, y + LH2 - 1.f, 0x10FFFFFF);
+
+        // ID
+        char idStr[4]; IntToHex(id, 2, idStr, sizeof(idStr));
+        DrawText(CX_ID, y, idStr, 1.05f, COL_DIM);
+
+        // Name — critical attrs in red if raw != 0
+        const char* name = SmartAttrName(id);
+        char nameBuf[22];
+        if (name) StrCopy(nameBuf, sizeof(nameBuf), name);
+        else { StrCopy(nameBuf, sizeof(nameBuf), "Attr 0x"); StrCat2(nameBuf, sizeof(nameBuf), nameBuf, idStr); }
+
+        bool isCrit = SmartAttrCritical(id);
+        // Check if raw value is non-zero (any of 6 bytes)
+        bool rawNonZero = false;
+        for (int j = 0; j < 6; ++j) if (raw[j]) { rawNonZero = true; break; }
+        DWORD nameCol = (isCrit && rawNonZero) ? COL_RED : COL_WHITE;
+        DrawText(CX_NAME, y, nameBuf, 1.1f, nameCol);
+
+        // Cur / Wst / Thr — highlight if below threshold
+        DWORD valCol = (cur <= thr && thr > 0) ? COL_RED : COL_CYAN;
+        char curStr[4]; IntToStr(cur, curStr, sizeof(curStr));
+        char wstStr[4]; IntToStr(wst, wstStr, sizeof(wstStr));
+        char thrStr[4]; IntToStr(thr, thrStr, sizeof(thrStr));
+        DrawText(CX_CUR, y, curStr, 1.05f, valCol);
+        DrawText(CX_WST, y, wstStr, 1.05f, COL_GRAY);
+        DrawText(CX_THR, y, thrStr, 1.05f, COL_DIM);
+
+        // Raw — 6 bytes as 3 space-separated pairs (most significant first)
+        char rawStr[20]; rawStr[0] = '\0';
+        char rb[4];
+        for (int j = 5; j >= 0; --j)
+        {
+            IntToHex(raw[j], 2, rb, sizeof(rb));
+            StrCat2(rawStr, sizeof(rawStr), rawStr, rb);
+            if (j > 0) StrCat2(rawStr, sizeof(rawStr), rawStr, " ");
+        }
+        DrawText(CX_RAW, y, rawStr, 1.0f, rawNonZero ? COL_YELLOW : COL_DIM);
+
+        y += LH2;
+    }
+
+    g_pDevice->EndScene();
+    g_pDevice->Present(NULL, NULL, NULL, NULL);
+}
+
+// ============================================================================
 // Tick
 // ============================================================================
 
@@ -719,9 +1109,24 @@ void HddInfo_Tick(const DiagLogo& logo)
         s_prevBtns = cur;
         return;
     }
+
+    if (EdgeDown(cur, s_prevBtns, BTN_DPAD_RIGHT))
+        s_view = VIEW_SMART;
+    if (EdgeDown(cur, s_prevBtns, BTN_DPAD_LEFT))
+        s_view = VIEW_INFO;
+
     if (EdgeDown(cur, s_prevBtns, BTN_A))
-        ExportData();
+    {
+        if (s_view == VIEW_INFO)
+            ExportData();
+        else
+            ExportSmart();
+    }
 
     s_prevBtns = cur;
-    Render(logo);
+
+    if (s_view == VIEW_SMART)
+        RenderSmart(logo);
+    else
+        Render(logo);
 }
