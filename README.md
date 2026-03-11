@@ -24,8 +24,8 @@ XbDiag is a native RXDK application that runs directly on an original Xbox hardw
 | 06 | **Video Info** | Encoder type and chip ID (Conexant/Focus/Xcalibur), AV pack type, backbuffer resolution, refresh rate |
 | 07 | **HDD Info** | ATA IDENTIFY — model, serial, firmware revision, capacity (LBA28/LBA48), UDMA mode, security lock state, export to TXT, also includes SMART support |
 | 08 | **Controller Test** | Digital buttons (including analog pressure), analog sticks, triggers, Black/White — live visualizer plus a dedicated rumble motor subcard |
-| 09 | **Stress Test** | CPU streasts, along with RAM stresstests |
-| 10 | **File Explorer** | A Simple file explore for navigating and launcing XBE's along with a simple FTP server |
+| 09 | **Stress Test** | CPU streasts, along with RAM stress tests |
+| 10 | **File Explorer** | A Simple file explorer for navigating and launching XBEs along with a simple FTP server |
 | 11 | **About** | Version info, credits, fun Xbox hardware facts ticker |
 
 ---
@@ -123,7 +123,7 @@ XbDiag uses software-shifted 8-bit addresses (hardware 7-bit address left-shifte
 ## Known Limitations
 
 - **Rev 1.6 temperatures** are read via PIC registers (0x09/0x0A). Xcalibur readings are noisier than ADM1032 — values are averaged across 10 samples to compensate.
-- **EEPROM export** writes `eeprom.bin`. If the title directory is read-only (e.g. running from a disc image without a writable D: mount) the export will silently fail — the status indicator on screen will show `FAIL`.
+- **EEPROM export** writes `eeprom.bin`. If the title directory is read-only (e.g., running from a disc image without a writable D: mount) the export will silently fail — the status indicator on screen will show `FAIL`.
 - **xemu compatibility**: The PIC SMBus device (0x20) may not respond in xemu. The Video Info and Temp Monitor screens handle this gracefully and show a note on screen. All other modules work normally.
 - **LBA48 capacity** is displayed correctly for drives over 137GB. Drives over 2TB will display a `+` suffix indicating the upper 32 address bits are non-zero, but the displayed sector count is capped to the lower 32 bits.
 
@@ -138,4 +138,4 @@ Additional credits:
 Team Resurgent X Equinox [PrometheOSxbe]
 Rocky5 [XBMC4Gamers-source]
 
-These sources were referenced for various functions through out XbDiag to ensure compability
+These sources were referenced for various functions throughout XbDiag to ensure compatibility
