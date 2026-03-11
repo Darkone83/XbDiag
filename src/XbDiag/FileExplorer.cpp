@@ -1415,96 +1415,103 @@ static void FtpTick()
         }
     }
 
-    // ---- Control socket: read commands -----------------------------------
-    // If the ctrl send buffer is critically full, stop processing incoming
-    // commands this tick — let the drain loop above catch up first.
-    // This means the client waits rather than receiving a dropped/missing reply.
-    const int SEND_BUF_PAUSE_THRESHOLD = (int)sizeof(s_ftp.sendBuf) - 256;
+    // ---- Control socket: receive and command dispatch --------------------
     if ((s_ftp.state == FTP_CONNECTED || s_ftp.state == FTP_TRANSFER) &&
-        s_ftp.ctrlSock != INVALID_SOCKET &&
-        s_ftp.sendLen < SEND_BUF_PAUSE_THRESHOLD)
+        s_ftp.ctrlSock != INVALID_SOCKET)
     {
-        // Try to receive more data into recvBuf
-        int space = (int)sizeof(s_ftp.recvBuf) - s_ftp.recvLen - 1;
-        if (space > 0)
+        // Receive new data only when the send buffer has room — backpressure.
+        // Disconnect detection always runs regardless of send buffer state.
+        const int SEND_BUF_PAUSE_THRESHOLD = (int)sizeof(s_ftp.sendBuf) - 256;
+        if (s_ftp.sendLen < SEND_BUF_PAUSE_THRESHOLD)
         {
-            int n = recv(s_ftp.ctrlSock,
-                s_ftp.recvBuf + s_ftp.recvLen, space, 0);
-            if (n > 0) s_ftp.recvLen += n;
-            else if (n == 0 || (n < 0 && WSAGetLastError() != WSAEWOULDBLOCK))
+            int space = (int)sizeof(s_ftp.recvBuf) - s_ftp.recvLen - 1;
+            if (space > 0)
             {
-                // Client disconnected or hard socket error — full session teardown
-                if (s_ftp.xferFile != INVALID_HANDLE_VALUE)
+                int n = recv(s_ftp.ctrlSock,
+                    s_ftp.recvBuf + s_ftp.recvLen, space, 0);
+                if (n > 0) s_ftp.recvLen += n;
+                else if (n == 0 || (n < 0 && WSAGetLastError() != WSAEWOULDBLOCK))
+                    goto ctrl_disconnect;
+            }
+            else
+            {
+                // recvBuf full — discard up to next newline, keep remainder
+                int nl = -1;
+                for (int i = 0; i < s_ftp.recvLen; ++i)
+                    if (s_ftp.recvBuf[i] == '\n') { nl = i; break; }
+                if (nl >= 0)
                 {
-                    CloseHandle(s_ftp.xferFile); s_ftp.xferFile = INVALID_HANDLE_VALUE;
+                    int remaining = s_ftp.recvLen - nl - 1;
+                    for (int i = 0; i < remaining; ++i)
+                        s_ftp.recvBuf[i] = s_ftp.recvBuf[nl + 1 + i];
+                    s_ftp.recvLen = remaining;
                 }
-                if (s_ftp.dataSock != INVALID_SOCKET) { closesocket(s_ftp.dataSock);   s_ftp.dataSock = INVALID_SOCKET; }
-                if (s_ftp.dataListen != INVALID_SOCKET) { closesocket(s_ftp.dataListen); s_ftp.dataListen = INVALID_SOCKET; }
-                closesocket(s_ftp.ctrlSock); s_ftp.ctrlSock = INVALID_SOCKET;
-                // Scrub all session state so reconnect starts clean
-                s_ftp.authed = false;
-                s_ftp.gotUser = false;
-                s_ftp.gotRnfr = false;
-                s_ftp.atVirtualRoot = false;
-                s_ftp.listPending = false;
-                s_ftp.xferType = XFER_NONE;
-                s_ftp.recvLen = 0;
-                s_ftp.retrBufLen = 0;
-                s_ftp.retrBufOff = 0;
-                s_ftp.listBufLen = 0;
-                s_ftp.listBufOff = 0;
-                s_ftp.sendLen = 0;
-                s_ftp.sendOff = 0;
-                s_ftp.state = FTP_LISTEN;
-                return;
+                else s_ftp.recvLen = 0;
             }
         }
         else
         {
-            // recvBuf full — the incoming command is too long.
-            // Scan for a \n so we can discard just this one broken command
-            // rather than the entire receive stream, keeping the session live.
-            int nl = -1;
-            for (int i = 0; i < s_ftp.recvLen; ++i)
-                if (s_ftp.recvBuf[i] == '\n') { nl = i; break; }
-            if (nl >= 0)
-            {
-                // Discard up through the newline, keep the rest
-                int remaining = s_ftp.recvLen - nl - 1;
-                for (int i = 0; i < remaining; ++i)
-                    s_ftp.recvBuf[i] = s_ftp.recvBuf[nl + 1 + i];
-                s_ftp.recvLen = remaining;
-            }
-            else
-            {
-                // No newline found — whole buffer is one overlong command, drop it
-                s_ftp.recvLen = 0;
-            }
+            // Send buffer near full — probe for disconnect even while paused.
+            // A zero-byte recv just checks if the socket is still alive.
+            char probe[1];
+            int n = recv(s_ftp.ctrlSock, probe, 0, 0);
+            if (n == 0 || (n < 0 && WSAGetLastError() != WSAEWOULDBLOCK))
+                goto ctrl_disconnect;
         }
 
-        // Parse complete lines (\r\n terminated) and handle them
-        s_ftp.recvBuf[s_ftp.recvLen] = '\0';
-        char* buf = s_ftp.recvBuf;
-        while (true)
+        // Parse and dispatch all complete commands already in recvBuf.
+        // This runs regardless of send buffer state — commands buffered before
+        // the gate closed still need to be processed.
         {
-            // Find \n
-            int pos = -1;
-            for (int i = 0; i < s_ftp.recvLen; ++i)
-                if (buf[i] == '\n') { pos = i; break; }
-            if (pos < 0) break;
+            s_ftp.recvBuf[s_ftp.recvLen] = '\0';
+            char* buf = s_ftp.recvBuf;
+            while (true)
+            {
+                int pos = -1;
+                for (int i = 0; i < s_ftp.recvLen; ++i)
+                    if (buf[i] == '\n') { pos = i; break; }
+                if (pos < 0) break;
 
-            // Strip \r\n
-            if (pos > 0 && buf[pos - 1] == '\r') buf[pos - 1] = '\0';
-            buf[pos] = '\0';
+                if (pos > 0 && buf[pos - 1] == '\r') buf[pos - 1] = '\0';
+                buf[pos] = '\0';
 
-            FtpHandleCommand(buf);
+                FtpHandleCommand(buf);
 
-            // Shift remaining data left
-            int remaining = s_ftp.recvLen - pos - 1;
-            for (int i = 0; i < remaining; ++i) buf[i] = buf[pos + 1 + i];
-            s_ftp.recvLen = remaining;
-            buf[remaining] = '\0';
+                int remaining = s_ftp.recvLen - pos - 1;
+                for (int i = 0; i < remaining; ++i) buf[i] = buf[pos + 1 + i];
+                s_ftp.recvLen = remaining;
+                buf[remaining] = '\0';
+            }
         }
+        goto skip_ctrl_disconnect;
+
+    ctrl_disconnect:
+        {
+            // Client disconnected or hard socket error — full session teardown
+            if (s_ftp.xferFile != INVALID_HANDLE_VALUE)
+            {
+                CloseHandle(s_ftp.xferFile); s_ftp.xferFile = INVALID_HANDLE_VALUE;
+            }
+            if (s_ftp.dataSock != INVALID_SOCKET) { closesocket(s_ftp.dataSock);   s_ftp.dataSock = INVALID_SOCKET; }
+            if (s_ftp.dataListen != INVALID_SOCKET) { closesocket(s_ftp.dataListen); s_ftp.dataListen = INVALID_SOCKET; }
+            closesocket(s_ftp.ctrlSock); s_ftp.ctrlSock = INVALID_SOCKET;
+            s_ftp.authed = false;
+            s_ftp.gotUser = false;
+            s_ftp.gotRnfr = false;
+            s_ftp.atVirtualRoot = false;
+            s_ftp.listPending = false;
+            s_ftp.xferType = XFER_NONE;
+            s_ftp.recvLen = 0;
+            s_ftp.retrBufLen = 0;
+            s_ftp.retrBufOff = 0;
+            s_ftp.listBufLen = 0;
+            s_ftp.listBufOff = 0;
+            s_ftp.sendLen = 0;
+            s_ftp.sendOff = 0;
+            s_ftp.state = FTP_LISTEN;
+            return;
+        }
+    skip_ctrl_disconnect:;
     }
 
     // ---- Data transfer ---------------------------------------------------
