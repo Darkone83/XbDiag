@@ -770,17 +770,54 @@ static void ReadSysData()
                 + sectorLo / (2UL * 1024UL * 1024UL);
             char t[12]; IntToStr((int)gb, t, sizeof(t));
             StrCat2(d.hddSizeGB, sizeof(d.hddSizeGB), t, " GB");
-            BYTE active = (BYTE)(buf[88] >> 8) & 0x3F;
+            // UDMA: word 88 high byte = active bits, low byte = supported bits.
+            // Active bits are zero at IDENTIFY time if SET FEATURES hasn't been
+            // issued yet (normal on cold-boot ATA). Fall back to supported bits
+            // and mark with '*'. If word 88 is entirely zero, fall back to MWDMA
+            // (word 63 high byte), then PIO.
+            BYTE active = (BYTE)(buf[88] >> 8) & 0x7F;
+            BYTE supported = (BYTE)(buf[88] & 0xFF) & 0x7F;
             int  mode = -1;
-            for (int i = 5; i >= 0; --i)
+            bool isFallback = false;
+
+            for (int i = 6; i >= 0; --i)
                 if (active & (1 << i)) { mode = i; break; }
+
+            if (mode < 0)
+            {
+                // Active bits zero — use supported bits
+                for (int i = 6; i >= 0; --i)
+                    if (supported & (1 << i)) { mode = i; isFallback = true; break; }
+            }
+
             if (mode >= 0)
             {
                 char t2[4]; IntToStr(mode, t2, sizeof(t2));
                 StrCopy(d.hddUDMA, sizeof(d.hddUDMA), "UDMA");
                 StrCat2(d.hddUDMA, sizeof(d.hddUDMA), d.hddUDMA, t2);
+                if (isFallback) StrCat2(d.hddUDMA, sizeof(d.hddUDMA), d.hddUDMA, "*");
             }
-            else StrCopy(d.hddUDMA, sizeof(d.hddUDMA), "PIO");
+            else
+            {
+                // Try MWDMA (word 63 high byte = active, low byte = supported)
+                BYTE mwActive = (BYTE)(buf[63] >> 8) & 0x07;
+                BYTE mwSupp = (BYTE)(buf[63] & 0xFF) & 0x07;
+                int  mwMode = -1;
+                for (int i = 2; i >= 0; --i)
+                    if (mwActive & (1 << i)) { mwMode = i; break; }
+                if (mwMode < 0)
+                    for (int i = 2; i >= 0; --i)
+                        if (mwSupp & (1 << i)) { mwMode = i; isFallback = true; break; }
+
+                if (mwMode >= 0)
+                {
+                    char t2[4]; IntToStr(mwMode, t2, sizeof(t2));
+                    StrCopy(d.hddUDMA, sizeof(d.hddUDMA), "MWDMA");
+                    StrCat2(d.hddUDMA, sizeof(d.hddUDMA), d.hddUDMA, t2);
+                    if (isFallback) StrCat2(d.hddUDMA, sizeof(d.hddUDMA), d.hddUDMA, "*");
+                }
+                else StrCopy(d.hddUDMA, sizeof(d.hddUDMA), "PIO");
+            }
         }
         else
         {

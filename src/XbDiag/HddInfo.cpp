@@ -310,10 +310,10 @@ static void LoadData()
         // Active bits are set by the host controller after negotiation.
         // At first IDENTIFY they may be 0 even if the BIOS has programmed
         // UDMA — fall back to highest supported bit in that case.
-        BYTE udmaActive = (BYTE)(w[88] >> 8) & 0x3F;
-        BYTE udmaSupported = (BYTE)(w[88]) & 0x3F;
+        BYTE udmaActive = (BYTE)(w[88] >> 8) & 0x7F;
+        BYTE udmaSupported = (BYTE)(w[88]) & 0x7F;
         int  udmaA = -1, udmaS = -1;
-        for (int i = 5; i >= 0; --i)
+        for (int i = 6; i >= 0; --i)
         {
             if (udmaA < 0 && (udmaActive & (1 << i))) udmaA = i;
             if (udmaS < 0 && (udmaSupported & (1 << i))) udmaS = i;

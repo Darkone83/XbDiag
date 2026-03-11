@@ -23,26 +23,30 @@
 //  [Left/Right] Toggle hex / decoded view
 //
 // EEPROM map (SMBus 0x54, 256 bytes):
-//   0x00-0x11  18  HMAC Confounder     key derivation seed
-//   0x12-0x21  16  HDD Key             ATA security key
-//   0x22-0x31  16  Console Key Seed    online auth seed
-//   0x32-0x33   2  Region              0x01=NTSC-M 0x02=NTSC-J 0x04=PAL
-//   0x34-0x3F  12  Serial Number       ASCII
-//   0x40-0x47   8  Online Key          Xbox Live key material
-//   0x48-0x4B   4  Video Flags         display standard + AV flags
-//   0x4C-0x4F   4  Game Region         game region DWORD
-//   0x50-0x53   4  DVD Region          DVD CSS region
-//   0x54-0x57   4  Parental Control    pin / settings
-//   0x58-0x5F   8  Timezone Bias       UTC bias + DST bias
-//   0x60-0x63   4  TZ Name 1           timezone string (4 chars)
-//   0x64-0x67   4  TZ Name 2           timezone string alt (4 chars)
-//   0x70-0x73   4  DST Start           DST transition start
-//   0x74-0x77   4  DST End             DST transition end
-//   0x80-0x87   8  Last Boot Time      FILETIME (100ns since 1601-01-01)
+// Offsets verified against SysInfo.cpp ground-truth (MAC at 0x40) and Xbox.h XC_ defines.
+//   0x00-0x13  20  HMAC SHA1 Hash      confounder / integrity checksum
+//   0x14-0x23  16  HDD Key             ATA security key
+//   0x24-0x27   4  Region Code         factory region (little-endian DWORD)
+//   0x28-0x33  12  Serial Number       ASCII factory serial
+//   0x34-0x3F  12  Online Key          Xbox Live key material (partial)
+//   0x40-0x45   6  MAC Address         Ethernet MAC (confirmed SysInfo ground truth)
+//   0x46-0x47   2  (reserved/pad)
+//   0x48-0x4B   4  Video Standard      XC_VIDEO_STANDARD_* (1=NTSC-M 2=NTSC-J 3=PAL)
+//   0x4C-0x4F   4  Video Flags         XC_VIDEO_FLAGS_* (widescreen, 480p, 720p, 1080i...)
+//   0x50-0x53   4  Audio Flags         XC_AUDIO_FLAGS_* (stereo/mono/surround, AC3, DTS)
+//   0x54-0x57   4  Game Region         XC_GAME_REGION_* (NA/Japan/RoW)
+//   0x58-0x5B   4  DVD Region          CSS region code (1-6)
+//   0x5C-0x5F   4  Parental Control    XC_PC_ESRB_* rating setting
+//   0x60-0x63   4  TZ Std Bias         UTC offset minutes (int32, standard time)
+//   0x64-0x67   4  TZ Dst Bias         UTC offset minutes (int32, daylight time)
+//   0x68-0x6F   8  TZ Std Name         WCHAR[4] timezone abbreviation
+//   0x70-0x77   8  TZ Dst Name         WCHAR[4] DST abbreviation
+//   0x78-0x7B   4  TZ Std Date         transition date (packed SYSTEMTIME fields)
+//   0x7C-0x7F   4  TZ Dst Date         transition date
+//   0x80-0x87   8  Last Boot Time      FILETIME (100ns intervals since 1601-01-01)
 //   0x88-0x8B   4  DVD Playback Key    CSS key material
-//   0x9C-0x9F   4  Misc Flags          system flags
-//   0xA0-0xDF  64  Online Block        Xbox Live reserved
-//   0xEA-0xEF   6  MAC Address         Ethernet MAC
+//   0x9C-0x9F   4  Misc Flags          PIC scratch register shadow
+//   0xA0-0xDF  64  Online Block        Xbox Live reserved block
 
 #include "EepromView.h"
 #include "font.h"
@@ -71,7 +75,7 @@ static const float HEX_FLD_Y = BOT_BAR_Y - 14.f; // field label strip above bot 
 static const float DEC_LBL_X = LM2;
 static const float DEC_HEX_X = LM2 + 130.f;
 static const float DEC_VAL_X = LM2 + 310.f;
-static const int   DEC_VISIBLE = 13; // rows visible at once
+static const int   DEC_VISIBLE = 15; // rows visible at once in SD mode (HD shows all)
 
 // ============================================================================
 // EEPROM field table
@@ -87,26 +91,28 @@ struct EepField
 
 static const EepField s_fields[] =
 {
-    { 0x00, 18, "HMAC Confounder",  "HMAC CONFOUNDER"  },
-    { 0x12, 16, "HDD Key",          "HDD KEY"          },
-    { 0x22, 16, "Console Key Seed", "CONSOLE KEY SEED" },
-    { 0x32,  2, "Region Flags",     "REGION FLAGS"     },
-    { 0x34, 12, "Serial Number",    "SERIAL NUMBER"    },
-    { 0x40,  8, "Online Key",       "ONLINE KEY"       },
-    { 0x48,  4, "Video Flags",      "VIDEO FLAGS"      },
-    { 0x4C,  4, "Game Region",      "GAME REGION"      },
-    { 0x50,  4, "DVD Region",       "DVD REGION"       },
-    { 0x54,  4, "Parental Control", "PARENTAL CTRL"    },
-    { 0x58,  8, "Timezone Bias",    "TIMEZONE BIAS"    },
-    { 0x60,  4, "TZ Name 1",        "TZ NAME 1"        },
-    { 0x64,  4, "TZ Name 2",        "TZ NAME 2"        },
-    { 0x70,  4, "DST Start",        "DST START"        },
-    { 0x74,  4, "DST End",          "DST END"          },
+    { 0x00, 20, "HMAC SHA1 Hash",   "HMAC SHA1 HASH"   },
+    { 0x14, 16, "HDD Key",          "HDD KEY"          },
+    { 0x24,  4, "Region Code",      "REGION CODE"      },
+    { 0x28, 12, "Serial Number",    "SERIAL NUMBER"    },
+    { 0x34, 12, "Online Key",       "ONLINE KEY"       },
+    { 0x40,  6, "MAC Address",      "MAC ADDRESS"      },
+    { 0x48,  4, "Video Standard",   "VIDEO STANDARD"   },
+    { 0x4C,  4, "Video Flags",      "VIDEO FLAGS"      },
+    { 0x50,  4, "Audio Flags",      "AUDIO FLAGS"      },
+    { 0x54,  4, "Game Region",      "GAME REGION"      },
+    { 0x58,  4, "DVD Region",       "DVD REGION"       },
+    { 0x5C,  4, "Parental Control", "PARENTAL CTRL"    },
+    { 0x60,  4, "TZ Std Bias",      "TZ STD BIAS"      },
+    { 0x64,  4, "TZ Dst Bias",      "TZ DST BIAS"      },
+    { 0x68,  8, "TZ Std Name",      "TZ STD NAME"      },
+    { 0x70,  8, "TZ Dst Name",      "TZ DST NAME"      },
+    { 0x78,  4, "TZ Std Date",      "TZ STD DATE"      },
+    { 0x7C,  4, "TZ Dst Date",      "TZ DST DATE"      },
     { 0x80,  8, "Last Boot Time",   "LAST BOOT TIME"   },
     { 0x88,  4, "DVD Playback Key", "DVD PLAYBACK KEY" },
     { 0x9C,  4, "Misc Flags",       "MISC FLAGS"       },
     { 0xA0, 64, "Online Block",     "ONLINE BLOCK"     },
-    { 0xEA,  6, "MAC Address",      "MAC ADDRESS"      },
 };
 static const int NUM_FIELDS = sizeof(s_fields) / sizeof(s_fields[0]);
 
@@ -205,23 +211,29 @@ static void DecodeField(int fi, char* out, int outLen)
 
     switch (f.offset)
     {
-        // Region flags
-    case 0x32:
+        // Region code — factory DWORD, low byte is region
+    case 0x24:
     {
         BYTE r = p[0];
-        if (r & 0x01) SafeCopy(out, outLen, "NTSC-M (N. America)");
-        else if (r & 0x02) SafeCopy(out, outLen, "NTSC-J (Japan)");
-        else if (r & 0x04) SafeCopy(out, outLen, "PAL (Europe/AUS)");
+        if (r == 0x00) SafeCopy(out, outLen, "NTSC-M (N. America)");
+        else if (r == 0x01) SafeCopy(out, outLen, "NTSC-J (Japan)");
+        else if (r == 0x02) SafeCopy(out, outLen, "PAL (Europe/AUS)");
         else
         {
             SafeCopy(out, outLen, "0x");
-            IntToHex(r, 2, t, sizeof(t)); SafeAppend(out, outLen, t);
+            IntToHex(p[0], 2, t, sizeof(t)); SafeAppend(out, outLen, t);
+            SafeAppend(out, outLen, " ");
+            IntToHex(p[1], 2, t, sizeof(t)); SafeAppend(out, outLen, t);
+            SafeAppend(out, outLen, " ");
+            IntToHex(p[2], 2, t, sizeof(t)); SafeAppend(out, outLen, t);
+            SafeAppend(out, outLen, " ");
+            IntToHex(p[3], 2, t, sizeof(t)); SafeAppend(out, outLen, t);
         }
         break;
     }
 
     // Serial number — ASCII printable
-    case 0x34:
+    case 0x28:
     {
         int n = f.size < outLen - 1 ? f.size : outLen - 1;
         for (int i = 0; i < n; ++i)
@@ -234,48 +246,85 @@ static void DecodeField(int fi, char* out, int outLen)
         break;
     }
 
-    // Video flags — bits
+    // MAC address
+    case 0x40:
+        FmtMAC(p, out, outLen);
+        break;
+
+        // Video Standard — XC_VIDEO_STANDARD_*
     case 0x48:
     {
         DWORD v = ReadDW(0x48);
-        // Low byte = video standard
-        BYTE vstd = (BYTE)(v & 0xFF);
-        if (vstd == 0x00) SafeCopy(out, outLen, "NTSC-M");
-        else if (vstd == 0x01) SafeCopy(out, outLen, "NTSC-J");
-        else if (vstd == 0x02) SafeCopy(out, outLen, "PAL-I");
-        else if (vstd == 0x03) SafeCopy(out, outLen, "PAL-M");
+        if (v == 1) SafeCopy(out, outLen, "NTSC-M (N. America)");
+        else if (v == 2) SafeCopy(out, outLen, "NTSC-J (Japan)");
+        else if (v == 3) SafeCopy(out, outLen, "PAL-I (Europe)");
         else
         {
-            SafeCopy(out, outLen, "vstd=0x");
-            IntToHex(vstd, 2, t, sizeof(t)); SafeAppend(out, outLen, t);
+            SafeCopy(out, outLen, "0x");
+            IntToHex(v, 8, t, sizeof(t)); SafeAppend(out, outLen, t);
         }
-        // AV bits
-        BYTE av = (BYTE)((v >> 8) & 0xFF);
-        if (av & 0x01) SafeAppend(out, outLen, " HDTV");
-        if (av & 0x02) SafeAppend(out, outLen, " 480p");
-        if (av & 0x04) SafeAppend(out, outLen, " 720p");
-        if (av & 0x08) SafeAppend(out, outLen, " 1080i");
-        if (av & 0x10) SafeAppend(out, outLen, " 16:9");
         break;
     }
 
-    // Game region
+    // Video Flags — XC_VIDEO_FLAGS_* (bits 0-6, direct)
     case 0x4C:
     {
         DWORD v = ReadDW(0x4C);
-        if (v == 0x00000001) SafeCopy(out, outLen, "NTSC-M");
-        else if (v == 0x00000002) SafeCopy(out, outLen, "NTSC-J");
-        else if (v == 0x00000004) SafeCopy(out, outLen, "PAL");
+        bool any = false;
+        // XC_VIDEO_FLAGS_WIDESCREEN 0x01
+        if (v & 0x00000001) { SafeAppend(out, outLen, "WIDE");    any = true; }
+        // XC_VIDEO_FLAGS_HDTV_720p  0x02
+        if (v & 0x00000002) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "720p");  any = true; }
+        // XC_VIDEO_FLAGS_HDTV_1080i 0x04
+        if (v & 0x00000004) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "1080i"); any = true; }
+        // XC_VIDEO_FLAGS_HDTV_480p  0x08
+        if (v & 0x00000008) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "480p");  any = true; }
+        // XC_VIDEO_FLAGS_LETTERBOX  0x10
+        if (v & 0x00000010) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "LBOX");  any = true; }
+        // XC_VIDEO_FLAGS_PAL_60Hz   0x40
+        if (v & 0x00000040) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "60Hz");  any = true; }
+        if (!any) SafeCopy(out, outLen, "STANDARD (no HDTV)");
+        break;
+    }
+
+    // Audio Flags — XC_AUDIO_FLAGS_*
+    case 0x50:
+    {
+        DWORD v = ReadDW(0x50);
+        // Low word: output mode
+        DWORD basic = v & 0x0000FFFF;
+        if (basic == 0x0000) SafeCopy(out, outLen, "Stereo");
+        else if (basic == 0x0001) SafeCopy(out, outLen, "Mono");
+        else if (basic == 0x0002) SafeCopy(out, outLen, "Surround");
+        else
+        {
+            SafeCopy(out, outLen, "Unk=0x");
+            IntToHex(basic, 4, t, sizeof(t)); SafeAppend(out, outLen, t);
+        }
+        // High word: encoded audio support
+        if (v & 0x00010000) SafeAppend(out, outLen, " +AC3");
+        if (v & 0x00020000) SafeAppend(out, outLen, " +DTS");
+        break;
+    }
+
+    // Game region — XC_GAME_REGION_*
+    case 0x54:
+    {
+        DWORD v = ReadDW(0x54);
+        if (v == 0x00000001) SafeCopy(out, outLen, "N. America");
+        else if (v == 0x00000002) SafeCopy(out, outLen, "Japan");
+        else if (v == 0x00000004) SafeCopy(out, outLen, "Rest of World");
+        else if (v == 0x80000000) SafeCopy(out, outLen, "Manufacturing");
         else if (v == 0xFFFFFFFF) SafeCopy(out, outLen, "ALL (debug)");
         else FmtDword(v, out, outLen);
         break;
     }
 
     // DVD region
-    case 0x50:
+    case 0x58:
     {
-        DWORD v = ReadDW(0x50);
-        if (v == 0x00000001) SafeCopy(out, outLen, "Region 1 (USA)");
+        DWORD v = ReadDW(0x58);
+        if (v == 0x00000001) SafeCopy(out, outLen, "Region 1 (USA/CA)");
         else if (v == 0x00000002) SafeCopy(out, outLen, "Region 2 (EUR/JPN)");
         else if (v == 0x00000003) SafeCopy(out, outLen, "Region 3 (SE Asia)");
         else if (v == 0x00000004) SafeCopy(out, outLen, "Region 4 (AUS/LAT)");
@@ -285,79 +334,139 @@ static void DecodeField(int fi, char* out, int outLen)
         break;
     }
 
-    // Parental control — pin is BCD or raw DWORD
-    case 0x54:
+    // Parental control — XC_PC_ESRB_*
+    case 0x5C:
     {
-        DWORD v = ReadDW(0x54);
-        if (v == 0x00000000) SafeCopy(out, outLen, "DISABLED");
+        DWORD v = ReadDW(0x5C);
+        if (v == 0) SafeCopy(out, outLen, "DISABLED (All)");
+        else if (v == 1) SafeCopy(out, outLen, "Adults Only");
+        else if (v == 2) SafeCopy(out, outLen, "Mature (M)");
+        else if (v == 3) SafeCopy(out, outLen, "Teen (T)");
+        else if (v == 4) SafeCopy(out, outLen, "Everyone (E)");
+        else if (v == 5) SafeCopy(out, outLen, "Kids to Adults");
+        else if (v == 6) SafeCopy(out, outLen, "Early Childhood");
         else FmtDword(v, out, outLen);
         break;
     }
 
-    // Timezone bias (int32 minutes from UTC, little-endian)
-    case 0x58:
+    // TZ standard bias and DST bias — int32 minutes from UTC
+    case 0x60:
+    case 0x64:
     {
-        int bias = (int)ReadDW(0x58);
-        int hrs = bias / 60;
-        int mins = bias % 60;
+        int bias = (int)ReadDW(f.offset);
+        if (bias == 0)
+        {
+            SafeCopy(out, outLen, "UTC+0");
+            break;
+        }
+        // Kernel stores bias as minutes-WEST (subtract to get local).
+        // Negate for human-readable UTC+ display.
+        int display = -bias;
+        int hrs = display / 60;
+        int mins = display % 60;
         if (mins < 0) mins = -mins;
         SafeCopy(out, outLen, "UTC");
-        if (hrs >= 0)
-        {
-            SafeAppend(out, outLen, "+");
-            IntToStr(hrs, t, sizeof(t)); SafeAppend(out, outLen, t);
-        }
-        else
-        {
-            IntToStr(hrs, t, sizeof(t)); SafeAppend(out, outLen, t);
-        }
+        if (hrs >= 0) SafeAppend(out, outLen, "+");
+        IntToStr(hrs, t, sizeof(t)); SafeAppend(out, outLen, t);
         if (mins)
         {
             SafeAppend(out, outLen, ":");
+            if (mins < 10) SafeAppend(out, outLen, "0");
             IntToStr(mins, t, sizeof(t)); SafeAppend(out, outLen, t);
         }
         break;
     }
 
-    // TZ name strings — 4 ASCII chars
-    case 0x60:
-    case 0x64:
+    // TZ name strings — WCHAR[4] (UTF-16LE), extract ASCII low bytes
+    case 0x68:
+    case 0x70:
     {
+        // Each WCHAR is 2 bytes; low byte is ASCII for standard timezone abbrevs
         for (int i = 0; i < 4; ++i)
         {
-            char c = (char)p[i];
-            t[0] = (c >= 0x20 && c < 0x7F) ? c : '.';
+            BYTE lo = p[i * 2];
+            t[0] = (lo >= 0x20 && lo < 0x7F) ? (char)lo : (lo ? '?' : '\0');
+            if (t[0] == '\0') break;
             t[1] = '\0';
             SafeAppend(out, outLen, t);
         }
+        if (out[0] == '\0') SafeCopy(out, outLen, "(not set)");
         break;
     }
 
-    // Last boot time — FILETIME, convert to simple date
+    // TZ transition dates — packed: month/week/day/hour
+    case 0x78:
+    case 0x7C:
+    {
+        DWORD v = ReadDW(f.offset);
+        if (v == 0)
+        {
+            SafeCopy(out, outLen, "(not set)");
+            break;
+        }
+        // Standard SYSTEMTIME packing used by kernel
+        BYTE month = (BYTE)(v & 0xFF);
+        BYTE week = (BYTE)((v >> 8) & 0xFF);
+        BYTE dow = (BYTE)((v >> 16) & 0xFF);
+        BYTE hour = (BYTE)((v >> 24) & 0xFF);
+        static const char* months[] = { "","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec" };
+        const char* mstr = (month >= 1 && month <= 12) ? months[month] : "?";
+        SafeCopy(out, outLen, mstr);
+        SafeAppend(out, outLen, " wk");
+        IntToStr(week, t, sizeof(t)); SafeAppend(out, outLen, t);
+        SafeAppend(out, outLen, " h");
+        IntToStr(hour, t, sizeof(t)); SafeAppend(out, outLen, t);
+        break;
+    }
+
+    // Last boot time — FILETIME
     case 0x80:
     {
-        // FILETIME: 100ns intervals since 1601-01-01
-        // We just show raw hi/lo DWORDs — full date math is complex
         DWORD lo = ReadDW(0x80);
         DWORD hi = ReadDW(0x84);
         if (lo == 0 && hi == 0)
             SafeCopy(out, outLen, "Never / Not Set");
         else
         {
-            SafeCopy(out, outLen, "Hi:");
+            // Convert FILETIME to approximate year (rough: hi*429 / 10^7 seconds since 1601)
+            // hi * 429.4967296 seconds-worth of high 32-bits
+            // Approx year: 1601 + (hi * 429 / 31536000)
+            DWORD approxYear = 1601 + (hi * 429 / 31536000);
+            SafeCopy(out, outLen, "~");
+            IntToStr(approxYear, t, sizeof(t)); SafeAppend(out, outLen, t);
+            SafeAppend(out, outLen, " (hi:");
             FmtDword(hi, t, sizeof(t)); SafeAppend(out, outLen, t);
-            SafeAppend(out, outLen, " Lo:");
-            FmtDword(lo, t, sizeof(t)); SafeAppend(out, outLen, t);
+            SafeAppend(out, outLen, ")");
         }
         break;
     }
 
-    // MAC address
-    case 0xEA:
-        FmtMAC(p, out, outLen);
+    // Misc flags — PIC scratch register shadow (SCRATCH_REGISTER_BITVALUE_*)
+    case 0x9C:
+    {
+        DWORD v = ReadDW(0x9C);
+        if (v == 0)
+        {
+            SafeCopy(out, outLen, "NORMAL BOOT");
+            break;
+        }
+        bool any = false;
+        if (v & 0x01) { SafeAppend(out, outLen, "EJECT-BOOT"); any = true; }
+        if (v & 0x02) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "DISP-ERR"); any = true; }
+        if (v & 0x04) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "NO-ANIM");  any = true; }
+        if (v & 0x08) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "DASH");     any = true; }
+        // Show any unknown bits
+        DWORD unk = v & ~0x0F;
+        if (unk)
+        {
+            if (any) SafeAppend(out, outLen, " ");
+            SafeAppend(out, outLen, "UNK=0x");
+            IntToHex(unk, 8, t, sizeof(t)); SafeAppend(out, outLen, t);
+        }
         break;
+    }
 
-        // HDD key, console key, online key, online block, misc — show "see hex"
+    // Everything else: short fields show raw hex, long fields defer to hex view
     default:
     {
         if (f.size <= 8)
