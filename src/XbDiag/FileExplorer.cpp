@@ -520,20 +520,28 @@ static void ResolveIP()
 static void FtpSendStr(SOCKET s, const char* str)
 {
     // Queue into ctrl send buffer; FtpTick drains it each frame.
-    // On overflow we do NOT disconnect — instead we stop accepting new commands
-    // (by leaving recvLen untouched) until the buffer drains enough to fit.
-    // This keeps the session alive through chatty clients and reply back-pressure.
     if (s != s_ftp.ctrlSock) return;  // only used for ctrl replies
     int len = 0; while (str[len]) len++;
+
+    // If the reply won't fit, first compact the buffer by shifting out the
+    // already-sent prefix. sendOff bytes at the front are gone — reclaim them.
     int space = (int)sizeof(s_ftp.sendBuf) - s_ftp.sendLen;
-    if (len > space)
+    if (len > space && s_ftp.sendOff > 0)
     {
-        // Buffer full — discard this reply rather than killing the session.
-        // The drain loop in FtpTick will clear space; next command will re-queue.
-        // In practice 2048 bytes holds ~20 queued replies; overflow means something
-        // is deeply wrong on the ctrl socket anyway, but staying alive is better.
-        return;
+        int remaining = s_ftp.sendLen - s_ftp.sendOff;
+        for (int i = 0; i < remaining; ++i)
+            s_ftp.sendBuf[i] = s_ftp.sendBuf[s_ftp.sendOff + i];
+        s_ftp.sendLen = remaining;
+        s_ftp.sendOff = 0;
+        space = (int)sizeof(s_ftp.sendBuf) - s_ftp.sendLen;
     }
+
+    // After compaction, if it still won't fit the buffer is genuinely exhausted.
+    // This should be unreachable in normal operation (2048 bytes, command intake
+    // paused at threshold) — but if it happens, stay connected and discard rather
+    // than drop the session. A missed reply is recoverable; a disconnect is not.
+    if (len > space) return;
+
     for (int i = 0; i < len; ++i)
         s_ftp.sendBuf[s_ftp.sendLen++] = str[i];
 }
