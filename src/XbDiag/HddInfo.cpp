@@ -38,16 +38,18 @@
 //   Word 217    = nominal media rotation rate (newer standard)
 //
 // EEPROM layout (SMBus 0x54, 93LC56 256-byte):
-//   0x00-0x11   HMAC/confounder      (18 bytes)
-//   0x12-0x21   HDD key              (16 bytes)
-//   0x22-0x31   Console key seed     (16 bytes)
-//   0x32-0x33   Region flags         (2 bytes)
+//   0x00-0x13   HMAC SHA1 hash       (20 bytes)
+//   0x14-0x1B   Confounder           (8 bytes)
+//   0x1C-0x2B   HDD key              (16 bytes)
+//   0x2C-0x2F   XBE region code      (4 bytes)
+//   0x30-0x33   Checksum2            (4 bytes)
 //   0x34-0x3F   Serial number        (12 bytes ASCII)
-//   0x40-0x47   Online key           (8 bytes)
-//   0xC0-0xCF   DVD zone / misc      (varies)
+//   0x40-0x45   MAC address          (6 bytes)
+//   0x46-0x47   Unknown padding      (2 bytes)
+//   0x48-0x57   Online key           (16 bytes)
+//   0x58-0x5B   Video standard       (4 bytes)
 //
-// Region decode:
-//   Bits 0-7 of word at 0x32:
+// Region decode (XBERegion[0]):
 //   0x01 = NTSC-M (North America)
 //   0x02 = NTSC-J (Japan)
 //   0x04 = PAL    (Europe/Australia)
@@ -126,8 +128,8 @@ struct HddData
     // EEPROM security data
     bool  eepromOK;
     BYTE  hddKey[16];
-    BYTE  consoleKey[16];
-    BYTE  onlineKey[8];
+    BYTE  xbeRegion[4];
+    BYTE  onlineKey[16];
     BYTE  regionByte;
     char  regionStr[24];
     char  serialEEPROM[14];   // 12 chars + null
@@ -566,19 +568,19 @@ static void LoadData()
         BYTE   eepBuf[256];
         ULONG  eeType = 0, eeLen = 0;
         LONG   eeStatus = ExQueryNonVolatileSetting(0xFFFF, &eeType, eepBuf, 256, &eeLen);
-        d.eepromOK = (eeStatus == 0 && eeLen >= 0xF0);
+        d.eepromOK = (eeStatus == 0 && eeLen >= 0x58);
 
         if (d.eepromOK)
         {
-            // HDD key: bytes 0x12-0x21 (16 bytes)
-            for (int i = 0; i < 16; ++i) d.hddKey[i] = eepBuf[0x12 + i];
-            // Console key: bytes 0x22-0x31 (16 bytes)
-            for (int i = 0; i < 16; ++i) d.consoleKey[i] = eepBuf[0x22 + i];
-            // Online key: bytes 0x40-0x47 (8 bytes)
-            for (int i = 0; i < 8; ++i) d.onlineKey[i] = eepBuf[0x40 + i];
+            // HDD key: bytes 0x1C-0x2B (16 bytes)
+            for (int i = 0; i < 16; ++i) d.hddKey[i] = eepBuf[0x1C + i];
+            // XBE Region: bytes 0x2C-0x2F (4 bytes)
+            for (int i = 0; i < 4; ++i) d.xbeRegion[i] = eepBuf[0x2C + i];
+            // Online key: bytes 0x48-0x57 (16 bytes)
+            for (int i = 0; i < 16; ++i) d.onlineKey[i] = eepBuf[0x48 + i];
 
-            // Region byte: 0x32
-            d.regionByte = eepBuf[0x32];
+            // Region from XBERegion[0]
+            d.regionByte = d.xbeRegion[0];
             switch (d.regionByte & 0x07)
             {
             case 0x01: StrCopy(d.regionStr, sizeof(d.regionStr), "NTSC-M  (N. America)"); break;
@@ -695,13 +697,13 @@ static void ExportData()
     StrCat2(line, sizeof(line), line, "\r\n");
     WriteFile(hf, line, StrLen(line), &w, NULL);
 
-    FormatHex(d.consoleKey, 16, hexbuf, sizeof(hexbuf));
-    StrCopy(line, sizeof(line), "Console Key:    ");
+    FormatHex(d.xbeRegion, 4, hexbuf, sizeof(hexbuf));
+    StrCopy(line, sizeof(line), "XBE Region:     ");
     StrCat2(line, sizeof(line), line, hexbuf);
     StrCat2(line, sizeof(line), line, "\r\n");
     WriteFile(hf, line, StrLen(line), &w, NULL);
 
-    FormatHex(d.onlineKey, 8, hexbuf, sizeof(hexbuf));
+    FormatHex(d.onlineKey, 16, hexbuf, sizeof(hexbuf));
     StrCopy(line, sizeof(line), "Online Key:     ");
     StrCat2(line, sizeof(line), line, hexbuf);
     StrCat2(line, sizeof(line), line, "\r\n");
@@ -951,19 +953,19 @@ static void Render(const DiagLogo& logo)
     DrawKeyRow(COL_R, COL_VR, y2, "BYTES   :", d.hddKey, 16, d.eepromOK);
     y2 += LH * 2.f + GAP;
 
-    // Console key (16 bytes = 2 rows)
-    DrawText(COL_R, y2, "CONSOLE KEY", 1.2f, COL_YELLOW);
+    // XBE Region (4 bytes = 1 row)
+    DrawText(COL_R, y2, "XBE REGION", 1.2f, COL_YELLOW);
     HLine(y2 + LH + 1.f, COL_R, SW - LM, COL_BORDER);
     y2 += LH + 5.f;
-    DrawKeyRow(COL_R, COL_VR, y2, "BYTES   :", d.consoleKey, 16, d.eepromOK);
-    y2 += LH * 2.f + GAP;
+    DrawKeyRow(COL_R, COL_VR, y2, "BYTES   :", d.xbeRegion, 4, d.eepromOK);
+    y2 += LH + GAP;
 
-    // Online key (8 bytes = 1 row)
+    // Online key (16 bytes = 2 rows)
     DrawText(COL_R, y2, "ONLINE KEY", 1.2f, COL_YELLOW);
     HLine(y2 + LH + 1.f, COL_R, SW - LM, COL_BORDER);
     y2 += LH + 5.f;
-    DrawKeyRow(COL_R, COL_VR, y2, "BYTES   :", d.onlineKey, 8, d.eepromOK);
-    y2 += LH + GAP;
+    DrawKeyRow(COL_R, COL_VR, y2, "BYTES   :", d.onlineKey, 16, d.eepromOK);
+    y2 += LH * 2.f + GAP;
 
 
     g_pDevice->EndScene();

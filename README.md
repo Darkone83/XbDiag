@@ -24,7 +24,9 @@ XbDiag is a native RXDK application that runs directly on an original Xbox hardw
 | 06 | **Video Info** | Encoder type and chip ID (Conexant/Focus/Xcalibur), AV pack type, backbuffer resolution, refresh rate |
 | 07 | **HDD Info** | ATA IDENTIFY — model, serial, firmware revision, capacity (LBA28/LBA48), UDMA mode, security lock state, export to TXT, also includes SMART support |
 | 08 | **Controller Test** | Digital buttons (including analog pressure), analog sticks, triggers, Black/White — live visualizer plus a dedicated rumble motor subcard |
-| 09 | **About** | Version info, credits, fun Xbox hardware facts ticker |
+| 09 | **Stress Test** | CPU streasts, along with RAM stresstests |
+| 10 | **File Explorer** | A Simple file explore for navigating and launcing XBE's along with a simple FTP server |
+| 11 | **About** | Version info, credits, fun Xbox hardware facts ticker |
 
 ---
 

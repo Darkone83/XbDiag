@@ -38,7 +38,9 @@ enum
     MSTATE_HDD = 7,
     MSTATE_ABOUT = 8,
     MSTATE_CTRL = 9,
-    MSTATE_EXIT = 10,
+    MSTATE_STRESS = 10,
+    MSTATE_FILES = 11,
+    MSTATE_EXIT = 12,
 };
 
 // ============================================================================
@@ -63,7 +65,9 @@ static const MenuItem k_items[] =
     { "06", "VIDEO INFO",       "Encoder type, AV pack, resolution, refresh rate, color depth", MSTATE_VIDEO   },
     { "07", "HDD INFO",         "ATA IDENTIFY - model, serial, capacity, UDMA mode",            MSTATE_HDD     },
     { "08", "CONTROLLER TEST",  "Buttons, analog sticks, triggers, and rumble motor test",      MSTATE_CTRL    },
-    { "09", "ABOUT",            "Version info, credits, and hardware compatibility notes",       MSTATE_ABOUT   },
+    { "09", "STRESS TEST",      "Sustained CPU and RAM load test with thermal monitoring",      MSTATE_STRESS  },
+    { "10", "FILE EXPLORER",    "Browse Xbox partitions - C: D: E: F: G: directory listings",   MSTATE_FILES   },
+    { "11", "ABOUT",            "Version info, credits, and hardware compatibility notes",       MSTATE_ABOUT   },
 };
 
 static const int k_itemCount = sizeof(k_items) / sizeof(k_items[0]);

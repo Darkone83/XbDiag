@@ -23,13 +23,17 @@
 //  [Left/Right] Toggle hex / decoded view
 //
 // EEPROM map (SMBus 0x54, 256 bytes):
-// Offsets verified against SysInfo.cpp ground-truth (MAC at 0x40) and Xbox.h XC_ defines.
-//   0x00-0x13  20  HMAC SHA1 Hash      confounder / integrity checksum
-//   0x14-0x23  16  HDD Key             ATA security key
-//   0x24-0x27   4  Region Code         factory region (little-endian DWORD)
-//   0x28-0x33  12  Serial Number       ASCII factory serial
-//   0x34-0x3F  12  Online Key          Xbox Live key material (partial)
-//   0x40-0x45   6  MAC Address         Ethernet MAC (confirmed SysInfo ground truth)
+// Offsets verified against XKEEPROM.h (Team Assembly) and PrometheOS EEPROMDATA struct.
+//   0x00-0x13  20  HMAC SHA1 Hash      integrity checksum (encrypted section)
+//   0x14-0x1B   8  Confounder          RC4 encrypted confounder
+//   0x1C-0x2B  16  HDD Key             RC4 encrypted ATA security key
+//   0x2C-0x2F   4  XBE Region          factory region code (little-endian DWORD)
+//   0x30-0x33   4  Checksum2           checksum of following 44 bytes
+//   0x34-0x3F  12  Serial Number       ASCII factory serial
+//   0x40-0x45   6  MAC Address         Ethernet MAC
+//   0x46-0x47   2  (reserved/pad)
+//   0x48-0x57  16  Online Key          Xbox Live key (16 bytes)
+//   0x58-0x5B   4  Video Standard      XC_VIDEO_STANDARD_* (1=NTSC-M 2=NTSC-J 3=PAL)
 //   0x46-0x47   2  (reserved/pad)
 //   0x48-0x4B   4  Video Standard      XC_VIDEO_STANDARD_* (1=NTSC-M 2=NTSC-J 3=PAL)
 //   0x4C-0x4F   4  Video Flags         XC_VIDEO_FLAGS_* (widescreen, 480p, 720p, 1080i...)
@@ -75,7 +79,7 @@ static const float HEX_FLD_Y = BOT_BAR_Y - 14.f; // field label strip above bot 
 static const float DEC_LBL_X = LM2;
 static const float DEC_HEX_X = LM2 + 130.f;
 static const float DEC_VAL_X = LM2 + 310.f;
-static const int   DEC_VISIBLE = 15; // rows visible at once in SD mode (HD shows all)
+static const int   DEC_VISIBLE = 20; // rows visible at once — always scroll, never overflow
 
 // ============================================================================
 // EEPROM field table
@@ -92,12 +96,14 @@ struct EepField
 static const EepField s_fields[] =
 {
     { 0x00, 20, "HMAC SHA1 Hash",   "HMAC SHA1 HASH"   },
-    { 0x14, 16, "HDD Key",          "HDD KEY"          },
-    { 0x24,  4, "Region Code",      "REGION CODE"      },
-    { 0x28, 12, "Serial Number",    "SERIAL NUMBER"    },
-    { 0x34, 12, "Online Key",       "ONLINE KEY"       },
+    { 0x14,  8, "Confounder",       "CONFOUNDER"       },
+    { 0x1C, 16, "HDD Key",          "HDD KEY"          },
+    { 0x2C,  4, "XBE Region",       "XBE REGION"       },
+    { 0x30,  4, "Checksum2",        "CHECKSUM2"        },
+    { 0x34, 12, "Serial Number",    "SERIAL NUMBER"    },
     { 0x40,  6, "MAC Address",      "MAC ADDRESS"      },
-    { 0x48,  4, "Video Standard",   "VIDEO STANDARD"   },
+    { 0x48, 16, "Online Key",       "ONLINE KEY"       },
+    { 0x58,  4, "Video Standard",   "VIDEO STANDARD"   },
     { 0x4C,  4, "Video Flags",      "VIDEO FLAGS"      },
     { 0x50,  4, "Audio Flags",      "AUDIO FLAGS"      },
     { 0x54,  4, "Game Region",      "GAME REGION"      },
@@ -211,8 +217,8 @@ static void DecodeField(int fi, char* out, int outLen)
 
     switch (f.offset)
     {
-        // Region code — factory DWORD, low byte is region
-    case 0x24:
+        // XBE Region — factory DWORD, low byte is region
+    case 0x2C:
     {
         BYTE r = p[0];
         if (r == 0x00) SafeCopy(out, outLen, "NTSC-M (N. America)");
@@ -233,7 +239,7 @@ static void DecodeField(int fi, char* out, int outLen)
     }
 
     // Serial number — ASCII printable
-    case 0x28:
+    case 0x34:
     {
         int n = f.size < outLen - 1 ? f.size : outLen - 1;
         for (int i = 0; i < n; ++i)
@@ -677,10 +683,9 @@ static void RenderDecoded(const DiagLogo& logo)
     HLine(hy, LM2, SW - LM, COL_BORDER);
     hy += 3.f;
 
-    // In HD modes the content area fits all fields — no scroll or scrollbar needed.
-    // In SD (480i/480p) cap to DEC_VISIBLE and show a scroll indicator.
-    int visible = g_isHD ? NUM_FIELDS : DEC_VISIBLE;
-    int scrollTop = g_isHD ? 0 : s_decScroll;
+    // Always cap to DEC_VISIBLE rows and scroll — field count exceeds content area height.
+    int visible = DEC_VISIBLE;
+    int scrollTop = s_decScroll;
 
     int end = scrollTop + visible;
     if (end > NUM_FIELDS) end = NUM_FIELDS;
@@ -711,8 +716,8 @@ static void RenderDecoded(const DiagLogo& logo)
         DrawText(DEC_VAL_X, rowY, decoded, 1.15f, COL_WHITE);
     }
 
-    // Scroll indicator — SD only
-    if (!g_isHD && NUM_FIELDS > DEC_VISIBLE)
+    // Scroll indicator
+    if (NUM_FIELDS > DEC_VISIBLE)
     {
         float sbTop = hy;
         float sbH = DEC_VISIBLE * LH;
@@ -774,11 +779,11 @@ void EepromView_Tick(const DiagLogo& logo)
     {
         if (EdgeDown(cur, s_prevBtns, BTN_DPAD_UP))
         {
-            if (!g_isHD && s_decScroll > 0) --s_decScroll;
+            if (s_decScroll > 0) --s_decScroll;
         }
         if (EdgeDown(cur, s_prevBtns, BTN_DPAD_DOWN))
         {
-            if (!g_isHD && s_decScroll < NUM_FIELDS - DEC_VISIBLE) ++s_decScroll;
+            if (s_decScroll < NUM_FIELDS - DEC_VISIBLE) ++s_decScroll;
         }
     }
 

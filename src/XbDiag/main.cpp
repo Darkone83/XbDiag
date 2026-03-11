@@ -28,6 +28,8 @@
 #include "HddInfo.h"
 #include "AboutScreen.h"
 #include "ControllerTest.h"
+#include "StressTest.h"
+#include "FileExplorer.h"
 
 #include <xtl.h>
 
@@ -57,6 +59,8 @@ enum AppState
     STATE_HDD,
     STATE_ABOUT,
     STATE_CTRL,
+    STATE_STRESS,
+    STATE_FILES,
     STATE_EXIT,
 };
 
@@ -263,6 +267,8 @@ void __cdecl main()
             case STATE_HDD:     HddInfo_OnEnter();     break;
             case STATE_ABOUT:   AboutScreen_OnEnter();    break;
             case STATE_CTRL:    ControllerTest_OnEnter(); break;
+            case STATE_STRESS:  StressTest_OnEnter();     break;
+            case STATE_FILES:   FileExplorer_OnEnter();   break;
             case STATE_EXIT:    ExitToDashboard();     break;
             default:            break;
             }
@@ -284,6 +290,8 @@ void __cdecl main()
         case STATE_HDD:     HddInfo_Tick(g_logo);     break;
         case STATE_ABOUT:   AboutScreen_Tick(g_logo);    break;
         case STATE_CTRL:    ControllerTest_Tick(g_logo); break;
+        case STATE_STRESS:  StressTest_Tick(g_logo);     break;
+        case STATE_FILES:   FileExplorer_Tick(g_logo);   break;
         default:            break;
         }
     }

@@ -686,7 +686,7 @@ static void ReadSysData()
         BYTE  eepBuf[256];
         ULONG eeType = 0, eeLen = 0;
         LONG  eeOK = ExQueryNonVolatileSetting(0xFFFF, &eeType, eepBuf, 256, &eeLen);
-        if (eeOK == 0 && eeLen >= 0xF0)
+        if (eeOK == 0 && eeLen >= 0x46)
         {
             // Serial: bytes 0x34-0x3F (12 ASCII chars)
             for (int i = 0; i < 12; ++i) d.serialNum[i] = (char)eepBuf[0x34 + i];
@@ -981,11 +981,11 @@ static void ExportSysInfo()
     {
         char dispLine[24];
         StrCat2(dispLine, sizeof(dispLine), "Display @ ", d.dispAddr);
-        WriteLine(hf, "Display:       ", dispLine);
+        WriteLine(hf, "LCD Display:       ", dispLine);
     }
     else
     {
-        WriteLine(hf, "Display:       ", "Not detected");
+        WriteLine(hf, "LCD Display:       ", "Not detected");
     }
     WriteLine(hf, "BIOS:          ", d.biosVer);
     WriteLine(hf, "Encoder:       ", d.encName);
@@ -1080,10 +1080,14 @@ static void Render(const DiagLogo& logo)
     const float LH = LINE_H - 1.f;
     const float GAP = 6.f;
 
+    // Bottom strip height reserved for CPU/GPU speed bar
+    const float STRIP_H = 22.f;
+    const float STRIP_Y = BOT_BAR_Y - STRIP_H - 2.f;
+
     float y1 = CONTENT_Y + 4.f;
     float y2 = CONTENT_Y + 4.f;
 
-    VLine(C2 - 10.f, CONTENT_Y + 2.f, BOT_BAR_Y - 2.f, COL_BORDER);
+    VLine(C2 - 10.f, CONTENT_Y + 2.f, STRIP_Y - 2.f, COL_BORDER);
 
     // ---- LEFT: CPU ----
     DrawSection(C1, y1, RULEW, "CPU");                          y1 += LH + 4.f;
@@ -1170,6 +1174,59 @@ static void Render(const DiagLogo& logo)
         d.macOK ? COL_CYAN : COL_RED);           y2 += LH;
     DrawRow(C2, y2, V2, "IP     :", d.ipAddr,
         d.ipOK ? COL_GREEN : COL_DIM);
+
+    // ---- BOTTOM STRIP: CPU / GPU speed ----
+    HLine(STRIP_Y, 0.f, SW, COL_BORDER);
+    FillRectGrad(0.f, STRIP_Y + 1.f, SW, STRIP_Y + STRIP_H,
+        D3DCOLOR_XRGB(16, 20, 44), D3DCOLOR_XRGB(10, 12, 28));
+
+    float sy = STRIP_Y + (STRIP_H - LINE_H) * 0.5f + 1.f;
+
+    // CPU label + speed
+    DrawText(LM, sy, "CPU:", 1.2f, COL_GRAY);
+    DrawText(LM + 34.f, sy, d.cpuSpeedMHz, 1.2f, COL_CYAN);
+
+    // Small filled bar proportional to expected 733MHz range (cap at 1200)
+    {
+        float barX = LM + 34.f + TW(d.cpuSpeedMHz, 1.2f) + 8.f;
+        float barW = 80.f;
+        float barH = 7.f;
+        float barY = sy + (LINE_H - barH) * 0.5f;
+        float fill = (float)d.cpuMHz / 1200.f;
+        if (fill > 1.f) fill = 1.f;
+        FillRect(barX, barY, barX + barW, barY + barH,
+            D3DCOLOR_XRGB(20, 25, 55));
+        FillRectGrad(barX, barY, barX + barW * fill, barY + barH,
+            D3DCOLOR_XRGB(60, 200, 255),
+            D3DCOLOR_XRGB(30, 120, 180));
+        HLine(barY, barX, barX + barW, COL_BORDER);
+        HLine(barY + barH, barX, barX + barW, COL_BORDER);
+        VLine(barX, barY, barY + barH, COL_BORDER);
+        VLine(barX + barW, barY, barY + barH, COL_BORDER);
+    }
+
+    // GPU label + speed (right side)
+    float gpuX = SW * 0.5f + 8.f;
+    DrawText(gpuX, sy, "GPU:", 1.2f, COL_GRAY);
+    DrawText(gpuX + 34.f, sy, d.gpuSpeedMHz, 1.2f, COL_CYAN);
+
+    {
+        float barX = gpuX + 34.f + TW(d.gpuSpeedMHz, 1.2f) + 8.f;
+        float barW = 80.f;
+        float barH = 7.f;
+        float barY = sy + (LINE_H - barH) * 0.5f;
+        float fill = (float)d.gpuMHz / 400.f;
+        if (fill > 1.f) fill = 1.f;
+        FillRect(barX, barY, barX + barW, barY + barH,
+            D3DCOLOR_XRGB(20, 25, 55));
+        FillRectGrad(barX, barY, barX + barW * fill, barY + barH,
+            D3DCOLOR_XRGB(80, 255, 160),
+            D3DCOLOR_XRGB(30, 160, 80));
+        HLine(barY, barX, barX + barW, COL_BORDER);
+        HLine(barY + barH, barX, barX + barW, COL_BORDER);
+        VLine(barX, barY, barY + barH, COL_BORDER);
+        VLine(barX + barW, barY, barY + barH, COL_BORDER);
+    }
 
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);

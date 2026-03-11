@@ -246,7 +246,7 @@ static void Render(const DiagLogo& logo)
     y += LINE_H;
 
     DrawText(LM, y, "MODULES         :", LS, COL_GRAY);
-    DrawText(VM2, y, "SysInfo  RAM  SMBus  Temp  HDD  EEPROM  Video Contoller", LS, COL_WHITE);
+    DrawText(VM2, y, "SysInfo  RAM  SMBus  Temp  HDD  EEPROM  Video Contoller Stress File Exp", LS, COL_WHITE);
 
     // -------------------------------------------------------------------------
     // Divider + logo panel background
