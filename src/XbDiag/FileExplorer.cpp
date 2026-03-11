@@ -102,7 +102,9 @@ extern "C" LONG WINAPI IoDeleteSymbolicLink(XBOX_STRING* symLink);
 
 // FTP data port for passive connections
 #define FTP_CTRL_PORT   21
-#define FTP_DATA_PORT   2024   // arbitrary fixed passive port
+#define FTP_DATA_PORT_BASE  2024   // passive port range: 2024–2055
+#define FTP_DATA_PORT_COUNT   32
+static int s_nextDataPort = 0;     // cycles through the range
 
 // ============================================================================
 // Types
@@ -134,6 +136,7 @@ struct FtpCtx
     SOCKET   ctrlSock;     // connected client control socket
     SOCKET   dataListen;   // passive listen socket
     SOCKET   dataSock;     // connected data socket
+    WORD     dataPort;     // port dataListen is bound to (set by FtpOpenPassive)
 
     // Auth
     bool     authed;
@@ -155,19 +158,30 @@ struct FtpCtx
     bool     gotRnfr;
     char     rnfrPath[MAX_PATH_LEN];
 
-    // Send buffer for control responses
-    char     sendBuf[512];
-    int      sendLen;
-    int      sendOff;
-
     // Receive buffer for control commands
-    char     recvBuf[512];
+    char     recvBuf[1024];
     int      recvLen;
 
-    // Data send buffer for LIST responses
-    char     listBuf[4096];
-    int      listLen;
-    int      listOff;
+    // Send buffer for control replies — drains each tick to handle WSAEWOULDBLOCK
+    char     sendBuf[2048];
+    int      sendLen;   // bytes queued
+    int      sendOff;   // bytes already sent
+
+    // RETR partial-send buffer — holds unsent remainder between ticks
+    char     retrBuf[4096];
+    int      retrBufLen;   // bytes valid in retrBuf
+    int      retrBufOff;   // bytes already sent
+
+    // Deferred LIST — populated when LIST arrives before dataSock is ready
+    bool     listPending;
+    bool     listVirtualRoot;
+    char     listDir[MAX_PATH_LEN];
+
+    // Buffered LIST data — built by FtpDoListing, drained by FtpTick XFER_LIST
+    // 64 KB covers ~800 files; more than enough for any real Xbox directory
+    char     listBuf[65536];
+    int      listBufLen;
+    int      listBufOff;
 };
 
 // ============================================================================
@@ -505,9 +519,23 @@ static void ResolveIP()
 
 static void FtpSendStr(SOCKET s, const char* str)
 {
-    // Non-blocking best-effort send — small control responses always fit
+    // Queue into ctrl send buffer; FtpTick drains it each frame.
+    // On overflow we do NOT disconnect — instead we stop accepting new commands
+    // (by leaving recvLen untouched) until the buffer drains enough to fit.
+    // This keeps the session alive through chatty clients and reply back-pressure.
+    if (s != s_ftp.ctrlSock) return;  // only used for ctrl replies
     int len = 0; while (str[len]) len++;
-    send(s, str, len, 0);
+    int space = (int)sizeof(s_ftp.sendBuf) - s_ftp.sendLen;
+    if (len > space)
+    {
+        // Buffer full — discard this reply rather than killing the session.
+        // The drain loop in FtpTick will clear space; next command will re-queue.
+        // In practice 2048 bytes holds ~20 queued replies; overflow means something
+        // is deeply wrong on the ctrl socket anyway, but staying alive is better.
+        return;
+    }
+    for (int i = 0; i < len; ++i)
+        s_ftp.sendBuf[s_ftp.sendLen++] = str[i];
 }
 
 static void FtpReply(int code, const char* msg)
@@ -540,14 +568,23 @@ static bool FtpOpenPassive()
     s_ftp.dataListen = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s_ftp.dataListen == INVALID_SOCKET) return false;
 
+    // SO_REUSEADDR so rebind succeeds immediately after prior connection closes
+    DWORD reuse = 1;
+    setsockopt(s_ftp.dataListen, SOL_SOCKET, SO_REUSEADDR,
+        (const char*)&reuse, sizeof(reuse));
+
     u_long nb = 1;
     ioctlsocket(s_ftp.dataListen, FIONBIO, &nb);
+
+    // Rotate through port range to avoid TIME_WAIT on rapid successive transfers
+    int port = FTP_DATA_PORT_BASE + (s_nextDataPort % FTP_DATA_PORT_COUNT);
+    s_nextDataPort++;
 
     SOCKADDR_IN sa;
     ZeroMemory(&sa, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_addr.s_addr = INADDR_ANY;
-    sa.sin_port = htons(FTP_DATA_PORT);
+    sa.sin_port = htons((u_short)port);
 
     if (bind(s_ftp.dataListen, (SOCKADDR*)&sa, sizeof(sa)) != 0 ||
         listen(s_ftp.dataListen, 1) != 0)
@@ -556,6 +593,7 @@ static bool FtpOpenPassive()
         s_ftp.dataListen = INVALID_SOCKET;
         return false;
     }
+    s_ftp.dataPort = (WORD)port;
     return true;
 }
 
@@ -576,7 +614,7 @@ static void FtpSendPasv()
         }
     }
 
-    WORD port = FTP_DATA_PORT;
+    WORD port = s_ftp.dataPort;
     char reply[64];
     char nums[8];
     reply[0] = '\0';
@@ -598,45 +636,41 @@ static void FtpSendPasv()
     FtpSendStr(s_ftp.ctrlSock, reply);
 }
 
-// Build LIST response line for one entry: "drwxr-xr-x  1 xbox xbox  0 Jan 01 00:00 name\r\n"
-static void FtpAppendListLine(const FileEntry& e)
+// Send one LIST line directly to the data socket.
+// Uses the real filename — no truncation.
+// line format: "drwxr-xr-x  1 xbox xbox  <size> Jan 01 00:00 <name>\r\n"
+// Append one LIST line to s_ftp.listBuf. Returns false if buffer full.
+static bool FtpAppendListLine(const char* name, bool isDir, DWORD sizeLow)
 {
-    char line[160];
+    char line[MAX_PATH_LEN + 64];
     char* p = line;
 
-    // Permissions
-    const char* perm = e.isDir ? "drwxr-xr-x" : "-rw-r--r--";
+    const char* perm = isDir ? "drwxr-xr-x" : "-rw-r--r--";
     while (*perm) *p++ = *perm++;
     *p++ = ' ';
 
-    // Link count, owner, group
-    const char* tail = "  1 xbox xbox ";
-    while (*tail) *p++ = *tail++;
+    const char* owner = "  1 xbox xbox ";
+    while (*owner) *p++ = *owner++;
 
-    // Size (right-aligned 10 chars)
-    char szBuf[12]; char szPad[12];
-    IntToStr((int)e.sizeLow, szBuf, sizeof(szBuf));
+    char szBuf[12];
+    IntToStr((int)sizeLow, szBuf, sizeof(szBuf));
     int szLen = 0; while (szBuf[szLen]) szLen++;
     for (int i = szLen; i < 10; ++i) *p++ = ' ';
     const char* sp = szBuf; while (*sp) *p++ = *sp++;
     *p++ = ' ';
 
-    // Fake date
     const char* dt = "Jan 01 00:00 ";
     while (*dt) *p++ = *dt++;
 
-    // Name
-    const char* nm = e.name; while (*nm) *p++ = *nm++;
+    const char* nm = name; while (*nm) *p++ = *nm++;
     *p++ = '\r'; *p++ = '\n'; *p = '\0';
 
-    // Append to listBuf
     int lineLen = (int)(p - line);
-    int remaining = (int)sizeof(s_ftp.listBuf) - s_ftp.listLen - 1;
-    if (lineLen > remaining) lineLen = remaining;
+    int space = (int)sizeof(s_ftp.listBuf) - s_ftp.listBufLen;
+    if (lineLen > space) return false;  // buffer full — truncate listing
     for (int i = 0; i < lineLen; ++i)
-        s_ftp.listBuf[s_ftp.listLen + i] = line[i];
-    s_ftp.listLen += lineLen;
-    s_ftp.listBuf[s_ftp.listLen] = '\0';
+        s_ftp.listBuf[s_ftp.listBufLen++] = line[i];
+    return true;
 }
 
 // Start FTP server
@@ -648,11 +682,16 @@ static void FtpStart()
     s_ftp.dataListen = INVALID_SOCKET;
     s_ftp.dataSock = INVALID_SOCKET;
     s_ftp.xferFile = INVALID_HANDLE_VALUE;
+    s_nextDataPort = 0;  // reset port rotation on each server start
 
     if (!s_ipOK) return;  // no network
 
     s_ftp.listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s_ftp.listenSock == INVALID_SOCKET) return;
+
+    DWORD reuse = 1;
+    setsockopt(s_ftp.listenSock, SOL_SOCKET, SO_REUSEADDR,
+        (const char*)&reuse, sizeof(reuse));
 
     u_long nb = 1;
     ioctlsocket(s_ftp.listenSock, FIONBIO, &nb);
@@ -710,31 +749,121 @@ static void FtpStop()
     s_ftp.state = FTP_OFF;
 }
 
-// Resolve an FTP argument to a full Windows path.
+// Normalize a raw Windows path in-place:
+//   - forward slashes -> backslashes
+//   - collapse repeated backslashes
+//   - resolve . and .. components
+//   - preserve drive root (e.g. C:\)
+static void NormalizePath(char* p)
+{
+    // Forward slash -> backslash
+    for (int i = 0; p[i]; ++i) if (p[i] == '/') p[i] = '\\';
+
+    // Collapse repeated backslashes (except UNC \\server — not needed here)
+    {
+        char tmp[MAX_PATH_LEN];
+        int ti = 0;
+        for (int i = 0; p[i] && ti < MAX_PATH_LEN - 1; )
+        {
+            tmp[ti++] = p[i++];
+            // After a backslash, skip additional backslashes
+            if (p[i - 1] == '\\')
+                while (p[i] == '\\') i++;
+        }
+        tmp[ti] = '\0';
+        StrCopy(p, MAX_PATH_LEN, tmp);
+    }
+
+    // Resolve . and .. using a component stack
+    // Components stored as offsets into a scratch buffer
+    char scratch[MAX_PATH_LEN];
+    StrCopy(scratch, sizeof(scratch), p);
+
+    // Identify drive root prefix: "X:\" (3 chars)
+    char root[4] = {};
+    char* rest = scratch;
+    if (scratch[0] && scratch[1] == ':' && scratch[2] == '\\')
+    {
+        root[0] = scratch[0]; root[1] = ':'; root[2] = '\\'; root[3] = '\0';
+        rest = scratch + 3;
+    }
+
+    // Split rest into components, resolve . and ..
+    // Use a simple stack of string pointers
+    const char* stack[64];
+    int depth = 0;
+
+    char* tok = rest;
+    while (*tok)
+    {
+        // Find next backslash
+        char* end = tok;
+        while (*end && *end != '\\') end++;
+        char saved = *end;
+        *end = '\0';
+
+        if (tok[0] == '.' && tok[1] == '\0')
+        {
+            // "." — skip
+        }
+        else if (tok[0] == '.' && tok[1] == '.' && tok[2] == '\0')
+        {
+            // ".." — pop
+            if (depth > 0) depth--;
+        }
+        else if (tok[0] != '\0')
+        {
+            if (depth < 64) stack[depth++] = tok;
+        }
+
+        *end = saved;
+        tok = (*end == '\\') ? end + 1 : end;
+    }
+
+    // Reassemble
+    StrCopy(p, MAX_PATH_LEN, root);
+    int plen = 0; while (p[plen]) plen++;
+    for (int i = 0; i < depth; ++i)
+    {
+        const char* comp = stack[i];
+        int clen = 0; while (comp[clen]) clen++;
+        if (plen + clen + 2 < MAX_PATH_LEN)
+        {
+            if (i > 0 || root[0] == '\0') { p[plen++] = '\\'; }
+            for (int j = 0; j < clen; ++j) p[plen++] = comp[j];
+            p[plen] = '\0';
+        }
+    }
+    // Ensure trailing backslash only at drive root level
+    if (plen == 2 && p[1] == ':') { p[plen++] = '\\'; p[plen] = '\0'; }
+}
+
+// Resolve an FTP argument to a normalized full Windows path.
 // Handles:
 //   X:\path        absolute Windows
 //   /X:/path       FileZilla Unix-absolute with colon
-//   /C  or  C      bare drive letter (FileZilla sends this from virtual root)
+//   /C  or  C      bare drive letter from virtual root
 //   relative       appended to cwd
+//   ..  and  .     resolved by NormalizePath
 static void FtpResolvePath(const char* arg, char* out, int outLen)
 {
     const char* a = arg;
     if (a[0] == '/') a++;           // strip leading Unix slash
 
-    // Bare single drive letter: "C", "E", "c" etc. (with optional trailing slash)
+    // Bare single drive letter: "C", "E", "c" etc.
     if (((a[0] >= 'A' && a[0] <= 'Z') || (a[0] >= 'a' && a[0] <= 'z'))
         && (a[1] == '\0' || a[1] == '/' || a[1] == '\\'))
     {
         out[0] = (a[0] >= 'a') ? (char)(a[0] - 32) : a[0];
         out[1] = ':'; out[2] = '\\'; out[3] = '\0';
         if (a[1] == '/' || a[1] == '\\') StrCat2(out, outLen, out, a + 2);
+        NormalizePath(out);
         return;
     }
 
-    if (a[1] == ':')                // absolute: X:\... or X:/...
+    if (a[1] == ':')                // absolute: X:\...
     {
         StrCopy(out, outLen, a);
-        for (int i = 0; out[i]; ++i) if (out[i] == '/') out[i] = '\\';
     }
     else                            // relative: append to cwd
     {
@@ -743,6 +872,60 @@ static void FtpResolvePath(const char* arg, char* out, int outLen)
         if (len > 0 && out[len - 1] != '\\') { out[len] = '\\'; out[len + 1] = '\0'; }
         StrCat2(out, outLen, out, a);
     }
+    NormalizePath(out);
+}
+
+// Execute a pending LIST — enumerate and send directly to dataSock, reply 226.
+// Build listing into listBuf then start async drain via XFER_LIST.
+// Called from FtpTick once dataSock is accepted.
+static void FtpDoListing()
+{
+    s_ftp.listBufLen = 0;
+    s_ftp.listBufOff = 0;
+
+    if (s_ftp.listVirtualRoot)
+    {
+        const char* driveLetters[] = { "C", "D", "E", "F", "G", "X", "Y", "Z", NULL };
+        for (int di = 0; driveLetters[di]; ++di)
+        {
+            char pat[8];
+            pat[0] = driveLetters[di][0]; pat[1] = ':'; pat[2] = '\\'; pat[3] = '*'; pat[4] = '\0';
+            WIN32_FIND_DATA fd2;
+            HANDLE h2 = FindFirstFile(pat, &fd2);
+            if (h2 != INVALID_HANDLE_VALUE)
+            {
+                FindClose(h2);
+                char driveName[3] = { driveLetters[di][0], '\0' };
+                FtpAppendListLine(driveName, true, 0);
+            }
+        }
+    }
+    else
+    {
+        char pat[MAX_PATH_LEN + 4];
+        StrCopy(pat, sizeof(pat), s_ftp.listDir);
+        int pl = 0; while (pat[pl]) pl++;
+        if (pl > 0 && pat[pl - 1] != '\\') { pat[pl] = '\\'; pat[pl + 1] = '\0'; pl++; }
+        pat[pl] = '*'; pat[pl + 1] = '\0';
+
+        WIN32_FIND_DATA fd;
+        HANDLE h = FindFirstFile(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            do {
+                if (fd.cFileName[0] == '.' && (fd.cFileName[1] == '\0' || fd.cFileName[1] == '.')) continue;
+                bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                FtpAppendListLine(fd.cFileName, isDir, isDir ? 0 : fd.nFileSizeLow);
+            } while (FindNextFile(h, &fd));
+            FindClose(h);
+        }
+    }
+
+    // Listing built — send 150 and start async drain
+    FtpReply(150, "Opening data connection.");
+    s_ftp.listPending = false;
+    s_ftp.xferType = XFER_LIST;
+    s_ftp.state = FTP_TRANSFER;
 }
 
 // Recursively delete a directory and all its contents
@@ -930,67 +1113,23 @@ static void FtpHandleCommand(char* cmd)
             while (*listArg == ' ') listArg++;
         }
 
-        // Build listing in listBuf
-        s_ftp.listLen = 0;
-        s_ftp.listOff = 0;
-
-        // Virtual root: enumerate available drive letters as directories
+        // Resolve listing directory now (before deferred execution)
         bool listVirtualRoot = s_ftp.atVirtualRoot &&
             (listArg[0] == '\0' || (listArg[0] == '/' && listArg[1] == '\0'));
-        if (listVirtualRoot)
+        char listDir[MAX_PATH_LEN] = {};
+        if (!listVirtualRoot)
         {
-            const char* driveLetters[] = { "C", "D", "E", "F", "G", "X", "Y", "Z", NULL };
-            for (int di = 0; driveLetters[di]; ++di)
-            {
-                char pat[8];
-                pat[0] = driveLetters[di][0]; pat[1] = ':'; pat[2] = '\\'; pat[3] = '*'; pat[4] = '\0';
-                WIN32_FIND_DATA fd2;
-                HANDLE h2 = FindFirstFile(pat, &fd2);
-                if (h2 != INVALID_HANDLE_VALUE)
-                {
-                    FindClose(h2);
-                    FileEntry tmp;
-                    tmp.name[0] = driveLetters[di][0]; tmp.name[1] = '\0';
-                    tmp.isDir = true;
-                    tmp.sizeLow = 0;
-                    FtpAppendListLine(tmp);
-                }
-            }
-        }
-        else
-        {
-            // Normal directory listing
-            char listDir[MAX_PATH_LEN];
             if (listArg[0] != '\0')
                 FtpResolvePath(listArg, listDir, sizeof(listDir));
             else
                 StrCopy(listDir, sizeof(listDir), s_ftp.cwd);
-
-            char pat[MAX_PATH_LEN + 4];
-            StrCopy(pat, sizeof(pat), listDir);
-            int pl = 0; while (pat[pl]) pl++;
-            if (pl > 0 && pat[pl - 1] != '\\') { pat[pl] = '\\'; pat[pl + 1] = '\0'; pl++; }
-            pat[pl] = '*'; pat[pl + 1] = '\0';
-
-            WIN32_FIND_DATA fd;
-            HANDLE h = FindFirstFile(pat, &fd);
-            if (h != INVALID_HANDLE_VALUE)
-            {
-                do {
-                    if (fd.cFileName[0] == '.' && (fd.cFileName[1] == '\0' || fd.cFileName[1] == '.')) continue;
-                    FileEntry tmp;
-                    TruncName(fd.cFileName, tmp.name, MAX_NAME_LEN - 1, MAX_NAME_LEN);
-                    tmp.isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                    tmp.sizeLow = tmp.isDir ? 0 : fd.nFileSizeLow;
-                    FtpAppendListLine(tmp);
-                } while (FindNextFile(h, &fd));
-                FindClose(h);
-            }
         }
 
-        FtpReply(150, "Opening data connection.");
-        s_ftp.xferType = XFER_LIST;
-        s_ftp.state = FTP_TRANSFER;
+        // Store as pending — FtpTick dispatches once dataSock is accepted.
+        // If dataSock is already available, FtpTick fires it next frame.
+        s_ftp.listPending = true;
+        s_ftp.listVirtualRoot = listVirtualRoot;
+        StrCopy(s_ftp.listDir, sizeof(s_ftp.listDir), listDir);
     }
     else if (verb[0] == 'R' && verb[1] == 'E' && verb[2] == 'T' && verb[3] == 'R')
     {
@@ -1012,6 +1151,8 @@ static void FtpHandleCommand(char* cmd)
         s_ftp.xferFile = hf;
         s_ftp.xferTotal = GetFileSize(hf, NULL);
         s_ftp.xferDone = 0;
+        s_ftp.retrBufLen = 0;
+        s_ftp.retrBufOff = 0;
         TruncName(arg, s_ftp.xferName, 18, sizeof(s_ftp.xferName));
         StrCopy(s_ftp.xferPath, sizeof(s_ftp.xferPath), fullPath);
         FtpReply(150, "Opening data connection.");
@@ -1059,7 +1200,13 @@ static void FtpHandleCommand(char* cmd)
         s_ftp.gotUser = false;
         s_ftp.gotRnfr = false;
         s_ftp.atVirtualRoot = false;
+        s_ftp.listPending = false;
         s_ftp.xferType = XFER_NONE;
+        s_ftp.recvLen = 0;
+        s_ftp.listBufLen = 0;
+        s_ftp.listBufOff = 0;
+        s_ftp.sendLen = 0;
+        s_ftp.sendOff = 0;
     }
     else if (verb[0] == 'D' && verb[1] == 'E' && verb[2] == 'L' && verb[3] == 'E')
     {
@@ -1104,12 +1251,23 @@ static void FtpHandleCommand(char* cmd)
     }
     else if (verb[0] == 'R' && verb[1] == 'N' && verb[2] == 'F' && verb[3] == 'R')
     {
-        // Rename from — store source path, wait for RNTO
+        // Rename from — verify source exists before storing
         char fullPath[MAX_PATH_LEN];
         FtpResolvePath(arg, fullPath, sizeof(fullPath));
-        StrCopy(s_ftp.rnfrPath, sizeof(s_ftp.rnfrPath), fullPath);
-        s_ftp.gotRnfr = true;
-        FtpReply(350, "Waiting for RNTO.");
+
+        // Check as file first, then as directory
+        DWORD attr = GetFileAttributesA(fullPath);
+        if (attr == 0xFFFFFFFF)
+        {
+            s_ftp.gotRnfr = false;
+            FtpReply(550, "No such file or directory.");
+        }
+        else
+        {
+            StrCopy(s_ftp.rnfrPath, sizeof(s_ftp.rnfrPath), fullPath);
+            s_ftp.gotRnfr = true;
+            FtpReply(350, "Waiting for RNTO.");
+        }
     }
     else if (verb[0] == 'R' && verb[1] == 'N' && verb[2] == 'T' && verb[3] == 'O')
     {
@@ -1129,7 +1287,7 @@ static void FtpHandleCommand(char* cmd)
     else if (verb[0] == 'F' && verb[1] == 'E' && verb[2] == 'A' && verb[3] == 'T')
     {
         // Advertise SIZE so clients know file sizes before transfer
-        FtpSendStr(s_ftp.ctrlSock, "211-Features:\r\n SIZE\r\n REST STREAM\r\n TVFS\r\n211 END\r\n");
+        FtpSendStr(s_ftp.ctrlSock, "211-Features:\r\n SIZE\r\n TVFS\r\n211 END\r\n");
     }
     else if (verb[0] == 'O' && verb[1] == 'P' && verb[2] == 'T' && verb[3] == 'S')
     {
@@ -1174,6 +1332,41 @@ static void FtpTick()
 {
     if (s_ftp.state == FTP_OFF) return;
 
+    // ---- Drain ctrl send buffer ------------------------------------------
+    // FtpSendStr() queues into sendBuf; we push bytes here each tick so
+    // WSAEWOULDBLOCK never silently drops part of a reply.
+    if (s_ftp.ctrlSock != INVALID_SOCKET && s_ftp.sendLen > s_ftp.sendOff)
+    {
+        int n = send(s_ftp.ctrlSock,
+            s_ftp.sendBuf + s_ftp.sendOff,
+            s_ftp.sendLen - s_ftp.sendOff, 0);
+        if (n > 0)
+        {
+            s_ftp.sendOff += n;
+            if (s_ftp.sendOff >= s_ftp.sendLen)
+                s_ftp.sendOff = s_ftp.sendLen = 0;  // buffer fully drained
+        }
+        else if (n < 0 && WSAGetLastError() != WSAEWOULDBLOCK)
+        {
+            // Hard send error on ctrl socket — treat as disconnect
+            closesocket(s_ftp.ctrlSock); s_ftp.ctrlSock = INVALID_SOCKET;
+            if (s_ftp.xferFile != INVALID_HANDLE_VALUE)
+            {
+                CloseHandle(s_ftp.xferFile); s_ftp.xferFile = INVALID_HANDLE_VALUE;
+            }
+            if (s_ftp.dataSock != INVALID_SOCKET) { closesocket(s_ftp.dataSock);   s_ftp.dataSock = INVALID_SOCKET; }
+            if (s_ftp.dataListen != INVALID_SOCKET) { closesocket(s_ftp.dataListen); s_ftp.dataListen = INVALID_SOCKET; }
+            s_ftp.authed = false; s_ftp.gotUser = false; s_ftp.gotRnfr = false;
+            s_ftp.atVirtualRoot = false; s_ftp.listPending = false;
+            s_ftp.xferType = XFER_NONE; s_ftp.recvLen = 0;
+            s_ftp.retrBufLen = 0; s_ftp.retrBufOff = 0;
+            s_ftp.listBufLen = 0; s_ftp.listBufOff = 0;
+            s_ftp.sendLen = 0; s_ftp.sendOff = 0;
+            s_ftp.state = FTP_LISTEN;
+            return;
+        }
+    }
+
     // ---- Accept new control connection ------------------------------------
     if (s_ftp.state == FTP_LISTEN && s_ftp.listenSock != INVALID_SOCKET)
     {
@@ -1197,8 +1390,6 @@ static void FtpTick()
 
     // ---- Accept passive data connection ----------------------------------
     // Try to accept whenever dataListen is open and we don't have dataSock yet.
-    // This covers both FTP_CONNECTED (PASV sent, waiting for LIST/RETR/STOR)
-    // and FTP_TRANSFER (command issued, client now connecting to data port).
     if (s_ftp.dataSock == INVALID_SOCKET &&
         s_ftp.dataListen != INVALID_SOCKET &&
         (s_ftp.state == FTP_CONNECTED || s_ftp.state == FTP_TRANSFER))
@@ -1209,12 +1400,21 @@ static void FtpTick()
         {
             u_long nb = 1; ioctlsocket(ds, FIONBIO, &nb);
             s_ftp.dataSock = ds;
+
+            // If a LIST was waiting for a data connection, execute it now
+            if (s_ftp.listPending)
+                FtpDoListing();
         }
     }
 
     // ---- Control socket: read commands -----------------------------------
+    // If the ctrl send buffer is critically full, stop processing incoming
+    // commands this tick — let the drain loop above catch up first.
+    // This means the client waits rather than receiving a dropped/missing reply.
+    const int SEND_BUF_PAUSE_THRESHOLD = (int)sizeof(s_ftp.sendBuf) - 256;
     if ((s_ftp.state == FTP_CONNECTED || s_ftp.state == FTP_TRANSFER) &&
-        s_ftp.ctrlSock != INVALID_SOCKET)
+        s_ftp.ctrlSock != INVALID_SOCKET &&
+        s_ftp.sendLen < SEND_BUF_PAUSE_THRESHOLD)
     {
         // Try to receive more data into recvBuf
         int space = (int)sizeof(s_ftp.recvBuf) - s_ftp.recvLen - 1;
@@ -1225,7 +1425,7 @@ static void FtpTick()
             if (n > 0) s_ftp.recvLen += n;
             else if (n == 0 || (n < 0 && WSAGetLastError() != WSAEWOULDBLOCK))
             {
-                // Client disconnected or hard socket error — reset to LISTEN
+                // Client disconnected or hard socket error — full session teardown
                 if (s_ftp.xferFile != INVALID_HANDLE_VALUE)
                 {
                     CloseHandle(s_ftp.xferFile); s_ftp.xferFile = INVALID_HANDLE_VALUE;
@@ -1233,14 +1433,45 @@ static void FtpTick()
                 if (s_ftp.dataSock != INVALID_SOCKET) { closesocket(s_ftp.dataSock);   s_ftp.dataSock = INVALID_SOCKET; }
                 if (s_ftp.dataListen != INVALID_SOCKET) { closesocket(s_ftp.dataListen); s_ftp.dataListen = INVALID_SOCKET; }
                 closesocket(s_ftp.ctrlSock); s_ftp.ctrlSock = INVALID_SOCKET;
+                // Scrub all session state so reconnect starts clean
+                s_ftp.authed = false;
+                s_ftp.gotUser = false;
+                s_ftp.gotRnfr = false;
+                s_ftp.atVirtualRoot = false;
+                s_ftp.listPending = false;
+                s_ftp.xferType = XFER_NONE;
+                s_ftp.recvLen = 0;
+                s_ftp.retrBufLen = 0;
+                s_ftp.retrBufOff = 0;
+                s_ftp.listBufLen = 0;
+                s_ftp.listBufOff = 0;
+                s_ftp.sendLen = 0;
+                s_ftp.sendOff = 0;
                 s_ftp.state = FTP_LISTEN;
                 return;
             }
         }
         else
         {
-            // recvBuf full — discard contents, client sent something too long
-            s_ftp.recvLen = 0;
+            // recvBuf full — the incoming command is too long.
+            // Scan for a \n so we can discard just this one broken command
+            // rather than the entire receive stream, keeping the session live.
+            int nl = -1;
+            for (int i = 0; i < s_ftp.recvLen; ++i)
+                if (s_ftp.recvBuf[i] == '\n') { nl = i; break; }
+            if (nl >= 0)
+            {
+                // Discard up through the newline, keep the rest
+                int remaining = s_ftp.recvLen - nl - 1;
+                for (int i = 0; i < remaining; ++i)
+                    s_ftp.recvBuf[i] = s_ftp.recvBuf[nl + 1 + i];
+                s_ftp.recvLen = remaining;
+            }
+            else
+            {
+                // No newline found — whole buffer is one overlong command, drop it
+                s_ftp.recvLen = 0;
+            }
         }
 
         // Parse complete lines (\r\n terminated) and handle them
@@ -1268,22 +1499,6 @@ static void FtpTick()
         }
     }
 
-    // ---- Stale data socket check -----------------------------------------
-    // If dataSock is accepted but no transfer has started and the client
-    // dropped it, clean up so the next PASV can work.
-    if (s_ftp.state == FTP_CONNECTED &&
-        s_ftp.dataSock != INVALID_SOCKET &&
-        s_ftp.xferType == XFER_NONE)
-    {
-        char probe[1];
-        int r = recv(s_ftp.dataSock, probe, 0, 0);
-        if (r == 0 || (r < 0 && WSAGetLastError() != WSAEWOULDBLOCK))
-        {
-            closesocket(s_ftp.dataSock);
-            s_ftp.dataSock = INVALID_SOCKET;
-        }
-    }
-
     // ---- Data transfer ---------------------------------------------------
     if (s_ftp.state == FTP_TRANSFER && s_ftp.dataSock != INVALID_SOCKET)
     {
@@ -1291,30 +1506,31 @@ static void FtpTick()
 
         if (s_ftp.xferType == XFER_LIST)
         {
-            // Send listing data
-            int remaining = s_ftp.listLen - s_ftp.listOff;
-            if (remaining > 0)
+            // Drain listBuf into dataSock non-blockingly, same pattern as RETR
+            if (s_ftp.listBufOff < s_ftp.listBufLen)
             {
+                int toSend = s_ftp.listBufLen - s_ftp.listBufOff;
                 int sent = send(s_ftp.dataSock,
-                    s_ftp.listBuf + s_ftp.listOff, remaining, 0);
+                    s_ftp.listBuf + s_ftp.listBufOff, toSend, 0);
                 if (sent > 0)
                 {
-                    s_ftp.listOff += sent;
+                    s_ftp.listBufOff += sent;
                 }
                 else if (sent < 0 && WSAGetLastError() != WSAEWOULDBLOCK)
                 {
-                    // Client aborted during listing
+                    // Data socket died mid-listing
                     closesocket(s_ftp.dataSock); s_ftp.dataSock = INVALID_SOCKET;
+                    FtpReply(426, "Connection closed; transfer aborted.");
                     s_ftp.xferType = XFER_NONE;
                     s_ftp.state = FTP_CONNECTED;
+                    return;
                 }
-                // WSAEWOULDBLOCK: retry next frame
+                // WSAEWOULDBLOCK — just wait for next tick
             }
             else
             {
-                // Listing fully sent — close data connection
+                // All listing data sent — close data socket and reply 226
                 closesocket(s_ftp.dataSock); s_ftp.dataSock = INVALID_SOCKET;
-                // dataListen stays open for the next PASV/transfer
                 FtpReply(226, "Transfer complete.");
                 s_ftp.xferType = XFER_NONE;
                 s_ftp.state = FTP_CONNECTED;
@@ -1322,25 +1538,56 @@ static void FtpTick()
         }
         else if (s_ftp.xferType == XFER_RETR)
         {
-            // Read chunk from file, send to client
-            DWORD bytesRead = 0;
-            if (ReadFile(s_ftp.xferFile, ioBuf, sizeof(ioBuf), &bytesRead, NULL) && bytesRead > 0)
+            // If we have unsent data from last tick, drain it first
+            if (s_ftp.retrBufOff < s_ftp.retrBufLen)
             {
-                int sent = send(s_ftp.dataSock, ioBuf, (int)bytesRead, 0);
+                int toSend = s_ftp.retrBufLen - s_ftp.retrBufOff;
+                int sent = send(s_ftp.dataSock,
+                    s_ftp.retrBuf + s_ftp.retrBufOff, toSend, 0);
                 if (sent > 0)
                 {
+                    s_ftp.retrBufOff += sent;
                     s_ftp.xferDone += (DWORD)sent;
                 }
-                else if (sent <= 0 && WSAGetLastError() != WSAEWOULDBLOCK)
+                else if (sent < 0 && WSAGetLastError() != WSAEWOULDBLOCK)
                 {
-                    // Client aborted — clean up without 226
+                    // Client aborted
                     closesocket(s_ftp.dataSock); s_ftp.dataSock = INVALID_SOCKET;
                     CloseHandle(s_ftp.xferFile); s_ftp.xferFile = INVALID_HANDLE_VALUE;
                     FtpReply(426, "Transfer aborted.");
                     s_ftp.xferType = XFER_NONE;
                     s_ftp.state = FTP_CONNECTED;
                 }
-                // WSAEWOULDBLOCK: buffer full this frame, retry next frame
+                // Either drained or WSAEWOULDBLOCK — don't read more this tick
+                return;
+            }
+
+            // Buffer empty — read next chunk from file
+            s_ftp.retrBufLen = 0;
+            s_ftp.retrBufOff = 0;
+            DWORD bytesRead = 0;
+            if (ReadFile(s_ftp.xferFile, s_ftp.retrBuf, sizeof(s_ftp.retrBuf),
+                &bytesRead, NULL) && bytesRead > 0)
+            {
+                s_ftp.retrBufLen = (int)bytesRead;
+                // Don't send here — let next tick's drain path handle it
+                // (avoids double-tick issue; drain runs at top of next frame)
+                int sent = send(s_ftp.dataSock, s_ftp.retrBuf, s_ftp.retrBufLen, 0);
+                if (sent > 0)
+                {
+                    s_ftp.retrBufOff += sent;
+                    s_ftp.xferDone += (DWORD)sent;
+                }
+                else if (sent < 0 && WSAGetLastError() != WSAEWOULDBLOCK)
+                {
+                    closesocket(s_ftp.dataSock); s_ftp.dataSock = INVALID_SOCKET;
+                    CloseHandle(s_ftp.xferFile); s_ftp.xferFile = INVALID_HANDLE_VALUE;
+                    FtpReply(426, "Transfer aborted.");
+                    s_ftp.xferType = XFER_NONE;
+                    s_ftp.state = FTP_CONNECTED;
+                }
+                // Partial or WSAEWOULDBLOCK: retrBufOff < retrBufLen,
+                // remainder drained next tick
             }
             else
             {
@@ -1360,8 +1607,18 @@ static void FtpTick()
             if (n > 0)
             {
                 DWORD written = 0;
-                WriteFile(s_ftp.xferFile, ioBuf, (DWORD)n, &written, NULL);
-                s_ftp.xferDone += (DWORD)n;
+                if (!WriteFile(s_ftp.xferFile, ioBuf, (DWORD)n, &written, NULL) ||
+                    written != (DWORD)n)
+                {
+                    // Disk full or write error — abort
+                    closesocket(s_ftp.dataSock); s_ftp.dataSock = INVALID_SOCKET;
+                    CloseHandle(s_ftp.xferFile); s_ftp.xferFile = INVALID_HANDLE_VALUE;
+                    FtpReply(452, "Write error - disk full?");
+                    s_ftp.xferType = XFER_NONE;
+                    s_ftp.state = FTP_CONNECTED;
+                    return;
+                }
+                s_ftp.xferDone += written;
             }
             else if (n == 0)
             {
@@ -1443,7 +1700,7 @@ static void DrawFtpWidget()
     {
         // Transfer verb + filename
         const char* verb = (s_ftp.xferType == XFER_RETR) ? "GET " :
-            (s_ftp.xferType == XFER_STOR) ? "PUT " : "LST ";
+            (s_ftp.xferType == XFER_STOR) ? "PUT " : "??? ";
         char dispLine[32];
         StrCopy(dispLine, sizeof(dispLine), verb);
         StrCat2(dispLine, sizeof(dispLine), dispLine, s_ftp.xferName);
