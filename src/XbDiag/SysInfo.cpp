@@ -66,6 +66,8 @@ struct SysData
     bool  rtcPresent;           // X-RTC module at SMBus 0x68
     bool  dispPresent;          // I2C display detected at 0x27, 0x3C, or 0x3D
     char  dispAddr[8];          // e.g. "0x3C"
+    char  modchipName[20];      // e.g. "Aladdin 1MB", "Modxo", "None/TSOP"
+    char  hdModVer[16];         // e.g. "V1.2.3" or "Not Detected"
 
     // BIOS
     char biosVer[32];
@@ -482,6 +484,98 @@ static void DetectBoardRevision(SysData& d, BYTE nvRev)
 }
 
 // ============================================================================
+// Modchip detection  (ref: PrometheOS modchip::detectModchip)
+// Uses direct port I/O reads at known modchip LPC signature addresses.
+// Returns a static string — do not free.
+// IMPORTANT: unknown result means TSOP/no modchip, NOT a probe failure.
+// ============================================================================
+
+static const char* DetectModchip()
+{
+    // Each probe: read a port, check for a known signature byte.
+    // All inline __asm per-instruction (no __ftol2_sse concern here, but
+    // keeping consistent with project style).
+    BYTE val = 0;
+
+    // Xecuter: port 0xF500 == 0xE1
+    __asm { mov dx, 0xF500 }
+    __asm { in  al, dx     }
+    __asm { mov val, al    }
+    if (val == 0xE1) return "Xecuter";
+
+    // Modxo: port 0xDEAD == 0xAF
+    __asm { mov dx, 0xDEAD }
+    __asm { in  al, dx     }
+    __asm { mov val, al    }
+    if (val == 0xAF) return "Modxo";
+
+    // Aladdin 1MB Lattice: port 0xF701 == 0x11
+    __asm { mov dx, 0xF701 }
+    __asm { in  al, dx     }
+    __asm { mov val, al    }
+    if (val == 0x11) return "Aladdin 1MB";
+
+    // Aladdin 1MB Xilinx: port 0xF701 == 0x15
+    if (val == 0x15) return "Aladdin 1MB";
+
+    // Aladdin 2MB Lattice: port 0xF701 == 0x69
+    if (val == 0x69) return "Aladdin 2MB";
+
+    // Xchanger: port 0x1912 != 0xFF
+    __asm { mov dx, 0x1912 }
+    __asm { in  al, dx     }
+    __asm { mov val, al    }
+    if (val != 0xFF) return "Xchanger";
+
+    // No known signature matched — TSOP or softmod boot
+    return "None / TSOP";
+}
+
+// ============================================================================
+// HD mod (HDMI adapter) detection  (ref: PrometheOS xboxConfig::getHdModString)
+// Probes SMBus address 0x44 (sw-shifted 0x88) — Chimeric/HDMI adapters.
+// On success reads version bytes from regs 0x57/0x58/0x59.
+// ============================================================================
+
+static void DetectHdMod(SysData& d)
+{
+    // Probe: write then read reg 0 at sw-addr 0x88 (7-bit 0x44)
+    // PrometheOS probes with a write first to wake the device.
+    BYTE dummy = 0;
+    bool probeOK = SMBusWrite(0x88, 0x00, 0x00) && SMBusRead(0x88, 0x00, dummy);
+
+    BYTE busAddr = 0x88;
+    if (!probeOK)
+    {
+        // Try secondary address 0x86 (7-bit 0x43) used by some adapters
+        probeOK = SMBusWrite(0x86, 0x00, 0x00) && SMBusRead(0x86, 0x00, dummy);
+        if (!probeOK)
+        {
+            StrCopy(d.hdModVer, sizeof(d.hdModVer), "Not Detected");
+            return;
+        }
+        busAddr = 0x86;
+    }
+
+    // Read version regs 0x57/0x58/0x59
+    BYTE v1 = 0, v2 = 0, v3 = 0;
+    SMBusRead(busAddr, 0x57, v1);
+    SMBusRead(busAddr, 0x58, v2);
+    SMBusRead(busAddr, 0x59, v3);
+
+    // Build "V%d.%d.%d" — use separate src buffer to avoid StrCat2 self-alias
+    char tmp[16];
+    char t[8];
+    StrCopy(tmp, sizeof(tmp), "V");
+    IntToStr(v1, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
+    StrCat2(tmp, sizeof(tmp), tmp, ".");
+    IntToStr(v2, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
+    StrCat2(tmp, sizeof(tmp), tmp, ".");
+    IntToStr(v3, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
+    StrCopy(d.hdModVer, sizeof(d.hdModVer), tmp);
+}
+
+// ============================================================================
 // Read all hardware data
 // ============================================================================
 
@@ -841,7 +935,11 @@ static void ReadSysData()
         }
     }
 
-    // --- HDD (ATA IDENTIFY, primary channel 0x1F0, master) ---
+    // --- Modchip detection (ref: PrometheOS modchip::detectModchip) ---
+    StrCopy(d.modchipName, sizeof(d.modchipName), DetectModchip());
+
+    // --- HD mod / HDMI adapter detection (ref: PrometheOS getHdModString) ---
+    DetectHdMod(d);
     {
         WORD buf[256];
         d.hddPresent = AtaIdentify(buf);
@@ -1141,12 +1239,14 @@ static void ExportSysInfo()
     {
         char dispLine[24];
         StrCat2(dispLine, sizeof(dispLine), "Display @ ", d.dispAddr);
-        WriteLine(hf, "LCD Display:       ", dispLine);
+        WriteLine(hf, "LCD Display:   ", dispLine);
     }
     else
     {
-        WriteLine(hf, "LCD Display:       ", "Not detected");
+        WriteLine(hf, "LCD Display:   ", "Not detected");
     }
+    WriteLine(hf, "Modchip:       ", d.modchipName);
+    WriteLine(hf, "HD Mod:        ", d.hdModVer);
     WriteLine(hf, "BIOS:          ", d.biosVer);
     WriteLine(hf, "Encoder:       ", d.encName);
     WriteLine(hf, "AV Pack:       ", d.avPack);
@@ -1302,7 +1402,21 @@ static void Render(const DiagLogo& logo)
     }
     y1 += LH + GAP;
 
-    // ---- RIGHT: Video ----
+    // Modchip
+    {
+        bool hasChip = (d.modchipName[0] != 'N'); // "None / TSOP" starts with N
+        DrawRow(C1, y1, V1, "MODCHIP:", d.modchipName,
+            hasChip ? COL_GREEN : COL_DIM);
+        y1 += LH + GAP;
+    }
+
+    // HD mod / HDMI adapter
+    {
+        bool hasHdMod = (d.hdModVer[0] == 'V');
+        DrawRow(C1, y1, V1, "HD MOD :", d.hdModVer,
+            hasHdMod ? COL_GREEN : COL_DIM);
+        y1 += LH + GAP;
+    }
     DrawSection(C2, y2, RULEW, "VIDEO");                         y2 += LH + 4.f;
     DrawRow(C2, y2, V2, "ENCODER:", d.encName, COL_CYAN);       y2 += LH;
     DrawRow(C2, y2, V2, "ENC ID :", d.encId, COL_WHITE);      y2 += LH;

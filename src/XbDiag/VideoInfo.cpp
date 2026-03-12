@@ -77,6 +77,9 @@ struct VideoData
     // AV pack (SMBus 0x45 reg 0x04)
     char avPack[24];     // "Composite" / "HDTV" / "S-Video" etc
 
+    // HD mod / HDMI adapter (SMBus 0x44 / 0x43, Chimeric-compatible)
+    char hdModVer[16];   // "V1.2.3" or "" if not detected
+
     // NV2A registers (MMIO 0xFD000000)
     bool nv2aOK;
     char memClkStr[12];  // "200 MHz"
@@ -415,6 +418,36 @@ static void LoadData()
     }
     else StrCopy(d.avPack, sizeof(d.avPack), "PIC NAK");
 
+    // ---- HD mod / HDMI adapter (ref: PrometheOS xboxConfig::getHdModString) ----
+    // Probe sw-addr 0x88 (7-bit 0x44) then fall back to 0x86 (7-bit 0x43).
+    // Write first to wake device, then read version regs 0x57/0x58/0x59.
+    {
+        d.hdModVer[0] = '\0';
+        BYTE dummy = 0;
+        BYTE busAddr = 0;
+        if (SMBusWrite(0x88, 0x00, 0x00) && SMBusRead(0x88, 0x00, dummy))
+            busAddr = 0x88;
+        else if (SMBusWrite(0x86, 0x00, 0x00) && SMBusRead(0x86, 0x00, dummy))
+            busAddr = 0x86;
+
+        if (busAddr != 0)
+        {
+            BYTE v1 = 0, v2 = 0, v3 = 0;
+            SMBusRead(busAddr, 0x57, v1);
+            SMBusRead(busAddr, 0x58, v2);
+            SMBusRead(busAddr, 0x59, v3);
+            char tmp[16];
+            char t[8];
+            StrCopy(tmp, sizeof(tmp), "V");
+            IntToStr(v1, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
+            StrCat2(tmp, sizeof(tmp), tmp, ".");
+            IntToStr(v2, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
+            StrCat2(tmp, sizeof(tmp), tmp, ".");
+            IntToStr(v3, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
+            StrCopy(d.hdModVer, sizeof(d.hdModVer), tmp);
+        }
+    }
+
     // ---- NV2A MMIO registers ----
     LoadNV2A(d);
 }
@@ -715,6 +748,17 @@ static void Render(const DiagLogo& logo)
         DrawText(COL_R, y2, "PIC (0x20) not responding.", 1.1f, COL_DIM);
         y2 += LH;
         DrawText(COL_R, y2, "Normal on xemu.", 1.1f, COL_DIM);
+        y2 += LH;
+    }
+
+    // ---- RIGHT: HD mod ----
+    if (d.hdModVer[0] != '\0')
+    {
+        y2 += GAP;
+        DrawText(COL_R, y2, "HD MOD", 1.3f, COL_YELLOW);
+        HLine(y2 + LH + 1.f, COL_R, SW - LM, COL_BORDER);
+        y2 += LH + 6.f;
+        DrawRow(COL_R, COL_VR, y2, "VERSION :", d.hdModVer, COL_CYAN);  y2 += LH;
     }
 
     g_pDevice->EndScene();

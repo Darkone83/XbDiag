@@ -162,6 +162,11 @@ static const KnownDevice s_known[] =
         "SSD1306/SSD1309 OLED display  -  128x64 or 128x32 (addr 0x3D)",
         "Reg 0x00=cmd  0x40=data  SA0 pin high selects this address"
     },
+    {
+        0x44, "HD MOD",
+        "HDMI adapter (Chimeric/compatible)  -  7-bit 0x44, sw-addr 0x88",
+        "Reg 0x57=ver_major  0x58=ver_minor  0x59=ver_patch"
+    },
 };
 static const int s_knownCount = sizeof(s_known) / sizeof(s_known[0]);
 
@@ -224,6 +229,12 @@ static const RegDesc s_regs_oled[] =
 {
     { 0x00, "CMD REG " },
 };
+static const RegDesc s_regs_hdmod[] =
+{
+    { 0x57, "VER MAJ " },
+    { 0x58, "VER MIN " },
+    { 0x59, "VER PTCH" },
+};
 static const RegDesc s_regs_generic[] =
 {
     { 0x00, "REG 0x00" },
@@ -245,6 +256,7 @@ static const DeviceRegs s_devRegs[] =
     { 0x68, s_regs_rtc,    4 },   // X-RTC DS1307
     { 0x3C, s_regs_oled,   1 },   // OLED 0x3C
     { 0x3D, s_regs_oled,   1 },   // OLED 0x3D
+    { 0x44, s_regs_hdmod,  3 },   // HDMI adapter (Chimeric/compatible)
 };
 static const int s_devRegsCount = sizeof(s_devRegs) / sizeof(s_devRegs[0]);
 
@@ -795,21 +807,14 @@ static void DrawInfoPanel()
 
     // ---- ID source badge (bottom-right of panel) ----------------------------
     {
-        char badge[40];
+        char badge[48];
+        StrCopy(badge, sizeof(badge), "internal db");
         if (s_idFileLoaded && s_userKnownCount > 0)
         {
-            StrCopy(badge, sizeof(badge), "smbid.id  +");
+            StrCat2(badge, sizeof(badge), badge, "  +  smbid.id (");
             char cnt[6]; IntToStr(s_userKnownCount, cnt, sizeof(cnt));
             StrCat2(badge, sizeof(badge), badge, cnt);
-            StrCat2(badge, sizeof(badge), badge, " user");
-        }
-        else if (s_idFileLoaded)
-        {
-            StrCopy(badge, sizeof(badge), "smbid.id  (no entries)");
-        }
-        else
-        {
-            StrCopy(badge, sizeof(badge), "internal db");
+            StrCat2(badge, sizeof(badge), badge, ")");
         }
         DrawTextR(PANEL_X + PANEL_W - 8.f, PANEL_BOTTOM - LINE_H - 2.f,
             badge, 1.0f, COL_DIM);
