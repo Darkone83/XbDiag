@@ -46,6 +46,13 @@
 extern void RequestState(int newState);
 static const int MSTATE_MENU = 0;
 
+extern "C" VOID __stdcall KeStallExecutionProcessor(ULONG Microseconds);
+
+// Board revision query — SysInfo exposes this so SmBusScan can adjust behaviour.
+// Returns true if the board is a 1.6 or 1.6b (Xcalibur, bus-sensitive).
+// SysInfo_GetBoardRev() is defined at the bottom of SysInfo.cpp.
+extern const char* SysInfo_GetBoardRev();
+
 // ============================================================================
 // Grid geometry  (design-space pixels, scaled by SX/SY at render time)
 // ============================================================================
@@ -162,11 +169,6 @@ static const KnownDevice s_known[] =
         "SSD1306/SSD1309 OLED display  -  128x64 or 128x32 (addr 0x3D)",
         "Reg 0x00=cmd  0x40=data  SA0 pin high selects this address"
     },
-    {
-        0x44, "HD MOD",
-        "HDMI adapter (Chimeric/compatible)  -  7-bit 0x44, sw-addr 0x88",
-        "Reg 0x57=ver_major  0x58=ver_minor  0x59=ver_patch"
-    },
 };
 static const int s_knownCount = sizeof(s_known) / sizeof(s_known[0]);
 
@@ -229,12 +231,6 @@ static const RegDesc s_regs_oled[] =
 {
     { 0x00, "CMD REG " },
 };
-static const RegDesc s_regs_hdmod[] =
-{
-    { 0x57, "VER MAJ " },
-    { 0x58, "VER MIN " },
-    { 0x59, "VER PTCH" },
-};
 static const RegDesc s_regs_generic[] =
 {
     { 0x00, "REG 0x00" },
@@ -256,7 +252,6 @@ static const DeviceRegs s_devRegs[] =
     { 0x68, s_regs_rtc,    4 },   // X-RTC DS1307
     { 0x3C, s_regs_oled,   1 },   // OLED 0x3C
     { 0x3D, s_regs_oled,   1 },   // OLED 0x3D
-    { 0x44, s_regs_hdmod,  3 },   // HDMI adapter (Chimeric/compatible)
 };
 static const int s_devRegsCount = sizeof(s_devRegs) / sizeof(s_devRegs[0]);
 
@@ -437,6 +432,9 @@ static void IdLoad()
 
 enum ScanPhase { PHASE_SCANNING, PHASE_DONE };
 
+// Warning / confirmation state for 1.6 boards
+enum WarnState { WARN_NONE, WARN_PENDING, WARN_ACCEPTED };
+
 struct AddrResult { bool scanned; bool ack; };
 
 static AddrResult s_results[ADDR_COUNT];
@@ -445,6 +443,20 @@ static int        s_scanNext;
 static int        s_cursor;
 static bool       s_regReadOpen;    // register read panel active
 static WORD       s_prevBtns;
+
+// 1.6 / 1.6b safety
+static bool       s_is16 = false;  // Xcalibur board detected
+static WarnState  s_warnState = WARN_NONE;
+// Xcalibur (0x70) one-shot: probe once per session, reuse result on re-scan
+static bool       s_xcalibProbed = false;
+static bool       s_xcalibAck = false;
+// On 1.6: count down frames between probes to reduce bus pressure
+static int        s_scanFrameSkip = 0;
+
+// Reserved addresses can be manually probed once via [Y].
+// Tracked separately so re-scans never touch them automatically.
+static bool       s_reservedProbed[ADDR_COUNT];  // has [Y] been pressed for this addr
+static bool       s_reservedAck[ADDR_COUNT];     // result of that one-shot
 
 static const int  MAX_DETAIL_ROWS = 8;
 struct DetailRow { char label[12]; char valStr[8]; bool ok; };
@@ -458,6 +470,20 @@ static int        s_detailCount;
 static bool EdgeDown(WORD cur, WORD prev, WORD btn)
 {
     return ((cur & btn) != 0) && ((prev & btn) == 0);
+}
+
+// SMBus spec reserves 0x00-0x07 (general call, CBUS, reserved) and
+// 0x78-0x7F (10-bit address range).  Never probe these on any revision.
+static bool IsReservedAddr(int addr)
+{
+    return (addr <= 0x07) || (addr >= 0x78);
+}
+
+// Xcalibur sits at 7-bit 0x70 and is extremely bus-sensitive on 1.6/1.6b.
+// We probe it exactly once per session; re-scans reuse the cached result.
+static bool IsXcaliburAddr(int addr)
+{
+    return (addr == 0x70);
 }
 
 // Scratch KnownDevice used to surface a UserDevice through FindKnown's return type.
@@ -495,12 +521,42 @@ static void ResetScan()
 {
     for (int i = 0; i < ADDR_COUNT; ++i)
     {
-        s_results[i].scanned = false;
-        s_results[i].ack = false;
+        if (IsReservedAddr(i))
+        {
+            // Mark reserved addresses as scanned-but-NAK so they render as
+            // dark/skipped and the cursor strip shows "reserved" for them.
+            s_results[i].scanned = true;
+            s_results[i].ack = false;
+        }
+        else if (s_is16 && IsXcaliburAddr(i))
+        {
+            // Xcalibur is probed once on the first scan only.
+            // On re-scans s_xcalibProbed is already true so we just replay
+            // the cached result without touching the bus.
+            if (s_xcalibProbed)
+            {
+                s_results[i].scanned = true;
+                s_results[i].ack = s_xcalibAck;
+            }
+            // else: leave as unscanned — the scan tick will probe it once and
+            // set s_xcalibProbed so it never happens again.
+        }
+        else
+        {
+            s_results[i].scanned = false;
+            s_results[i].ack = false;
+        }
     }
+    // Advance s_scanNext past any already-handled addresses at the start
     s_scanNext = 0;
-    s_phase = PHASE_SCANNING;
+    while (s_scanNext < ADDR_COUNT && s_results[s_scanNext].scanned)
+        ++s_scanNext;
+    if (s_scanNext >= ADDR_COUNT)
+        s_phase = PHASE_DONE;
+    else
+        s_phase = PHASE_SCANNING;
     s_regReadOpen = false;
+    s_scanFrameSkip = 0;
 }
 
 static void OpenRegRead(int addr)
@@ -539,7 +595,71 @@ void SmBusScan_OnEnter()
     s_prevBtns = 0;
     s_cursor = 0x10;   // start on PIC16L (7-bit 0x10 = sw 0x20)
     IdLoad();          // load / generate smbid.id; falls back to internal DB silently
-    ResetScan();
+
+    // Reserved one-shot results persist across re-scans but reset on module entry
+    for (int i = 0; i < ADDR_COUNT; ++i)
+    {
+        s_reservedProbed[i] = false;
+        s_reservedAck[i] = false;
+    }
+
+    // Detect 1.6/1.6b — Xcalibur board with a bus-sensitive encoder.
+    // SysInfo_GetBoardRev() returns the cached string from the last SysInfo run,
+    // or "" if SysInfo hasn't been visited yet this session.
+    const char* rev = SysInfo_GetBoardRev();
+    bool was16 = s_is16;
+    s_is16 = (rev[0] == '1' && rev[1] == '.' && rev[2] == '6');  // "1.6" or "1.6b"
+
+    // If the board rev changed (or first entry), reset the Xcalibur one-shot cache.
+    if (s_is16 != was16)
+    {
+        s_xcalibProbed = false;
+        s_xcalibAck = false;
+    }
+
+    // Show a confirmation warning before scanning on a 1.6/1.6b.
+    // On 1.0-1.5 the bus is forgiving enough that we can scan without prompting.
+    s_warnState = s_is16 ? WARN_PENDING : WARN_NONE;
+
+    if (s_warnState == WARN_NONE)
+        ResetScan();
+    // If WARN_PENDING, ResetScan() is called after the user accepts.
+}
+
+// ============================================================================
+// Warning screen  (1.6 / 1.6b only — shown before scan begins)
+// ============================================================================
+
+static void RenderWarning(const DiagLogo& logo)
+{
+    g_pDevice->BeginScene();
+    DrawPageChrome(logo, "SMBUS SCAN", "[A] Proceed    [B] Cancel");
+
+    float y = CONTENT_Y + 30.f;
+    DrawText(LM, y, "1.6 / 1.6b DETECTED", 1.5f, COL_YELLOW);  y += LINE_H * 2.f;
+
+    DrawText(LM, y, "This board uses the Xcalibur integrated encoder.", 1.2f, COL_WHITE);
+    y += LINE_H + 4.f;
+    DrawText(LM, y, "Xcalibur is bus-sensitive: an aggressive scan can", 1.2f, COL_WHITE);
+    y += LINE_H + 4.f;
+    DrawText(LM, y, "desync video output requiring a power cycle.", 1.2f, COL_WHITE);
+    y += LINE_H * 2.f;
+
+    DrawText(LM, y, "XbDiag will scan with extra care:", 1.2f, COL_CYAN);
+    y += LINE_H + 4.f;
+    DrawText(LM + 16.f, y, "- Reserved addresses skipped (0x00-0x07, 0x78-0x7F)", 1.15f, COL_WHITE);
+    y += LINE_H + 4.f;
+    DrawText(LM + 16.f, y, "- Xcalibur (0x70) probed once only, result cached for re-scans", 1.15f, COL_WHITE);
+    y += LINE_H + 4.f;
+    DrawText(LM + 16.f, y, "- Register reads on known devices are still available ([A])", 1.15f, COL_WHITE);
+    y += LINE_H + 4.f;
+    DrawText(LM + 16.f, y, "- 500us stall + inter-probe gap between each address", 1.15f, COL_WHITE);
+    y += LINE_H * 2.f;
+
+    DrawText(LM, y, "Press [A] to proceed or [B] to cancel.", 1.2f, COL_YELLOW);
+
+    g_pDevice->EndScene();
+    g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
 
 // ============================================================================
@@ -573,7 +693,13 @@ static void DrawGrid()
 
             // Cell bg + text color
             DWORD bg, fg;
-            if (!s_results[addr].scanned)
+            if (IsReservedAddr(addr))
+            {
+                // SMBus spec reserved — not probed, shown with a warm-dim tint
+                bg = D3DCOLOR_XRGB(28, 20, 10);
+                fg = D3DCOLOR_XRGB(70, 52, 28);
+            }
+            else if (!s_results[addr].scanned)
             {
                 bg = D3DCOLOR_XRGB(16, 20, 44);
                 fg = D3DCOLOR_XRGB(55, 60, 88);
@@ -641,7 +767,20 @@ static void DrawCursorStrip()
 
     DWORD col;
     const KnownDevice* kd = FindKnown(s_cursor);
-    if (!s_results[s_cursor].scanned)
+    if (IsReservedAddr(s_cursor))
+    {
+        if (!s_reservedProbed[s_cursor])
+        {
+            StrCat2(info, sizeof(info), info, "reserved  -  [Y] to probe once");
+        }
+        else
+        {
+            StrCat2(info, sizeof(info), info, "reserved  -  ");
+            StrCat2(info, sizeof(info), info, s_reservedAck[s_cursor] ? "ACK" : "NAK");
+        }
+        col = D3DCOLOR_XRGB(80, 55, 20);
+    }
+    else if (!s_results[s_cursor].scanned)
     {
         StrCat2(info, sizeof(info), info, "pending scan");
         col = COL_DIM;
@@ -674,17 +813,18 @@ static void DrawLegend()
     struct Swatch { DWORD bg; DWORD tc; const char* lbl; };
     static const Swatch sw[] =
     {
-        { D3DCOLOR_XRGB(26,50,16),  COL_YELLOW,              "KNOWN"   },
-        { D3DCOLOR_XRGB(14,46,60),  COL_CYAN,                "UNKNOWN" },
-        { D3DCOLOR_XRGB(11,13,28),  D3DCOLOR_XRGB(36,40,58), "NAK"     },
-        { D3DCOLOR_XRGB(16,20,44),  D3DCOLOR_XRGB(55,60,88), "PENDING" },
+        { D3DCOLOR_XRGB(26,50,16),  COL_YELLOW,              "KNOWN"    },
+        { D3DCOLOR_XRGB(14,46,60),  COL_CYAN,                "UNKNOWN"  },
+        { D3DCOLOR_XRGB(11,13,28),  D3DCOLOR_XRGB(36,40,58), "NAK"      },
+        { D3DCOLOR_XRGB(16,20,44),  D3DCOLOR_XRGB(55,60,88), "PENDING"  },
+        { D3DCOLOR_XRGB(28,20,10),  D3DCOLOR_XRGB(70,52,28), "RESERVED" },
     };
 
     float sx = LM;
     float sh = LINE_H - 5.f;
     float sy = LEGEND_Y + 2.f;
 
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 5; ++i)
     {
         FillRect(sx, sy, sx + 10.f, sy + sh, sw[i].bg);
         HLine(sy, sx, sx + 10.f, COL_BORDER);
@@ -714,6 +854,53 @@ static void DrawInfoPanel()
     float py = PANEL_Y + 6.f;
 
     const KnownDevice* kd = FindKnown(s_cursor);
+
+    // ---- Reserved address card ----
+    // Shown whenever cursor is on a reserved address, regardless of reg-read state.
+    if (IsReservedAddr(s_cursor))
+    {
+        char addrHex[4]; IntToHex((BYTE)s_cursor, 2, addrHex, sizeof(addrHex));
+        char title[32];
+        StrCopy(title, sizeof(title), "0x");
+        StrCat2(title, sizeof(title), title, addrHex);
+        StrCat2(title, sizeof(title), title, "  SMBus RESERVED");
+        DrawText(px, py, title, 1.3f, D3DCOLOR_XRGB(200, 140, 40));
+        py += LINE_H + 2.f;
+        DrawText(px, py, "This address range is reserved by the SMBus specification.", 1.15f, COL_WHITE);
+        py += LINE_H + 3.f;
+        HLine(py, PANEL_X + 8.f, PANEL_X + PANEL_W - 8.f, COL_BORDER);
+        py += 5.f;
+
+        if (s_cursor <= 0x07)
+            DrawText(px, py, "0x00-0x07: General Call, CBUS, reserved protocol addresses.", 1.1f, COL_GRAY);
+        else
+            DrawText(px, py, "0x78-0x7F: 10-bit addressing range, not valid for 7-bit devices.", 1.1f, COL_GRAY);
+        py += LINE_H + 4.f;
+
+        if (!s_reservedProbed[s_cursor])
+        {
+            // Not yet probed — offer [Y] one-shot
+            DrawText(px, py, "WARNING: probing may cause unexpected device behaviour.", 1.1f, COL_YELLOW);
+            py += LINE_H + 3.f;
+            DrawText(px, py, "[Y] One-shot probe this address  (not repeated on re-scan)", 1.1f, COL_CYAN);
+        }
+        else
+        {
+            // Already probed — show result
+            const char* res = s_reservedAck[s_cursor] ? "ACK" : "NAK";
+            DWORD        rc = s_reservedAck[s_cursor] ? COL_GREEN : D3DCOLOR_XRGB(55, 60, 85);
+            char line[40];
+            StrCopy(line, sizeof(line), "One-shot result: ");
+            StrCat2(line, sizeof(line), line, res);
+            DrawText(px, py, line, 1.2f, rc);
+            if (s_reservedAck[s_cursor])
+            {
+                py += LINE_H + 3.f;
+                DrawText(px, py, "[A] Read registers", 1.1f, COL_CYAN);
+            }
+        }
+        return;
+    }
 
     if (s_regReadOpen)
     {
@@ -807,14 +994,21 @@ static void DrawInfoPanel()
 
     // ---- ID source badge (bottom-right of panel) ----------------------------
     {
-        char badge[48];
-        StrCopy(badge, sizeof(badge), "internal db");
+        char badge[40];
         if (s_idFileLoaded && s_userKnownCount > 0)
         {
-            StrCat2(badge, sizeof(badge), badge, "  +  smbid.id (");
+            StrCopy(badge, sizeof(badge), "smbid.id  +");
             char cnt[6]; IntToStr(s_userKnownCount, cnt, sizeof(cnt));
             StrCat2(badge, sizeof(badge), badge, cnt);
-            StrCat2(badge, sizeof(badge), badge, ")");
+            StrCat2(badge, sizeof(badge), badge, " user");
+        }
+        else if (s_idFileLoaded)
+        {
+            StrCopy(badge, sizeof(badge), "smbid.id  (no entries)");
+        }
+        else
+        {
+            StrCopy(badge, sizeof(badge), "internal db");
         }
         DrawTextR(PANEL_X + PANEL_W - 8.f, PANEL_BOTTOM - LINE_H - 2.f,
             badge, 1.0f, COL_DIM);
@@ -829,6 +1023,28 @@ void SmBusScan_Tick(const DiagLogo& logo)
 {
     WORD cur = GetButtons();
 
+    // ---- 1.6 warning confirmation ----
+    // Hold here until user explicitly accepts or cancels the scan.
+    if (s_warnState == WARN_PENDING)
+    {
+        if (EdgeDown(cur, s_prevBtns, BTN_A))
+        {
+            s_warnState = WARN_ACCEPTED;
+            s_prevBtns = cur;
+            ResetScan();
+            return;
+        }
+        if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
+        {
+            s_prevBtns = cur;
+            RequestState(MSTATE_MENU);
+            return;
+        }
+        s_prevBtns = cur;
+        RenderWarning(logo);
+        return;
+    }
+
     if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
     {
         if (s_regReadOpen)
@@ -842,7 +1058,16 @@ void SmBusScan_Tick(const DiagLogo& logo)
     }
     else if (EdgeDown(cur, s_prevBtns, BTN_X))
     {
-        ResetScan();
+        if (s_is16)
+        {
+            // On 1.6: re-show warning before allowing another full scan.
+            // Xcalibur one-shot cache is preserved — it won't be re-probed.
+            s_warnState = WARN_PENDING;
+        }
+        else
+        {
+            ResetScan();
+        }
     }
     else if (s_regReadOpen)
     {
@@ -865,29 +1090,109 @@ void SmBusScan_Tick(const DiagLogo& logo)
         {
             OpenRegRead(s_cursor);
         }
+
+        // [Y] — one-shot probe of a reserved address.
+        // Only fires if cursor is on a reserved address not yet probed.
+        // Result is cached; re-scans never touch it.
+        if (EdgeDown(cur, s_prevBtns, BTN_Y) &&
+            IsReservedAddr(s_cursor) &&
+            !s_reservedProbed[s_cursor])
+        {
+            BYTE dummy = 0;
+            if (s_is16) KeStallExecutionProcessor(500);
+            bool ack = SMBusRead((BYTE)(s_cursor << 1), 0x00, dummy);
+            if (s_is16) KeStallExecutionProcessor(500);
+            s_reservedProbed[s_cursor] = true;
+            s_reservedAck[s_cursor] = ack;
+            // If it ACK'd, surface it in s_results so [A] reg-read works
+            s_results[s_cursor].scanned = true;
+            s_results[s_cursor].ack = ack;
+        }
+
+        // [A] on a reserved address that ACK'd after a [Y] probe
+        if (EdgeDown(cur, s_prevBtns, BTN_A) &&
+            IsReservedAddr(s_cursor) &&
+            s_reservedProbed[s_cursor] &&
+            s_reservedAck[s_cursor])
+        {
+            OpenRegRead(s_cursor);
+        }
     }
 
     s_prevBtns = cur;
 
-    // Incremental scan - one address per frame
+    // Incremental scan - one address per frame (two frames on 1.6 for pacing)
     if (s_phase == PHASE_SCANNING && s_scanNext < ADDR_COUNT)
     {
-        BYTE dummy = 0;
-        // HalReadSMBusValue uses 8-bit sw-shifted address (7-bit << 1)
-        s_results[s_scanNext].ack = SMBusRead((BYTE)(s_scanNext << 1), 0x00, dummy);
-        s_results[s_scanNext].scanned = true;
-        if (++s_scanNext >= ADDR_COUNT)
-            s_phase = PHASE_DONE;
+        // On 1.6: skip every other frame to halve bus pressure
+        if (s_is16 && s_scanFrameSkip > 0)
+        {
+            --s_scanFrameSkip;
+        }
+        else
+        {
+            // Advance past any already-handled addresses (reserved, cached Xcalibur)
+            while (s_scanNext < ADDR_COUNT && s_results[s_scanNext].scanned)
+                ++s_scanNext;
+
+            if (s_scanNext < ADDR_COUNT)
+            {
+                BYTE dummy = 0;
+                const int addr = s_scanNext;
+
+                if (s_is16 && IsXcaliburAddr(addr))
+                {
+                    // One-shot probe: if we haven't probed Xcalibur yet this session
+                    // do it now with a pre/post stall; otherwise reuse cached result.
+                    if (!s_xcalibProbed)
+                    {
+                        KeStallExecutionProcessor(500);   // pre-probe settling gap
+                        bool ack = SMBusRead((BYTE)(addr << 1), 0x00, dummy);
+                        KeStallExecutionProcessor(800);   // generous post-probe recovery
+                        s_xcalibProbed = true;
+                        s_xcalibAck = ack;
+                        s_results[addr].ack = ack;
+                    }
+                    else
+                    {
+                        s_results[addr].ack = s_xcalibAck;
+                    }
+                }
+                else
+                {
+                    // Normal probe.
+                    // On 1.6: 500us pre-stall so bus fully settles from last op.
+                    if (s_is16) KeStallExecutionProcessor(500);
+                    s_results[addr].ack = SMBusRead((BYTE)(addr << 1), 0x00, dummy);
+                    if (s_is16) KeStallExecutionProcessor(300);   // post-probe gap
+                }
+
+                s_results[addr].scanned = true;
+                ++s_scanNext;
+
+                // On 1.6: insert a frame-skip after each probe
+                if (s_is16) s_scanFrameSkip = 1;
+            }
+
+            if (s_scanNext >= ADDR_COUNT)
+                s_phase = PHASE_DONE;
+        }
     }
 
     // Render
     g_pDevice->BeginScene();
 
-    const char* hint = s_regReadOpen
-        ? "[B] Close registers    [X] Re-scan"
-        : (s_phase == PHASE_SCANNING
-            ? "[B] Back    [X] Re-scan"
-            : "[A] Read registers    [B] Back    [X] Re-scan");
+    const char* hint;
+    if (s_regReadOpen)
+        hint = "[B] Close registers    [X] Re-scan";
+    else if (IsReservedAddr(s_cursor) && !s_reservedProbed[s_cursor])
+        hint = "[Y] One-shot probe    [B] Back    [X] Re-scan";
+    else if (IsReservedAddr(s_cursor) && s_reservedProbed[s_cursor] && s_reservedAck[s_cursor])
+        hint = "[A] Read registers    [B] Back    [X] Re-scan";
+    else if (s_phase == PHASE_SCANNING)
+        hint = "[B] Back    [X] Re-scan";
+    else
+        hint = "[A] Read registers    [B] Back    [X] Re-scan";
 
     DrawPageChrome(logo, "SMBUS SCAN", hint);
     DrawGrid();

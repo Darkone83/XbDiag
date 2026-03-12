@@ -1505,3 +1505,16 @@ void SysInfo_Tick(const DiagLogo& logo)
     s_prevBtns = cur;
     Render(logo);
 }
+
+// ============================================================================
+// Cross-module export
+// ============================================================================
+
+// Returns the cached board revision string from the last SysInfo data load,
+// e.g. "1.0", "1.4", "1.6", "1.6b", "UNKNOWN", or "" if never loaded.
+// Used by SmBusScan to detect 1.6/1.6b and apply safe scan behaviour.
+const char* SysInfo_GetBoardRev()
+{
+    if (!s_dataLoaded) return "";
+    return s_data.boardRevFinal;
+}
