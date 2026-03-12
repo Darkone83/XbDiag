@@ -106,6 +106,10 @@ extern "C" LONG WINAPI IoDeleteSymbolicLink(XBOX_STRING* symLink);
 #define FTP_DATA_PORT_COUNT   32
 static int s_nextDataPort = 0;     // cycles through the range
 
+// File operation limits
+#define MAX_CLIPBOARD   64      // max items in clipboard/selection
+#define COPY_BUF_SIZE   (64*1024)  // 64 KB copy chunk
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -206,6 +210,56 @@ static bool      s_ipOK = false;
 static char      s_ftpMsg[48] = { 0 };
 static int       s_ftpMsgFrames = 0;
 
+// --- File operation state ---
+enum FileOpType { FILEOP_NONE = 0, FILEOP_COPY, FILEOP_MOVE };
+enum FileOpState { FOS_IDLE = 0, FOS_CONFIRM_DELETE, FOS_RUNNING };
+
+struct ClipboardEntry
+{
+    char path[MAX_PATH_LEN];   // full source path
+    bool isDir;
+};
+
+static ClipboardEntry s_clipboard[MAX_CLIPBOARD];
+static int            s_clipCount = 0;
+static FileOpType     s_clipOp = FILEOP_NONE;  // COPY or MOVE
+
+// Selection (marked items — persists across navigation)
+static bool           s_marked[MAX_ENTRIES];        // parallel to s_entries
+static int            s_markedCount = 0;
+
+// Confirm-delete overlay
+static FileOpState    s_fosState = FOS_IDLE;
+
+// Flat work-list for tick-driven file op
+// Dirs are pre-expanded into mkdir entries + file entries at op start.
+#define MAX_WORK_ITEMS  2048
+
+enum WorkItemType { WI_MKDIR = 0, WI_FILE };
+
+struct WorkItem
+{
+    WorkItemType type;
+    char src[MAX_PATH_LEN];   // source path  (WI_FILE only)
+    char dst[MAX_PATH_LEN];   // destination path
+};
+
+static WorkItem  s_work[MAX_WORK_ITEMS];
+static int       s_workCount = 0;
+static int       s_workIdx = 0;       // current item being processed
+static FileOpType s_workOp = FILEOP_NONE;
+static char      s_workDstRoot[MAX_PATH_LEN] = {};  // destination root for this op
+
+// Per-tick file copy state
+static HANDLE    s_opSrcHandle = INVALID_HANDLE_VALUE;
+static HANDLE    s_opDstHandle = INVALID_HANDLE_VALUE;
+static bool      s_opRunning = false;
+static char      s_opSrcName[MAX_NAME_LEN] = {};
+static DWORD     s_opDone = 0;
+static DWORD     s_opTotal = 0;
+static int       s_opItemDone = 0;
+static int       s_opItemTotal = 0;
+
 // --- FTP ---
 static FtpCtx    s_ftp;
 
@@ -219,23 +273,30 @@ static bool EdgeDown(WORD cur, WORD prev, WORD btn)
     return ((cur & btn) != 0) && ((prev & btn) == 0);
 }
 
+static void AppendStr(char* out, int outLen, const char* src)
+{
+    int i = 0; while (out[i]) i++;
+    while (*src && i < outLen - 1) out[i++] = *src++;
+    out[i] = '\0';
+}
+
 // Format file size — bytes if < 1024, KB if < 1MB, MB otherwise
 static void FormatSize(DWORD bytes, char* buf, int bufLen)
 {
     if (bytes < 1024)
     {
         IntToStr((int)bytes, buf, bufLen);
-        StrCat2(buf, bufLen, buf, " B");
+        AppendStr(buf, bufLen, " B");
     }
     else if (bytes < 1024 * 1024)
     {
         IntToStr((int)(bytes / 1024), buf, bufLen);
-        StrCat2(buf, bufLen, buf, " KB");
+        AppendStr(buf, bufLen, " KB");
     }
     else
     {
         IntToStr((int)(bytes / (1024 * 1024)), buf, bufLen);
-        StrCat2(buf, bufLen, buf, " MB");
+        AppendStr(buf, bufLen, " MB");
     }
 }
 
@@ -320,6 +381,8 @@ static void LoadDriveList()
     s_entryCount = 0;
     s_atRoot = true;
     s_path[0] = '\0';
+    for (int i = 0; i < MAX_ENTRIES; ++i) s_marked[i] = false;
+    s_markedCount = 0;
 
     // Ensure HDD partitions are mapped to drive letters before probing
     MountAllDrives();
@@ -348,6 +411,8 @@ static void LoadDirectory(const char* path)
     s_entryCount = 0;
     s_atRoot = false;
     StrCopy(s_path, sizeof(s_path), path);
+    for (int i = 0; i < MAX_ENTRIES; ++i) s_marked[i] = false;
+    s_markedCount = 0;
 
     char pattern[MAX_PATH_LEN + 4];
     StrCopy(pattern, sizeof(pattern), path);
@@ -681,6 +746,249 @@ static bool FtpAppendListLine(const char* name, bool isDir, DWORD sizeLow)
     return true;
 }
 
+// ============================================================================
+// File operation helpers
+// ============================================================================
+
+// Recursively expand srcPath into s_work[], building a flat list of
+// WI_MKDIR and WI_FILE entries. dstPath is the destination for srcPath.
+static void ExpandToWorkList(const char* srcPath, const char* dstPath, bool isDir)
+{
+    if (s_workCount >= MAX_WORK_ITEMS) return;
+
+    if (!isDir)
+    {
+        WorkItem& wi = s_work[s_workCount++];
+        wi.type = WI_FILE;
+        StrCopy(wi.src, sizeof(wi.src), srcPath);
+        StrCopy(wi.dst, sizeof(wi.dst), dstPath);
+        return;
+    }
+
+    // Emit mkdir for this dir first
+    {
+        WorkItem& wi = s_work[s_workCount++];
+        wi.type = WI_MKDIR;
+        wi.src[0] = '\0';
+        StrCopy(wi.dst, sizeof(wi.dst), dstPath);
+    }
+
+    // Recurse into children
+    char pat[MAX_PATH_LEN + 4];
+    StrCopy(pat, sizeof(pat), srcPath);
+    int pl = 0; while (pat[pl]) pl++;
+    if (pl > 0 && pat[pl - 1] != '\\') { pat[pl++] = '\\'; pat[pl] = '\0'; }
+    pat[pl++] = '*'; pat[pl] = '\0';
+
+    WIN32_FIND_DATA fd;
+    HANDLE h = FindFirstFile(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == '.' &&
+            (fd.cFileName[1] == '\0' || fd.cFileName[1] == '.')) continue;
+        if (s_workCount >= MAX_WORK_ITEMS) break;
+
+        char src2[MAX_PATH_LEN], dst2[MAX_PATH_LEN];
+        StrCopy(src2, sizeof(src2), srcPath);
+        int sl = 0; while (src2[sl]) sl++;
+        if (sl > 0 && src2[sl - 1] != '\\') { src2[sl++] = '\\'; src2[sl] = '\0'; }
+        AppendStr(src2, sizeof(src2), fd.cFileName);
+
+        StrCopy(dst2, sizeof(dst2), dstPath);
+        int dl = 0; while (dst2[dl]) dl++;
+        if (dl > 0 && dst2[dl - 1] != '\\') { dst2[dl++] = '\\'; dst2[dl] = '\0'; }
+        AppendStr(dst2, sizeof(dst2), fd.cFileName);
+
+        ExpandToWorkList(src2, dst2,
+            (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+    } while (FindNextFile(h, &fd));
+    FindClose(h);
+}
+
+// Delete a file or directory recursively
+static bool FileDeleteRecursive(const char* path, bool isDir)
+{
+    if (!isDir) return DeleteFileA(path) != 0;
+
+    char pat[MAX_PATH_LEN + 4];
+    StrCopy(pat, sizeof(pat), path);
+    int pl = 0; while (pat[pl]) pl++;
+    if (pl > 0 && pat[pl - 1] != '\\') { pat[pl++] = '\\'; pat[pl] = '\0'; }
+    pat[pl++] = '*'; pat[pl] = '\0';
+
+    WIN32_FIND_DATA fd;
+    HANDLE h = FindFirstFile(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do {
+            if (fd.cFileName[0] == '.' &&
+                (fd.cFileName[1] == '\0' || fd.cFileName[1] == '.')) continue;
+            char child[MAX_PATH_LEN];
+            StrCopy(child, sizeof(child), path);
+            int cl = 0; while (child[cl]) cl++;
+            if (cl > 0 && child[cl - 1] != '\\') { child[cl++] = '\\'; child[cl] = '\0'; }
+            AppendStr(child, sizeof(child), fd.cFileName);
+            FileDeleteRecursive(child,
+                (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+        } while (FindNextFile(h, &fd));
+        FindClose(h);
+    }
+    return RemoveDirectoryA(path) != 0;
+}
+
+// Start a file operation — expand clipboard to flat work list, begin ticking.
+static void FileOpStart(FileOpType op)
+{
+    s_workCount = 0;
+    s_workIdx = 0;
+    s_workOp = op;
+    s_opItemDone = 0;
+    s_opSrcHandle = INVALID_HANDLE_VALUE;
+    s_opDstHandle = INVALID_HANDLE_VALUE;
+
+    for (int i = 0; i < s_clipCount; ++i)
+    {
+        ClipboardEntry& ce = s_clipboard[i];
+
+        // Build destination: s_path + \ + source filename
+        int srcLen = 0; while (ce.path[srcLen]) srcLen++;
+        int lastSep = -1;
+        for (int k = srcLen - 1; k >= 0; --k)
+            if (ce.path[k] == '\\') { lastSep = k; break; }
+        const char* fname = (lastSep >= 0) ? ce.path + lastSep + 1 : ce.path;
+
+        char dst[MAX_PATH_LEN];
+        StrCopy(dst, sizeof(dst), s_path);
+        int dl = 0; while (dst[dl]) dl++;
+        if (dl > 0 && dst[dl - 1] != '\\') { dst[dl++] = '\\'; dst[dl] = '\0'; }
+        AppendStr(dst, sizeof(dst), fname);
+
+        ExpandToWorkList(ce.path, dst, ce.isDir);
+    }
+
+    s_opItemTotal = s_workCount;
+    s_opRunning = (s_workCount > 0);
+    s_fosState = s_opRunning ? FOS_RUNNING : FOS_IDLE;
+}
+
+// Called every tick while s_opRunning. Processes one 64KB chunk per call.
+static void FileOpTick()
+{
+    if (!s_opRunning) return;
+
+    while (s_workIdx < s_workCount)
+    {
+        WorkItem& wi = s_work[s_workIdx];
+
+        if (wi.type == WI_MKDIR)
+        {
+            CreateDirectoryA(wi.dst, NULL);
+            s_opItemDone++;
+            s_workIdx++;
+            continue;   // mkdir is instant — loop to next item
+        }
+
+        // WI_FILE — open handles on first access
+        if (s_opSrcHandle == INVALID_HANDLE_VALUE)
+        {
+            s_opSrcHandle = CreateFile(wi.src, GENERIC_READ, FILE_SHARE_READ,
+                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (s_opSrcHandle == INVALID_HANDLE_VALUE)
+            {
+                s_opItemDone++; s_workIdx++; continue;
+            }
+
+            s_opDstHandle = CreateFile(wi.dst, GENERIC_WRITE, 0,
+                NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (s_opDstHandle == INVALID_HANDLE_VALUE)
+            {
+                CloseHandle(s_opSrcHandle);
+                s_opSrcHandle = INVALID_HANDLE_VALUE;
+                s_opItemDone++; s_workIdx++; continue;
+            }
+
+            s_opTotal = GetFileSize(s_opSrcHandle, NULL);
+            s_opDone = 0;
+
+            // Display name
+            int sl = 0; while (wi.src[sl]) sl++;
+            int sep = -1;
+            for (int k = sl - 1; k >= 0; --k)
+                if (wi.src[k] == '\\') { sep = k; break; }
+            TruncName(sep >= 0 ? wi.src + sep + 1 : wi.src,
+                s_opSrcName, 18, sizeof(s_opSrcName));
+        }
+
+        // One chunk per tick
+        static char s_copyBuf[COPY_BUF_SIZE];
+        DWORD nr = 0;
+        if (!ReadFile(s_opSrcHandle, s_copyBuf, sizeof(s_copyBuf), &nr, NULL) || nr == 0)
+        {
+            // EOF or error — close handles and advance
+            CloseHandle(s_opSrcHandle); s_opSrcHandle = INVALID_HANDLE_VALUE;
+            FlushFileBuffers(s_opDstHandle);
+            CloseHandle(s_opDstHandle); s_opDstHandle = INVALID_HANDLE_VALUE;
+            s_opItemDone++; s_workIdx++;
+            break;  // yield — render this frame
+        }
+
+        DWORD nw = 0;
+        WriteFile(s_opDstHandle, s_copyBuf, nr, &nw, NULL);
+        s_opDone += nw;
+        break;  // one chunk, then yield
+    }
+
+    // All items done
+    if (s_workIdx >= s_workCount)
+    {
+        if (s_opSrcHandle != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(s_opSrcHandle); s_opSrcHandle = INVALID_HANDLE_VALUE;
+        }
+        if (s_opDstHandle != INVALID_HANDLE_VALUE)
+        {
+            FlushFileBuffers(s_opDstHandle); CloseHandle(s_opDstHandle); s_opDstHandle = INVALID_HANDLE_VALUE;
+        }
+
+        // MOVE: delete sources after successful copy
+        if (s_workOp == FILEOP_MOVE)
+        {
+            for (int i = 0; i < s_clipCount; ++i)
+                FileDeleteRecursive(s_clipboard[i].path, s_clipboard[i].isDir);
+        }
+
+        s_clipCount = 0;
+        s_clipOp = FILEOP_NONE;
+        s_opRunning = false;
+        s_fosState = FOS_IDLE;
+        s_opSrcName[0] = '\0';
+        s_workCount = 0;
+        s_workIdx = 0;
+
+        LoadDirectory(s_path);
+        s_cursor = 0; s_scroll = 0;
+    }
+}
+
+// Snapshot marked items into clipboard
+static void SnapMarkedToClipboard(FileOpType op)
+{
+    s_clipCount = 0;
+    s_clipOp = op;
+    for (int i = 0; i < s_entryCount && s_clipCount < MAX_CLIPBOARD; ++i)
+    {
+        if (!s_marked[i]) continue;
+        ClipboardEntry& ce = s_clipboard[s_clipCount++];
+        StrCopy(ce.path, sizeof(ce.path), s_path);
+        int pl = 0; while (ce.path[pl]) pl++;
+        if (pl > 0 && ce.path[pl - 1] != '\\') { ce.path[pl++] = '\\'; ce.path[pl] = '\0'; }
+        AppendStr(ce.path, sizeof(ce.path), s_entries[i].name);
+        ce.isDir = s_entries[i].isDir;
+    }
+    for (int i = 0; i < MAX_ENTRIES; ++i) s_marked[i] = false;
+    s_markedCount = 0;
+}
+
 // Start FTP server
 static void FtpStart()
 {
@@ -718,26 +1026,9 @@ static void FtpStart()
         return;
     }
 
-    // Sync CWD with current explorer path
-    // When at root we can't point FTP at a single drive — start at C: if mounted, else E:
-    if (s_atRoot)
-    {
-        // Pick first available real drive (not D: which is DVD)
-        const char* rootFallbacks[] = { "C:\\", "E:\\", "F:\\", "G:\\", NULL };
-        bool picked = false;
-        for (int i = 0; rootFallbacks[i] && !picked; ++i)
-        {
-            char pat[8];
-            pat[0] = rootFallbacks[i][0]; pat[1] = ':'; pat[2] = '\\'; pat[3] = '*'; pat[4] = '\0';
-            WIN32_FIND_DATA fd2;
-            HANDLE h2 = FindFirstFile(pat, &fd2);
-            if (h2 != INVALID_HANDLE_VALUE) { FindClose(h2); StrCopy(s_ftp.cwd, sizeof(s_ftp.cwd), rootFallbacks[i]); picked = true; }
-        }
-        if (!picked) StrCopy(s_ftp.cwd, sizeof(s_ftp.cwd), "D:\\");
-    }
-    else
-        StrCopy(s_ftp.cwd, sizeof(s_ftp.cwd), s_path);
-
+    // Always start in virtual root — MapFtpPath converts at filesystem boundaries
+    s_ftp.atVirtualRoot = true;
+    StrCopy(s_ftp.cwd, sizeof(s_ftp.cwd), "/");
     s_ftpMsg[0] = '\0';   // clear any "No link" message
     s_ftpMsgFrames = 0;
     s_ftp.state = FTP_LISTEN;
@@ -757,132 +1048,111 @@ static void FtpStop()
     s_ftp.state = FTP_OFF;
 }
 
-// Normalize a raw Windows path in-place:
-//   - forward slashes -> backslashes
-//   - collapse repeated backslashes
-//   - resolve . and .. components
-//   - preserve drive root (e.g. C:\)
-static void NormalizePath(char* p)
+// Clean a virtual FTP path.
+// - Splits on '/' and '\\', processes each component.
+// - Skips empty components and ".".
+// - ".." pops the last component (clamped at root, cannot escape).
+// - Rejects components containing Windows-illegal chars (* ? " < > |).
+// - Accepts ANY other name: _folder, .hidden, __temp, F:, etc.
+// - Result always starts with '/' and has no trailing '/'.
+static void CleanVirtualPath(const char* virtualPath, char* out, int outLen)
 {
-    // Forward slash -> backslash
-    for (int i = 0; p[i]; ++i) if (p[i] == '/') p[i] = '\\';
+    int  oi = 0;
+    const char* p = virtualPath;
 
-    // Collapse repeated backslashes (except UNC \\server — not needed here)
+    while (*p)
     {
-        char tmp[MAX_PATH_LEN];
-        int ti = 0;
-        for (int i = 0; p[i] && ti < MAX_PATH_LEN - 1; )
-        {
-            tmp[ti++] = p[i++];
-            // After a backslash, skip additional backslashes
-            if (p[i - 1] == '\\')
-                while (p[i] == '\\') i++;
-        }
-        tmp[ti] = '\0';
-        StrCopy(p, MAX_PATH_LEN, tmp);
-    }
+        // Skip separators
+        while (*p == '/' || *p == '\\') p++;
+        if (!*p) break;
 
-    // Resolve . and .. using a component stack
-    // Components stored as offsets into a scratch buffer
-    char scratch[MAX_PATH_LEN];
-    StrCopy(scratch, sizeof(scratch), p);
+        // Extract next component
+        char tok[MAX_PATH_LEN];
+        int  ti = 0;
+        while (*p && *p != '/' && *p != '\\' && ti < (int)sizeof(tok) - 1)
+            tok[ti++] = *p++;
+        tok[ti] = '\0';
 
-    // Identify drive root prefix: "X:\" (3 chars)
-    char root[4] = {};
-    char* rest = scratch;
-    if (scratch[0] && scratch[1] == ':' && scratch[2] == '\\')
-    {
-        root[0] = scratch[0]; root[1] = ':'; root[2] = '\\'; root[3] = '\0';
-        rest = scratch + 3;
-    }
-
-    // Split rest into components, resolve . and ..
-    // Use a simple stack of string pointers
-    const char* stack[64];
-    int depth = 0;
-
-    char* tok = rest;
-    while (*tok)
-    {
-        // Find next backslash
-        char* end = tok;
-        while (*end && *end != '\\') end++;
-        char saved = *end;
-        *end = '\0';
+        if (tok[0] == '\0')
+            continue;                               // empty — skip
 
         if (tok[0] == '.' && tok[1] == '\0')
+            continue;                               // "." — skip
+
+        if (tok[0] == '.' && tok[1] == '.' && tok[2] == '\0')
         {
-            // "." — skip
-        }
-        else if (tok[0] == '.' && tok[1] == '.' && tok[2] == '\0')
-        {
-            // ".." — pop
-            if (depth > 0) depth--;
-        }
-        else if (tok[0] != '\0')
-        {
-            if (depth < 64) stack[depth++] = tok;
+            // ".." — pop last component, clamped at root
+            if (oi > 0)
+            {
+                oi--;
+                while (oi > 0 && out[oi] != '/') oi--;
+            }
+            continue;
         }
 
-        *end = saved;
-        tok = (*end == '\\') ? end + 1 : end;
+        // Reject Windows-illegal chars (colon is allowed: needed for "F:")
+        bool bad = false;
+        for (int i = 0; tok[i]; i++)
+        {
+            char c = tok[i];
+            if (c == '*' || c == '?' || c == '"' ||
+                c == '<' || c == '>' || c == '|')
+            {
+                bad = true; break;
+            }
+        }
+        if (bad) continue;
+
+        // Append /component
+        if (oi < outLen - 1) out[oi++] = '/';
+        for (int i = 0; tok[i] && oi < outLen - 1; i++)
+            out[oi++] = tok[i];
     }
 
-    // Reassemble
-    StrCopy(p, MAX_PATH_LEN, root);
-    int plen = 0; while (p[plen]) plen++;
-    for (int i = 0; i < depth; ++i)
-    {
-        const char* comp = stack[i];
-        int clen = 0; while (comp[clen]) clen++;
-        if (plen + clen + 2 < MAX_PATH_LEN)
-        {
-            if (i > 0 || root[0] == '\0') { p[plen++] = '\\'; }
-            for (int j = 0; j < clen; ++j) p[plen++] = comp[j];
-            p[plen] = '\0';
-        }
-    }
-    // Ensure trailing backslash only at drive root level
-    if (plen == 2 && p[1] == ':') { p[plen++] = '\\'; p[plen] = '\0'; }
+    if (oi == 0) { out[0] = '/'; out[1] = '\0'; return; }
+    out[oi] = '\0';
 }
 
-// Resolve an FTP argument to a normalized full Windows path.
-// Handles:
-//   X:\path        absolute Windows
-//   /X:/path       FileZilla Unix-absolute with colon
-//   /C  or  C      bare drive letter from virtual root
-//   relative       appended to cwd
-//   ..  and  .     resolved by NormalizePath
+
+static void ResolveRelative(const char* cwd, const char* arg, char* out, int outLen)
+{
+    if (arg[0] != '/') {
+        // relative — join with backslash then clean
+        char tmp[MAX_PATH_LEN * 2];
+        StrCopy(tmp, sizeof(tmp), cwd);
+        AppendStr(tmp, sizeof(tmp), "\\");
+        AppendStr(tmp, sizeof(tmp), arg);
+        CleanVirtualPath(tmp, out, outLen);
+    }
+    else {
+        // absolute virtual path — clean as-is
+        CleanVirtualPath(arg, out, outLen);
+    }
+}
+
+// Port of PrometheOS mapFtpPath (simplified for bare drive-letter virtual paths).
+// "/F:/Apps/Type D" -> "F:\Apps\Type D"
+// "/" -> "/"  (virtual root — caller must check)
+static void MapFtpPath(const char* virt, char* out, int outLen)
+{
+    const char* a = (virt[0] == '/') ? virt + 1 : virt;
+    StrCopy(out, outLen, a);
+    for (int i = 0; out[i]; i++) if (out[i] == '/') out[i] = '\\';
+    // "F:" (drive root) -> "F:\\"
+    int len = 0; while (out[len]) len++;
+    if (len == 2 && out[1] == ':')
+    {
+        out[2] = '\\'; out[3] = '\0';
+    }
+}
+
+// Convenience: resolve arg against cwd then map to real Windows path.
 static void FtpResolvePath(const char* arg, char* out, int outLen)
 {
-    const char* a = arg;
-    if (a[0] == '/') a++;           // strip leading Unix slash
-
-    // Bare single drive letter: "C", "E", "c" etc.
-    if (((a[0] >= 'A' && a[0] <= 'Z') || (a[0] >= 'a' && a[0] <= 'z'))
-        && (a[1] == '\0' || a[1] == '/' || a[1] == '\\'))
-    {
-        out[0] = (a[0] >= 'a') ? (char)(a[0] - 32) : a[0];
-        out[1] = ':'; out[2] = '\\'; out[3] = '\0';
-        if (a[1] == '/' || a[1] == '\\') StrCat2(out, outLen, out, a + 2);
-        NormalizePath(out);
-        return;
-    }
-
-    if (a[1] == ':')                // absolute: X:\...
-    {
-        StrCopy(out, outLen, a);
-    }
-    else                            // relative: append to cwd
-    {
-        StrCopy(out, outLen, s_ftp.cwd);
-        int len = 0; while (out[len]) len++;
-        if (len > 0 && out[len - 1] != '\\') { out[len] = '\\'; out[len + 1] = '\0'; }
-        StrCat2(out, outLen, out, a);
-    }
-    NormalizePath(out);
+    char virt[MAX_PATH_LEN];
+    ResolveRelative(s_ftp.cwd, arg, virt, sizeof(virt));
+    MapFtpPath(virt, out, outLen);
 }
-
 // Execute a pending LIST — enumerate and send directly to dataSock, reply 226.
 // Build listing into listBuf then start async drain via XFER_LIST.
 // Called from FtpTick once dataSock is accepted.
@@ -903,7 +1173,7 @@ static void FtpDoListing()
             if (h2 != INVALID_HANDLE_VALUE)
             {
                 FindClose(h2);
-                char driveName[3] = { driveLetters[di][0], '\0' };
+                char driveName[4] = { driveLetters[di][0], ':', '\0' };
                 FtpAppendListLine(driveName, true, 0);
             }
         }
@@ -957,7 +1227,7 @@ static bool FtpDeleteDir(const char* path)
             StrCopy(child, sizeof(child), path);
             int cl = 0; while (child[cl]) cl++;
             if (cl > 0 && child[cl - 1] != '\\') { child[cl] = '\\'; child[cl + 1] = '\0'; }
-            StrCat2(child, sizeof(child), child, fd.cFileName);
+            AppendStr(child, sizeof(child), fd.cFileName);
 
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
             {
@@ -983,6 +1253,17 @@ static void FtpHandleCommand(char* cmd)
     while (cmd[i] && cmd[i] != ' ' && i < 15) { verb[i] = cmd[i]; i++; }
     verb[i] = '\0';
     if (cmd[i] == ' ') { i++; StrCopy(arg, sizeof(arg), cmd + i); }
+
+    // Strip surrounding quotes — some clients quote paths containing spaces
+    // e.g. CWD "F:\Apps\Type D"
+    {
+        int alen = 0; while (arg[alen]) alen++;
+        if (alen >= 2 && arg[0] == '"' && arg[alen - 1] == '"')
+        {
+            for (int k = 0; k < alen - 2; ++k) arg[k] = arg[k + 1];
+            arg[alen - 2] = '\0';
+        }
+    }
 
     // Uppercase verb
     for (int k = 0; verb[k]; ++k)
@@ -1027,6 +1308,7 @@ static void FtpHandleCommand(char* cmd)
     else if ((verb[0] == 'P' && verb[1] == 'W' && verb[2] == 'D') ||
         (verb[0] == 'X' && verb[1] == 'P' && verb[2] == 'W' && verb[3] == 'D'))
     {
+        // PWD returns virtual path exactly — same as PrometheOS
         char reply[MAX_PATH_LEN + 8];
         reply[0] = '"';
         int ri = 1;
@@ -1040,64 +1322,63 @@ static void FtpHandleCommand(char* cmd)
         (verb[0] == 'C' && verb[1] == 'D' && verb[2] == 'U' && verb[3] == 'P') ||
         (verb[0] == 'X' && verb[1] == 'C' && verb[2] == 'U' && verb[3] == 'P'))
     {
-        char newPath[MAX_PATH_LEN];
-        bool goVirtualRoot = false;
-
-        // CDUP or XCUP
+        // Exact port of PrometheOS CWD/CDUP logic.
         bool isCdup = (verb[0] == 'C' && verb[1] == 'D' && verb[2] == 'U') ||
             (verb[0] == 'X' && verb[1] == 'C' && verb[2] == 'U');
-        if (isCdup)
+        const char* param = isCdup ? ".." : arg;
+
+        char newVirtual[MAX_PATH_LEN];
+        ResolveRelative(s_ftp.cwd, param, newVirtual, sizeof(newVirtual));
+
+        bool isFolder = false;
+
+        // Case 1: resolved to virtual root "/"
+        if (newVirtual[0] == '/' && newVirtual[1] == '\0')
         {
-            if (s_ftp.atVirtualRoot)
-            {
-                FtpReply(250, "Directory changed.");
-                return;
-            }
-            StrCopy(newPath, sizeof(newPath), s_ftp.cwd);
-            int len = 0; while (newPath[len]) len++;
-            if (len > 0 && newPath[len - 1] == '\\') len--;
-            int slash = -1;
-            for (int k = len - 1; k >= 0; --k) if (newPath[k] == '\\') { slash = k; break; }
-            if (slash <= 2) { goVirtualRoot = true; }  // at drive root, go up to virtual root
-            else { newPath[slash] = '\0'; }
+            isFolder = true;
         }
         else
         {
-            // CWD "/" or "" = virtual root
-            if (arg[0] == '\0' || (arg[0] == '/' && arg[1] == '\0'))
+            char ftpPath[MAX_PATH_LEN];
+            MapFtpPath(newVirtual, ftpPath, sizeof(ftpPath));
+
+            // Case 2: drive root — ftpPath is "F:" or "F:\"
+            int fplen = 0; while (ftpPath[fplen]) fplen++;
+            if (fplen >= 2 && ftpPath[1] == ':' && (ftpPath[2] == '\0' || (ftpPath[2] == '\\' && ftpPath[3] == '\0')))
             {
-                goVirtualRoot = true;
+                isFolder = true;
             }
             else
             {
-                FtpResolvePath(arg, newPath, sizeof(newPath));
+                // Case 3: subdirectory.
+                // GetFileAttributesA first — works on non-empty dirs.
+                // Fallback: try CreateDirectoryA; if it fails with
+                // ERROR_ALREADY_EXISTS the path exists and is a directory.
+                // This handles empty directories on RXDK where GetFileAttributes
+                // may return INVALID_FILE_ATTRIBUTES.
+                DWORD attr = GetFileAttributesA(ftpPath);
+                if (attr != 0xFFFFFFFF && (attr & FILE_ATTRIBUTE_DIRECTORY))
+                {
+                    isFolder = true;
+                }
+                else
+                {
+                    if (!CreateDirectoryA(ftpPath, NULL) &&
+                        GetLastError() == ERROR_ALREADY_EXISTS)
+                        isFolder = true;
+                }
             }
         }
 
-        if (goVirtualRoot)
+        if (isFolder)
         {
-            s_ftp.atVirtualRoot = true;
-            StrCopy(s_ftp.cwd, sizeof(s_ftp.cwd), "/");
+            s_ftp.atVirtualRoot = (newVirtual[0] == '/' && newVirtual[1] == '\0');
+            StrCopy(s_ftp.cwd, sizeof(s_ftp.cwd), newVirtual);
             FtpReply(250, "Directory changed.");
         }
         else
         {
-            // Validate by attempting FindFirstFile
-            char pat[MAX_PATH_LEN + 4];
-            StrCopy(pat, sizeof(pat), newPath);
-            int pl = 0; while (pat[pl]) pl++;
-            if (pl > 0 && pat[pl - 1] != '\\') { pat[pl] = '\\'; pat[pl + 1] = '\0'; pl++; }
-            pat[pl] = '*'; pat[pl + 1] = '\0';
-            WIN32_FIND_DATA fd;
-            HANDLE h = FindFirstFile(pat, &fd);
-            if (h != INVALID_HANDLE_VALUE)
-            {
-                FindClose(h);
-                s_ftp.atVirtualRoot = false;
-                StrCopy(s_ftp.cwd, sizeof(s_ftp.cwd), newPath);
-                FtpReply(250, "Directory changed.");
-            }
-            else FtpReply(550, "No such directory.");
+            FtpReply(550, "No such directory.");
         }
     }
     else if (verb[0] == 'P' && verb[1] == 'A' && verb[2] == 'S' && verb[3] == 'V')
@@ -1113,31 +1394,39 @@ static void FtpHandleCommand(char* cmd)
             FtpReply(425, "Use PASV first."); return;
         }
 
-        // Strip leading flags (e.g. "-a", "-la") that some clients send
+        // Strip all leading flag groups (e.g. "-a", "-la", "-al", "-a -l")
+        // Some clients send multiple flag tokens before the path or nothing.
         char* listArg = arg;
-        if (listArg[0] == '-')
+        while (listArg[0] == '-')
         {
-            while (*listArg && *listArg != ' ') listArg++;
-            while (*listArg == ' ') listArg++;
+            while (*listArg && *listArg != ' ') listArg++;  // skip flag token
+            while (*listArg == ' ') listArg++;              // skip spaces
         }
 
-        // Resolve listing directory now (before deferred execution)
-        bool listVirtualRoot = s_ftp.atVirtualRoot &&
-            (listArg[0] == '\0' || (listArg[0] == '/' && listArg[1] == '\0'));
+        // Resolve listing target.
+        // Empty arg or bare "/" after flag stripping always means current directory.
+        // At virtual root that produces the drive letter listing.
+        bool isRootArg = (listArg[0] == '\0') ||
+            (listArg[0] == '/' && listArg[1] == '\0');
+        bool listVirtualRoot = s_ftp.atVirtualRoot && isRootArg;
         char listDir[MAX_PATH_LEN] = {};
         if (!listVirtualRoot)
         {
             if (listArg[0] != '\0')
                 FtpResolvePath(listArg, listDir, sizeof(listDir));
             else
-                StrCopy(listDir, sizeof(listDir), s_ftp.cwd);
+                MapFtpPath(s_ftp.cwd, listDir, sizeof(listDir));
         }
 
-        // Store as pending — FtpTick dispatches once dataSock is accepted.
-        // If dataSock is already available, FtpTick fires it next frame.
+        // Store as pending then dispatch immediately if dataSock is already
+        // accepted (fast clients connect to the data port before LIST arrives).
+        // Otherwise FtpTick dispatches it when accept fires.
         s_ftp.listPending = true;
         s_ftp.listVirtualRoot = listVirtualRoot;
         StrCopy(s_ftp.listDir, sizeof(s_ftp.listDir), listDir);
+
+        if (s_ftp.dataSock != INVALID_SOCKET)
+            FtpDoListing();
     }
     else if (verb[0] == 'R' && verb[1] == 'E' && verb[2] == 'T' && verb[3] == 'R')
     {
@@ -1230,15 +1519,17 @@ static void FtpHandleCommand(char* cmd)
         (verb[0] == 'X' && verb[1] == 'M' && verb[2] == 'K' && verb[3] == 'D'))
     {
         // Create directory
+        char newVirt[MAX_PATH_LEN];
+        ResolveRelative(s_ftp.cwd, arg, newVirt, sizeof(newVirt));
         char fullPath[MAX_PATH_LEN];
-        FtpResolvePath(arg, fullPath, sizeof(fullPath));
+        MapFtpPath(newVirt, fullPath, sizeof(fullPath));
         if (CreateDirectoryA(fullPath, NULL))
         {
-            // RFC 959: 257 response must quote the path
+            // RFC 959: 257 response quotes the virtual path
             char reply[MAX_PATH_LEN + 4];
             reply[0] = '"';
             int ri = 1;
-            const char* pp = fullPath;
+            const char* pp = newVirt;
             while (*pp && ri < (int)sizeof(reply) - 3) reply[ri++] = *pp++;
             reply[ri++] = '"'; reply[ri] = '\0';
             FtpReply(257, reply);
@@ -1413,6 +1704,16 @@ static void FtpTick()
             if (s_ftp.listPending)
                 FtpDoListing();
         }
+    }
+
+    // Fallback: listPending but dataSock already accepted (fast client connected
+    // to data port before LIST command arrived — dispatch was handled inline in
+    // FtpHandleCommand, but catch any edge case where it was missed).
+    if (s_ftp.listPending &&
+        s_ftp.dataSock != INVALID_SOCKET &&
+        s_ftp.xferType == XFER_NONE)
+    {
+        FtpDoListing();
     }
 
     // ---- Control socket: receive and command dispatch --------------------
@@ -1703,7 +2004,7 @@ static void DrawFtpWidget()
     // IP + port
     char ipPort[32];
     StrCopy(ipPort, sizeof(ipPort), s_ipStr);
-    StrCat2(ipPort, sizeof(ipPort), ipPort, " :21");
+    AppendStr(ipPort, sizeof(ipPort), " :21");
     DrawText(wx + WIDGET_PAD, ty, ipPort, 1.05f, COL_CYAN);
     ty += WIDGET_LINE_H;
 
@@ -1714,7 +2015,7 @@ static void DrawFtpWidget()
             (s_ftp.xferType == XFER_STOR) ? "PUT " : "??? ";
         char dispLine[32];
         StrCopy(dispLine, sizeof(dispLine), verb);
-        StrCat2(dispLine, sizeof(dispLine), dispLine, s_ftp.xferName);
+        AppendStr(dispLine, sizeof(dispLine), s_ftp.xferName);
         DrawText(wx + WIDGET_PAD, ty, dispLine, 1.05f, COL_WHITE);
         ty += WIDGET_LINE_H;
 
@@ -1730,7 +2031,7 @@ static void DrawFtpWidget()
             if (frac > 1.f) frac = 1.f;
             int pct = Ftoi(frac * 100.f);
             IntToStr(pct, pctBuf, sizeof(pctBuf));
-            StrCat2(pctBuf, sizeof(pctBuf), pctBuf, "%");
+            AppendStr(pctBuf, sizeof(pctBuf), "%");
         }
         else if (s_ftp.xferType == XFER_STOR)
         {
@@ -1796,13 +2097,20 @@ static void Render(const DiagLogo& logo)
     const char* hints;
     bool canLaunch = !s_atRoot && s_entryCount > 0 &&
         !s_entries[s_cursor].isDir &&
-        IsXBE(s_entries[s_cursor].name);
-    if (s_ftp.state != FTP_OFF)
-        hints = canLaunch ? "[A] Open  [B] Back  [X] Launch  [Start] FTP Off"
-        : "[A] Open  [B] Back  [Start] FTP Off";
+        IsXBE(s_entries[s_cursor].name) &&
+        s_markedCount == 0;
+    if (s_fosState == FOS_CONFIRM_DELETE)
+        hints = "[B] Confirm Delete  [Back] Cancel";
+    else if (s_markedCount > 0)
+        hints = "[Y] Mark  [Black] Copy  [White] Move  [B] Delete  [Back] Clear";
+    else if (s_clipCount > 0)
+        hints = "[Black] Paste  [White] Move here  [Back] Clear clipboard";
+    else if (s_ftp.state != FTP_OFF)
+        hints = canLaunch ? "[A] Open  [B] Back  [X] Launch  [Y] Mark  [Start] FTP Off"
+        : "[A] Open  [B] Back  [Y] Mark  [Start] FTP Off";
     else
-        hints = canLaunch ? "[A] Open  [B] Back  [X] Launch  [Start] FTP On"
-        : "[A] Open  [B] Back  [Start] FTP On";
+        hints = canLaunch ? "[A] Open  [B] Back  [X] Launch  [Y] Mark  [Start] FTP On"
+        : "[A] Open  [B] Back  [Y] Mark  [Start] FTP On";
 
     DrawPageChrome(logo, "FILE EXPLORER", hints);
 
@@ -1818,7 +2126,7 @@ static void Render(const DiagLogo& logo)
     {
         char ftpBadge[32];
         StrCopy(ftpBadge, sizeof(ftpBadge), "FTP ");
-        StrCat2(ftpBadge, sizeof(ftpBadge), ftpBadge, s_ipStr);
+        AppendStr(ftpBadge, sizeof(ftpBadge), s_ipStr);
         DrawTextR(SW - LM, PATH_Y, ftpBadge, 1.1f,
             s_ftp.state == FTP_TRANSFER ? COL_CYAN : COL_GREEN);
     }
@@ -1848,6 +2156,7 @@ static void Render(const DiagLogo& logo)
         bool selected = (idx == s_cursor);
 
         // Row highlight
+        bool isMarkedRow = !s_atRoot && s_marked[idx];
         if (selected)
             FillRect(0.f, ry, SW, ry + ROW_H, D3DCOLOR_XRGB(20, 40, 100));
         else if (i & 1)
@@ -1855,16 +2164,18 @@ static void Render(const DiagLogo& logo)
 
         FileEntry& e = s_entries[idx];
 
-        // Directory / file icon char
-        DrawText(ICON_X, ry, e.isDir ? ">" : " ", 1.2f,
-            e.isDir ? COL_YELLOW : COL_DIM);
+        // Directory / file icon char — show check mark if selected
+        bool isMarked = !s_atRoot && s_marked[idx];
+        DrawText(ICON_X, ry, isMarked ? "*" : (e.isDir ? ">" : " "), 1.2f,
+            isMarked ? COL_CYAN : (e.isDir ? COL_YELLOW : COL_DIM));
 
         // Name (truncated)
         char dispName[MAX_NAME_LEN];
         TruncName(e.name, dispName, NAME_MAX_CHARS, sizeof(dispName));
 
         DWORD nameCol;
-        if (selected)         nameCol = COL_WHITE;
+        if (isMarkedRow)      nameCol = D3DCOLOR_XRGB(80, 255, 100);
+        else if (selected)    nameCol = COL_WHITE;
         else if (e.isDir)     nameCol = COL_YELLOW;
         else if (IsXBE(e.name)) nameCol = COL_CYAN;
         else                  nameCol = D3DCOLOR_XRGB(180, 180, 180);
@@ -1903,8 +2214,145 @@ static void Render(const DiagLogo& logo)
     if (s_entryCount == 0)
         DrawText(LM, LIST_Y + ROW_H, "No files found.", 1.2f, COL_DIM);
 
+    // ---- Controls legend (top-left, idle only) --------------------------
+    if (s_fosState == FOS_IDLE && !s_opRunning)
+    {
+        const float CX = SW - LM - 148.f;
+        const float CY = CONTENT_Y + 2.f;
+        const float CPad = 5.f;
+        const float CLH = 12.f;
+
+        // Choose lines based on state
+        const char* lines[8];
+        int         nLines = 0;
+
+        if (s_markedCount > 0)
+        {
+            lines[nLines++] = "[Y]     Mark/Unmark";
+            lines[nLines++] = "[Black] Copy marked";
+            lines[nLines++] = "[White] Cut marked";
+            lines[nLines++] = "[B]     Delete marked";
+            lines[nLines++] = "[Back]  Clear marks";
+        }
+        else if (s_clipCount > 0)
+        {
+            lines[nLines++] = "[Y]     Mark/Unmark";
+            lines[nLines++] = "[Black] Paste (copy)";
+            lines[nLines++] = "[White] Paste (move)";
+            lines[nLines++] = "[Back]  Clear clipboard";
+            lines[nLines++] = "[A]     Open / Enter";
+            lines[nLines++] = "[B]     Back / Up";
+        }
+        else
+        {
+            lines[nLines++] = "[A]     Open / Enter";
+            lines[nLines++] = "[B]     Back / Up";
+            lines[nLines++] = "[X]     Launch XBE";
+            lines[nLines++] = "[Y]     Mark item";
+            lines[nLines++] = "[LT/RT] Page up/down";
+            lines[nLines++] = "[Start] FTP on/off";
+        }
+
+        float cw = 148.f;
+        float ch = CPad * 2.f + (float)nLines * CLH;
+
+        FillRect(CX, CY, CX + cw, CY + ch,
+            D3DCOLOR_ARGB(180, 6, 10, 24));
+        HLine(CY, CX, CX + cw, COL_BORDER);
+        HLine(CY + ch, CX, CX + cw, COL_BORDER);
+        VLine(CX, CY, CY + ch, COL_BORDER);
+        VLine(CX + cw, CY, CY + ch, COL_BORDER);
+
+        float ty = CY + CPad;
+        for (int li = 0; li < nLines; ++li)
+        {
+            DrawText(CX + CPad, ty, lines[li], 0.95f,
+                D3DCOLOR_XRGB(160, 180, 210));
+            ty += CLH;
+        }
+    }
+
     // ---- FTP widget (lower right) ----------------------------------------
     DrawFtpWidget();
+
+    // ---- File op progress widget -----------------------------------------
+    if (s_opRunning)
+    {
+        const float OW = 260.f;
+        const float OX = (SW - OW) * 0.5f;
+        const float OY = 180.f;
+        const float OP = 8.f;
+        const float OLH = 14.f;
+        const float OH = OP * 2.f + OLH * 4.f;
+
+        FillRect(OX, OY, OX + OW, OY + OH, D3DCOLOR_ARGB(230, 8, 12, 30));
+        HLine(OY, OX, OX + OW, COL_CYAN);
+        HLine(OY + OH, OX, OX + OW, COL_CYAN);
+
+        float ty = OY + OP;
+        DrawText(OX + OP, ty, "FILE OPERATION", 1.1f, COL_CYAN); ty += OLH;
+
+        char itemLine[48];
+        itemLine[0] = '\0';
+        char a[8], b[8];
+        IntToStr(s_opItemDone, a, sizeof(a));
+        IntToStr(s_opItemTotal, b, sizeof(b));
+        StrCat2(itemLine, sizeof(itemLine), itemLine, "Item ");
+        StrCat2(itemLine, sizeof(itemLine), itemLine, a);
+        StrCat2(itemLine, sizeof(itemLine), itemLine, " of ");
+        StrCat2(itemLine, sizeof(itemLine), itemLine, b);
+        DrawText(OX + OP, ty, itemLine, 1.05f, COL_WHITE); ty += OLH;
+
+        DrawText(OX + OP, ty, s_opSrcName, 1.05f, D3DCOLOR_XRGB(180, 180, 180)); ty += OLH;
+
+        // Progress bar for current file
+        float frac = (s_opTotal > 0) ? (float)s_opDone / (float)s_opTotal : 0.f;
+        if (frac > 1.f) frac = 1.f;
+        const float BW = OW - OP * 2.f - 36.f;
+        FillRect(OX + OP, ty + 1.f, OX + OP + BW, ty + 9.f, D3DCOLOR_XRGB(15, 20, 50));
+        FillRectGrad(OX + OP, ty + 1.f, OX + OP + BW * frac, ty + 9.f,
+            D3DCOLOR_XRGB(60, 180, 255), D3DCOLOR_XRGB(20, 80, 160));
+        HLine(ty + 1.f, OX + OP, OX + OP + BW, COL_BORDER);
+        HLine(ty + 9.f, OX + OP, OX + OP + BW, COL_BORDER);
+        char pctBuf[8];
+        IntToStr(Ftoi(frac * 100.f), pctBuf, sizeof(pctBuf));
+        AppendStr(pctBuf, sizeof(pctBuf), "%");
+        DrawText(OX + OP + BW + 4.f, ty, pctBuf, 1.05f, COL_WHITE);
+    }
+
+    // ---- Confirm delete overlay ------------------------------------------
+    if (s_fosState == FOS_CONFIRM_DELETE)
+    {
+        const float DW = 240.f;
+        const float DH = 70.f;
+        const float DX = (SW - DW) * 0.5f;
+        const float DY = 200.f;
+
+        FillRect(DX, DY, DX + DW, DY + DH, D3DCOLOR_ARGB(240, 30, 8, 8));
+        HLine(DY, DX, DX + DW, D3DCOLOR_XRGB(200, 50, 50));
+        HLine(DY + DH, DX, DX + DW, D3DCOLOR_XRGB(200, 50, 50));
+
+        char delLine[48] = "Delete ";
+        char cnt[8];
+        IntToStr(s_markedCount, cnt, sizeof(cnt));
+        AppendStr(delLine, sizeof(delLine), cnt);
+        AppendStr(delLine, sizeof(delLine), " item(s)?");
+        DrawText(DX + 10.f, DY + 12.f, delLine, 1.15f, COL_WHITE);
+        DrawText(DX + 10.f, DY + 30.f, "[B] Confirm", 1.05f, D3DCOLOR_XRGB(255, 80, 80));
+        DrawText(DX + 10.f, DY + 46.f, "[Back] Cancel", 1.05f, COL_GRAY);
+    }
+
+    // ---- Clipboard status bar (bottom of list, above bot bar) ------------
+    if (s_clipCount > 0 && !s_opRunning && s_fosState == FOS_IDLE)
+    {
+        char clipLine[64] = "Clipboard: ";
+        char cnt[8];
+        IntToStr(s_clipCount, cnt, sizeof(cnt));
+        AppendStr(clipLine, sizeof(clipLine), cnt);
+        AppendStr(clipLine, sizeof(clipLine), " item(s)  ");
+        AppendStr(clipLine, sizeof(clipLine), s_clipOp == FILEOP_MOVE ? "[MOVE]" : "[COPY]");
+        DrawText(LM, BOT_BAR_Y - 16.f, clipLine, 1.05f, COL_CYAN);
+    }
 
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
@@ -1916,8 +2364,9 @@ static void Render(const DiagLogo& logo)
 
 void FileExplorer_Tick(const DiagLogo& logo)
 {
-    // Service FTP every tick regardless of input skip
+    // Service FTP and file ops every tick regardless of input skip
     FtpTick();
+    FileOpTick();
 
     if (s_skipFirstTick)
     {
@@ -1965,6 +2414,9 @@ void FileExplorer_Tick(const DiagLogo& logo)
         else
             FtpStop();
     }
+
+    // Block navigation input while file op running
+    if (s_opRunning) { s_prevBtns = cur; Render(logo); return; }
 
     // [DPad Down]
     if (EdgeDown(cur, s_prevBtns, BTN_DPAD_DOWN))
@@ -2020,14 +2472,117 @@ void FileExplorer_Tick(const DiagLogo& logo)
         }
     }
 
-    // [B] go up / back to menu
-    if (EdgeDown(cur, s_prevBtns, BTN_B))
-        GoUp();
+    // [Y] mark / unmark current item
+    if (EdgeDown(cur, s_prevBtns, BTN_Y))
+    {
+        if (!s_atRoot && s_entryCount > 0 && s_fosState == FOS_IDLE && !s_opRunning)
+        {
+            s_marked[s_cursor] = !s_marked[s_cursor];
+            s_markedCount += s_marked[s_cursor] ? 1 : -1;
+            if (s_markedCount < 0) s_markedCount = 0;
+            // Advance cursor
+            if (s_cursor < s_entryCount - 1)
+            {
+                s_cursor++;
+                if (s_cursor >= s_scroll + ROWS_VISIBLE)
+                    s_scroll = s_cursor - ROWS_VISIBLE + 1;
+            }
+        }
+    }
 
-    // [X] launch XBE
+    // [Black] — copy marked to clipboard, or paste clipboard here
+    if (EdgeDown(cur, s_prevBtns, BTN_BLACK))
+    {
+        if (s_fosState == FOS_IDLE && !s_atRoot)
+        {
+            if (s_markedCount > 0)
+            {
+                // Snapshot marked items as COPY clipboard
+                SnapMarkedToClipboard(FILEOP_COPY);
+            }
+            else if (s_clipCount > 0)
+            {
+                // Paste clipboard into current directory
+                FileOpStart(s_clipOp == FILEOP_NONE ? FILEOP_COPY : s_clipOp);
+            }
+        }
+    }
+
+    // [White] — move marked items here, or move clipboard here
+    if (EdgeDown(cur, s_prevBtns, BTN_WHITE))
+    {
+        if (s_fosState == FOS_IDLE && !s_atRoot)
+        {
+            if (s_markedCount > 0)
+            {
+                // Snapshot as MOVE clipboard — user navigates to dest, then
+                // presses White (or Black) again to execute
+                SnapMarkedToClipboard(FILEOP_MOVE);
+            }
+            else if (s_clipCount > 0)
+            {
+                FileOpStart(FILEOP_MOVE);
+            }
+        }
+    }
+
+    // [B] — confirm delete if pending, else go up / back to menu
+    if (EdgeDown(cur, s_prevBtns, BTN_B))
+    {
+        if (s_fosState == FOS_CONFIRM_DELETE)
+        {
+            // Confirmed — delete all marked items
+            s_fosState = FOS_IDLE;
+            for (int i = 0; i < s_entryCount; ++i)
+            {
+                if (!s_marked[i]) continue;
+                char fullPath[MAX_PATH_LEN];
+                StrCopy(fullPath, sizeof(fullPath), s_path);
+                int pl = 0; while (fullPath[pl]) pl++;
+                if (pl > 0 && fullPath[pl - 1] != '\\') { fullPath[pl++] = '\\'; fullPath[pl] = '\0'; }
+                AppendStr(fullPath, sizeof(fullPath), s_entries[i].name);
+                FileDeleteRecursive(fullPath, s_entries[i].isDir);
+            }
+            for (int i = 0; i < MAX_ENTRIES; ++i) s_marked[i] = false;
+            s_markedCount = 0;
+            LoadDirectory(s_path);
+            s_cursor = 0; s_scroll = 0;
+        }
+        else if (s_fosState == FOS_IDLE)
+        {
+            if (s_markedCount > 0)
+            {
+                // First [B] with marks — show confirm prompt
+                s_fosState = FOS_CONFIRM_DELETE;
+            }
+            else
+            {
+                GoUp();
+            }
+        }
+    }
+
+    // [Back] button — cancel confirm or clear marks
+    if (EdgeDown(cur, s_prevBtns, BTN_BACK))
+    {
+        if (s_fosState == FOS_CONFIRM_DELETE)
+        {
+            s_fosState = FOS_IDLE;
+        }
+        else
+        {
+            // Clear all marks and clipboard
+            for (int i = 0; i < MAX_ENTRIES; ++i) s_marked[i] = false;
+            s_markedCount = 0;
+            s_clipCount = 0;
+            s_clipOp = FILEOP_NONE;
+        }
+    }
+
+    // [X] launch XBE (only when nothing marked)
     if (EdgeDown(cur, s_prevBtns, BTN_X))
     {
-        if (!s_atRoot && s_entryCount > 0)
+        if (!s_atRoot && s_entryCount > 0 && s_markedCount == 0)
         {
             FileEntry& e = s_entries[s_cursor];
             if (e.isDir)
@@ -2115,7 +2670,7 @@ void FileExplorer_Tick(const DiagLogo& logo)
                     {
                         char launchPath[MAX_NAME_LEN + 4];
                         launchPath[0] = 'D'; launchPath[1] = ':'; launchPath[2] = '\\'; launchPath[3] = '\0';
-                        StrCat2(launchPath, sizeof(launchPath), launchPath, e.name);
+                        AppendStr(launchPath, sizeof(launchPath), e.name);
 
                         FtpStop();
                         XLaunchNewImage(launchPath, NULL);
