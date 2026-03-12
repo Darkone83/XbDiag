@@ -8,7 +8,7 @@
 
 **A hardware diagnostic suite for the original Xbox console.**
 
-XbDiag is a native RXDK application that runs directly on an original Xbox hardware (revisions 1.0 through 1.6, and debug kits). It gives you a deep look at the internal state of the machine — RAM integrity, SMBus devices, temperatures, EEPROM contents, HDD identity, video encoder, and controller hardware — all presented in a clean full-screen UI with no dependencies outside the Xbox kernel.
+XbDiag is a native RXDK application that runs directly on original Xbox hardware (revisions 1.0 through 1.6, and debug kits). It gives you a deep look at the internal state of the machine — RAM integrity, SMBus devices, temperatures, EEPROM contents, HDD identity, video encoder, and controller hardware — all presented in a clean full-screen UI with no dependencies outside the Xbox kernel.
 
 ---
 
@@ -22,11 +22,51 @@ XbDiag is a native RXDK application that runs directly on an original Xbox hardw
 | 04 | **Temp Monitor** | Live CPU and board temperatures via ADM1032 (rev 1.0–1.5) or PIC/Xcalibur (rev 1.6), with scrolling history graph |
 | 05 | **EEPROM Viewer** | Full 256-byte EEPROM decode — serial number, region, HDD key, LAN MAC, confounder, checksum, and binary export |
 | 06 | **Video Info** | Encoder type and chip ID (Conexant/Focus/Xcalibur), AV pack type, backbuffer resolution, refresh rate |
-| 07 | **HDD Info** | ATA IDENTIFY — model, serial, firmware revision, capacity (LBA28/LBA48), UDMA mode, security lock state, export to TXT, also includes SMART support |
+| 07 | **HDD Info** | ATA IDENTIFY — model, serial, firmware revision, capacity (LBA28/LBA48), UDMA mode, security lock state, export to TXT, SMART support |
 | 08 | **Controller Test** | Digital buttons (including analog pressure), analog sticks, triggers, Black/White — live visualizer plus a dedicated rumble motor subcard |
-| 09 | **Stress Test** | CPU streasts, along with RAM stress tests |
-| 10 | **File Explorer** | A Simple file explorer for navigating and launching XBEs along with a simple FTP server |
+| 09 | **Stress Test** | CPU and RAM stress tests with live temperature monitoring |
+| 10 | **File Explorer** | Full file manager with FTP server, file copy/move/delete, multi-select, and XBE launcher |
 | 11 | **About** | Version info, credits, fun Xbox hardware facts ticker |
+
+---
+
+## File Explorer
+
+The File Explorer is a full single-pane file manager for navigating and managing files on your Xbox HDD partitions.
+
+### Navigation
+
+| Button | Action |
+|--------|--------|
+| `[DPad Up/Down]` | Move cursor |
+| `[LT / RT]` | Page up / page down |
+| `[A]` | Enter directory / open drive |
+| `[B]` | Go up one level (at drive list returns to menu) |
+| `[X]` | Launch selected XBE via XLaunchNewImage |
+| `[Start]` | Toggle FTP server on / off |
+
+### File Operations
+
+| Button | Action |
+|--------|--------|
+| `[Y]` | Mark / unmark item (multi-select, cursor auto-advances) |
+| `[Black]` | If items marked: copy to clipboard. If clipboard loaded: paste here |
+| `[White]` | If items marked: cut to clipboard. If clipboard loaded: move here |
+| `[B]` | If items marked: confirm delete prompt. If nothing marked: go up |
+| `[Back]` | Cancel delete prompt / clear marks and clipboard |
+
+Marked items are shown in **green**. Marks persist while you navigate to your destination — mark your files, navigate to the target folder, then paste.
+
+Copy and move operations run as a tick-driven background task so large transfers (including multi-GB files) show a live progress widget and keep the UI responsive throughout. The FTP server continues to operate during file operations.
+
+### FTP Server
+
+- **Credentials:** xbox / xbox
+- **Port:** 21
+- **Mode:** Passive (PASV) only
+- **Supported commands:** USER, PASS, SYST, TYPE, FEAT, PWD, CWD, CDUP, LIST, NLST, RETR, STOR, DELE, MKD, RMD, RNFR, RNTO, SIZE, OPTS, NOOP, QUIT
+- Fully non-blocking — polled every frame, never stalls the UI
+- Compatible with FlashFXP, FileZilla, and standard FTP clients
 
 ---
 
@@ -59,11 +99,10 @@ Place the built `default.xbe` and the `tex\` folder together in the same directo
   default.xbe
   tex\
     xb.dds      (XbDiag logo, shown in top bar on every screen)
-    tr.dds      (Team Resurgent credit logo)
     dc.dds      (Darkone Customs credit logo)
 ```
 
-Diagnostic output files written by the tool
+Diagnostic output files written by the tool:
 
 ```
 \eeprom.bin    (written by EEPROM Viewer export)
@@ -126,16 +165,17 @@ XbDiag uses software-shifted 8-bit addresses (hardware 7-bit address left-shifte
 - **EEPROM export** writes `eeprom.bin`. If the title directory is read-only (e.g., running from a disc image without a writable D: mount) the export will silently fail — the status indicator on screen will show `FAIL`.
 - **xemu compatibility**: The PIC SMBus device (0x20) may not respond in xemu. The Video Info and Temp Monitor screens handle this gracefully and show a note on screen. All other modules work normally.
 - **LBA48 capacity** is displayed correctly for drives over 137GB. Drives over 2TB will display a `+` suffix indicating the upper 32 address bits are non-zero, but the displayed sector count is capped to the lower 32 bits.
+- **FTP passive mode only** — active mode (PORT) is not supported. Configure your FTP client to use passive mode.
 
 ---
 
 ## Credits
 
-Built by **Team Resurgent** and **Darkone83**.
+Built by **Darkone83** / **Darkone Customs**.
 
 Additional credits:
 
-Team Resurgent X Equinox [PrometheOSxbe]
-Rocky5 [XBMC4Gamers-source]
+Team Resurgent x Equinox [PrometheOS] — virtual path architecture and FTP server reference  
+Rocky5 [XBMC4Gamers] — referenced for compatibility
 
-These sources were referenced for various functions throughout XbDiag to ensure compatibility
+These sources were referenced for various functions throughout XbDiag to ensure hardware compatibility.
