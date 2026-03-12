@@ -696,10 +696,6 @@ static void RenderDecoded(const DiagLogo& logo)
         const BYTE* p = s_eeprom + f.offset;
         float           rowY = hy + (fi - scrollTop) * LH;
 
-        // Alternate row tint
-        if ((fi & 1) == 0)
-            FillRect(LM2 - 2.f, rowY - 1.f, SW - LM, rowY + LH - 1.f, 0x10FFFFFF);
-
         // Field name
         DrawText(DEC_LBL_X, rowY, f.name, 1.15f, COL_YELLOW);
 

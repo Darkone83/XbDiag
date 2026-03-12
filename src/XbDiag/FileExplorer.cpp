@@ -172,7 +172,7 @@ struct FtpCtx
     int      sendOff;   // bytes already sent
 
     // RETR partial-send buffer — holds unsent remainder between ticks
-    char     retrBuf[4096];
+    char     retrBuf[65536];
     int      retrBufLen;   // bytes valid in retrBuf
     int      retrBufOff;   // bytes already sent
 
@@ -212,7 +212,7 @@ static int       s_ftpMsgFrames = 0;
 
 // --- File operation state ---
 enum FileOpType { FILEOP_NONE = 0, FILEOP_COPY, FILEOP_MOVE };
-enum FileOpState { FOS_IDLE = 0, FOS_CONFIRM_DELETE, FOS_RUNNING };
+enum FileOpState { FOS_IDLE = 0, FOS_CONFIRM_DELETE, FOS_RUNNING, FOS_PICK_DEST };
 
 struct ClipboardEntry
 {
@@ -230,6 +230,15 @@ static int            s_markedCount = 0;
 
 // Confirm-delete overlay
 static FileOpState    s_fosState = FOS_IDLE;
+
+// Destination picker state (FOS_PICK_DEST)
+static FileEntry      s_pickEntries[MAX_ENTRIES];
+static int            s_pickEntryCount = 0;
+static int            s_pickCursor = 0;
+static int            s_pickScroll = 0;
+static char           s_pickPath[MAX_PATH_LEN];
+static bool           s_pickAtRoot = true;
+static FileOpType     s_pendingOp = FILEOP_NONE;
 
 // Flat work-list for tick-driven file op
 // Dirs are pre-expanded into mkdir entries + file entries at op start.
@@ -471,6 +480,178 @@ static void LoadDirectory(const char* path)
         }
 }
 
+// ============================================================================
+// Destination picker — separate buffer, mirrors main browser logic
+// ============================================================================
+
+static void PickLoadDriveList()
+{
+    s_pickEntryCount = 0;
+    s_pickAtRoot = true;
+    s_pickPath[0] = '\0';
+
+    const char* drives[] = { "C", "D", "E", "F", "G", "X", "Y", "Z" };
+    for (int d = 0; d < 8 && s_pickEntryCount < MAX_ENTRIES; ++d)
+    {
+        char pattern[8];
+        pattern[0] = drives[d][0]; pattern[1] = ':'; pattern[2] = '\\';
+        pattern[3] = '*'; pattern[4] = '\0';
+
+        WIN32_FIND_DATA fd;
+        HANDLE h = FindFirstFile(pattern, &fd);
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            FindClose(h);
+            FileEntry& e = s_pickEntries[s_pickEntryCount++];
+            e.name[0] = drives[d][0]; e.name[1] = ':'; e.name[2] = '\0';
+            e.isDir = true;
+            e.sizeLow = 0;
+        }
+    }
+}
+
+static void PickLoadDirectory(const char* path)
+{
+    s_pickEntryCount = 0;
+    s_pickAtRoot = false;
+    StrCopy(s_pickPath, sizeof(s_pickPath), path);
+
+    char pattern[MAX_PATH_LEN + 4];
+    StrCopy(pattern, sizeof(pattern), path);
+    int plen = 0; while (pattern[plen]) plen++;
+    if (plen > 0 && pattern[plen - 1] != '\\')
+    {
+        pattern[plen] = '\\'; pattern[plen + 1] = '\0'; plen++;
+    }
+    pattern[plen] = '*'; pattern[plen + 1] = '\0';
+
+    WIN32_FIND_DATA fd;
+    HANDLE h = FindFirstFile(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    do
+    {
+        if (fd.cFileName[0] == '.' &&
+            (fd.cFileName[1] == '\0' || (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0')))
+            continue;
+
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue; // dirs only
+
+        if (s_pickEntryCount >= MAX_ENTRIES) break;
+
+        FileEntry& e = s_pickEntries[s_pickEntryCount++];
+        TruncName(fd.cFileName, e.name, MAX_NAME_LEN - 1, MAX_NAME_LEN);
+        e.isDir = true;
+        e.sizeLow = 0;
+    } while (FindNextFile(h, &fd));
+
+    FindClose(h);
+
+    // Sort alphabetically
+    for (int i = 0; i < s_pickEntryCount - 1; ++i)
+        for (int j = i + 1; j < s_pickEntryCount; ++j)
+        {
+            const char* a = s_pickEntries[i].name;
+            const char* b = s_pickEntries[j].name;
+            int k = 0;
+            while (a[k] && b[k] && a[k] == b[k]) k++;
+            if (a[k] > b[k])
+            {
+                FileEntry tmp = s_pickEntries[i];
+                s_pickEntries[i] = s_pickEntries[j];
+                s_pickEntries[j] = tmp;
+            }
+        }
+}
+
+// ============================================================================
+// DrawDestPicker — modal overlay card, drawn on top of everything
+// ============================================================================
+
+#define PICK_ROWS_VISIBLE  12
+#define PICK_ROW_H         (LINE_H + 1.f)
+
+static void DrawDestPicker()
+{
+    const float PW = 380.f;
+    const float PH = 290.f;
+    const float PX = (SW - PW) * 0.5f;
+    const float PY = (480.f - PH) * 0.5f;
+
+    // Backdrop
+    FillRectGrad(PX, PY, PX + PW, PY + PH,
+        D3DCOLOR_XRGB(14, 20, 52),
+        D3DCOLOR_XRGB(8, 12, 32));
+    HLine(PY, PX, PX + PW, COL_CYAN);
+    HLine(PY + PH, PX, PX + PW, COL_CYAN);
+    VLine(PX, PY, PY + PH, COL_BORDER);
+    VLine(PX + PW, PY, PY + PH, COL_BORDER);
+
+    // Title
+    const char* opLabel = (s_pendingOp == FILEOP_MOVE) ? "MOVE TO" : "COPY TO";
+    DrawText(PX + 8.f, PY + 5.f, opLabel, 1.3f, COL_YELLOW);
+
+    // Current path bar
+    const char* pathDisp = s_pickAtRoot ? "[ Drive List ]" : s_pickPath;
+    DrawText(PX + 8.f, PY + 22.f, pathDisp, 1.05f, COL_CYAN);
+    HLine(PY + 34.f, PX, PX + PW, COL_BORDER);
+
+    // Entry list
+    const float LIST_TOP = PY + 37.f;
+    const float ICON_X = PX + 8.f;
+    const float NAME_X = PX + 22.f;
+
+    for (int i = 0; i < PICK_ROWS_VISIBLE; ++i)
+    {
+        int idx = s_pickScroll + i;
+        if (idx >= s_pickEntryCount) break;
+
+        float ry = LIST_TOP + (float)i * PICK_ROW_H;
+        bool sel = (idx == s_pickCursor);
+
+        if (sel)
+            FillRect(PX + 1.f, ry, PX + PW - 1.f, ry + PICK_ROW_H,
+                D3DCOLOR_XRGB(20, 40, 100));
+        else if (i & 1)
+            FillRect(PX + 1.f, ry, PX + PW - 1.f, ry + PICK_ROW_H,
+                D3DCOLOR_XRGB(10, 12, 28));
+
+        FileEntry& e = s_pickEntries[idx];
+        DWORD nc = sel ? COL_WHITE : COL_YELLOW;
+        DrawText(ICON_X, ry, ">", 1.2f, sel ? COL_CYAN : COL_DIM);
+        DrawText(NAME_X, ry, e.name, 1.2f, nc);
+    }
+
+    // Empty dir message
+    if (s_pickEntryCount == 0)
+    {
+        const char* msg = s_pickAtRoot ? "No drives found" : "No subfolders";
+        DrawText(PX + (PW - TW(msg, 1.1f)) * 0.5f,
+            LIST_TOP + 20.f, msg, 1.1f, COL_DIM);
+    }
+
+    // Scroll indicator
+    if (s_pickEntryCount > PICK_ROWS_VISIBLE)
+    {
+        float sbX = PX + PW - 6.f;
+        float sbY0 = LIST_TOP;
+        float sbH = (float)PICK_ROWS_VISIBLE * PICK_ROW_H;
+        float thH = sbH * ((float)PICK_ROWS_VISIBLE / (float)s_pickEntryCount);
+        float thY = sbY0 + sbH * ((float)s_pickScroll / (float)s_pickEntryCount);
+        FillRect(sbX, sbY0, sbX + 4.f, sbY0 + sbH, D3DCOLOR_XRGB(20, 25, 55));
+        FillRect(sbX, thY, sbX + 4.f, thY + thH, COL_BORDER);
+    }
+
+    // Hint bar inside card
+    HLine(PY + PH - 18.f, PX, PX + PW, COL_BORDER);
+    const char* hint = s_pickAtRoot
+        ? "[A] Open Drive    [B] Cancel"
+        : "[A] Enter Folder  [Black/White] Copy/Move Here  [B] Up";
+    DrawText(PX + (PW - TW(hint, 1.0f)) * 0.5f,
+        PY + PH - 15.f, hint, 1.0f, COL_GRAY);
+}
+
+// ============================================================================
 // Navigate into entry at cursor
 static void EnterSelected()
 {
@@ -837,6 +1018,39 @@ static bool FileDeleteRecursive(const char* path, bool isDir)
 }
 
 // Start a file operation — expand clipboard to flat work list, begin ticking.
+static void FileOpStartTo(const char* destDir)
+{
+    s_workCount = 0;
+    s_workIdx = 0;
+    s_workOp = s_clipOp;
+    s_opItemDone = 0;
+    s_opSrcHandle = INVALID_HANDLE_VALUE;
+    s_opDstHandle = INVALID_HANDLE_VALUE;
+
+    for (int i = 0; i < s_clipCount; ++i)
+    {
+        ClipboardEntry& ce = s_clipboard[i];
+
+        int srcLen = 0; while (ce.path[srcLen]) srcLen++;
+        int lastSep = -1;
+        for (int k = srcLen - 1; k >= 0; --k)
+            if (ce.path[k] == '\\') { lastSep = k; break; }
+        const char* fname = (lastSep >= 0) ? ce.path + lastSep + 1 : ce.path;
+
+        char dst[MAX_PATH_LEN];
+        StrCopy(dst, sizeof(dst), destDir);
+        int dl = 0; while (dst[dl]) dl++;
+        if (dl > 0 && dst[dl - 1] != '\\') { dst[dl++] = '\\'; dst[dl] = '\0'; }
+        AppendStr(dst, sizeof(dst), fname);
+
+        ExpandToWorkList(ce.path, dst, ce.isDir);
+    }
+
+    s_opItemTotal = s_workCount;
+    s_opRunning = (s_workCount > 0);
+    s_fosState = s_opRunning ? FOS_RUNNING : FOS_IDLE;
+}
+
 static void FileOpStart(FileOpType op)
 {
     s_workCount = 0;
@@ -1850,67 +2064,78 @@ static void FtpTick()
         }
         else if (s_ftp.xferType == XFER_RETR)
         {
-            // If we have unsent data from last tick, drain it first
-            if (s_ftp.retrBufOff < s_ftp.retrBufLen)
+            // Time-bounded pump: keep reading + sending for up to 15ms per tick.
+            // This lets us push multiple 64KB chunks per frame when the socket
+            // is keeping up, without starving input/render on slow transfers.
+            // Every exit path below is identical to the old single-shot logic —
+            // we just loop instead of returning after the first chunk.
+            DWORD retrStart = GetTickCount();
+            while (GetTickCount() - retrStart < 15)
             {
-                int toSend = s_ftp.retrBufLen - s_ftp.retrBufOff;
-                int sent = send(s_ftp.dataSock,
-                    s_ftp.retrBuf + s_ftp.retrBufOff, toSend, 0);
-                if (sent > 0)
+                // Drain any unsent remainder from the previous read first
+                if (s_ftp.retrBufOff < s_ftp.retrBufLen)
                 {
-                    s_ftp.retrBufOff += sent;
-                    s_ftp.xferDone += (DWORD)sent;
+                    int toSend = s_ftp.retrBufLen - s_ftp.retrBufOff;
+                    int sent = send(s_ftp.dataSock,
+                        s_ftp.retrBuf + s_ftp.retrBufOff, toSend, 0);
+                    if (sent > 0)
+                    {
+                        s_ftp.retrBufOff += sent;
+                        s_ftp.xferDone += (DWORD)sent;
+                    }
+                    else if (sent < 0 && WSAGetLastError() != WSAEWOULDBLOCK)
+                    {
+                        // Client aborted
+                        closesocket(s_ftp.dataSock); s_ftp.dataSock = INVALID_SOCKET;
+                        CloseHandle(s_ftp.xferFile); s_ftp.xferFile = INVALID_HANDLE_VALUE;
+                        FtpReply(426, "Transfer aborted.");
+                        s_ftp.xferType = XFER_NONE;
+                        s_ftp.state = FTP_CONNECTED;
+                        goto retr_done;
+                    }
+                    // Socket full (WSAEWOULDBLOCK) or partial — stop pumping,
+                    // remainder will drain at the top of this loop next tick
+                    break;
                 }
-                else if (sent < 0 && WSAGetLastError() != WSAEWOULDBLOCK)
-                {
-                    // Client aborted
-                    closesocket(s_ftp.dataSock); s_ftp.dataSock = INVALID_SOCKET;
-                    CloseHandle(s_ftp.xferFile); s_ftp.xferFile = INVALID_HANDLE_VALUE;
-                    FtpReply(426, "Transfer aborted.");
-                    s_ftp.xferType = XFER_NONE;
-                    s_ftp.state = FTP_CONNECTED;
-                }
-                // Either drained or WSAEWOULDBLOCK — don't read more this tick
-                return;
-            }
 
-            // Buffer empty — read next chunk from file
-            s_ftp.retrBufLen = 0;
-            s_ftp.retrBufOff = 0;
-            DWORD bytesRead = 0;
-            if (ReadFile(s_ftp.xferFile, s_ftp.retrBuf, sizeof(s_ftp.retrBuf),
-                &bytesRead, NULL) && bytesRead > 0)
-            {
-                s_ftp.retrBufLen = (int)bytesRead;
-                // Don't send here — let next tick's drain path handle it
-                // (avoids double-tick issue; drain runs at top of next frame)
-                int sent = send(s_ftp.dataSock, s_ftp.retrBuf, s_ftp.retrBufLen, 0);
-                if (sent > 0)
+                // Buffer fully drained — read the next chunk from disk
+                s_ftp.retrBufLen = 0;
+                s_ftp.retrBufOff = 0;
+                DWORD bytesRead = 0;
+                if (ReadFile(s_ftp.xferFile, s_ftp.retrBuf, sizeof(s_ftp.retrBuf),
+                    &bytesRead, NULL) && bytesRead > 0)
                 {
-                    s_ftp.retrBufOff += sent;
-                    s_ftp.xferDone += (DWORD)sent;
+                    s_ftp.retrBufLen = (int)bytesRead;
+                    int sent = send(s_ftp.dataSock, s_ftp.retrBuf, s_ftp.retrBufLen, 0);
+                    if (sent > 0)
+                    {
+                        s_ftp.retrBufOff += sent;
+                        s_ftp.xferDone += (DWORD)sent;
+                    }
+                    else if (sent < 0 && WSAGetLastError() != WSAEWOULDBLOCK)
+                    {
+                        closesocket(s_ftp.dataSock); s_ftp.dataSock = INVALID_SOCKET;
+                        CloseHandle(s_ftp.xferFile); s_ftp.xferFile = INVALID_HANDLE_VALUE;
+                        FtpReply(426, "Transfer aborted.");
+                        s_ftp.xferType = XFER_NONE;
+                        s_ftp.state = FTP_CONNECTED;
+                        goto retr_done;
+                    }
+                    // If partial/WSAEWOULDBLOCK, retrBufOff < retrBufLen;
+                    // drain path at top of loop handles it next iteration
                 }
-                else if (sent < 0 && WSAGetLastError() != WSAEWOULDBLOCK)
+                else
                 {
+                    // EOF or read error — transfer complete
                     closesocket(s_ftp.dataSock); s_ftp.dataSock = INVALID_SOCKET;
                     CloseHandle(s_ftp.xferFile); s_ftp.xferFile = INVALID_HANDLE_VALUE;
-                    FtpReply(426, "Transfer aborted.");
+                    FtpReply(226, "Transfer complete.");
                     s_ftp.xferType = XFER_NONE;
                     s_ftp.state = FTP_CONNECTED;
+                    goto retr_done;
                 }
-                // Partial or WSAEWOULDBLOCK: retrBufOff < retrBufLen,
-                // remainder drained next tick
             }
-            else
-            {
-                // EOF or read error — transfer complete
-                closesocket(s_ftp.dataSock); s_ftp.dataSock = INVALID_SOCKET;
-                // dataListen stays open for the next PASV/transfer
-                CloseHandle(s_ftp.xferFile); s_ftp.xferFile = INVALID_HANDLE_VALUE;
-                FtpReply(226, "Transfer complete.");
-                s_ftp.xferType = XFER_NONE;
-                s_ftp.state = FTP_CONNECTED;
-            }
+        retr_done:;
         }
         else if (s_ftp.xferType == XFER_STOR)
         {
@@ -2101,6 +2326,8 @@ static void Render(const DiagLogo& logo)
         s_markedCount == 0;
     if (s_fosState == FOS_CONFIRM_DELETE)
         hints = "[B] Confirm Delete  [Back] Cancel";
+    else if (s_fosState == FOS_PICK_DEST)
+        hints = "[A] Enter  [Black/White] Confirm  [B] Up / Cancel";
     else if (s_markedCount > 0)
         hints = "[Y] Mark  [Black] Copy  [White] Move  [B] Delete  [Back] Clear";
     else if (s_clipCount > 0)
@@ -2214,64 +2441,6 @@ static void Render(const DiagLogo& logo)
     if (s_entryCount == 0)
         DrawText(LM, LIST_Y + ROW_H, "No files found.", 1.2f, COL_DIM);
 
-    // ---- Controls legend (top-left, idle only) --------------------------
-    if (s_fosState == FOS_IDLE && !s_opRunning)
-    {
-        const float CX = SW - LM - 148.f;
-        const float CY = CONTENT_Y + 2.f;
-        const float CPad = 5.f;
-        const float CLH = 12.f;
-
-        // Choose lines based on state
-        const char* lines[8];
-        int         nLines = 0;
-
-        if (s_markedCount > 0)
-        {
-            lines[nLines++] = "[Y]     Mark/Unmark";
-            lines[nLines++] = "[Black] Copy marked";
-            lines[nLines++] = "[White] Cut marked";
-            lines[nLines++] = "[B]     Delete marked";
-            lines[nLines++] = "[Back]  Clear marks";
-        }
-        else if (s_clipCount > 0)
-        {
-            lines[nLines++] = "[Y]     Mark/Unmark";
-            lines[nLines++] = "[Black] Paste (copy)";
-            lines[nLines++] = "[White] Paste (move)";
-            lines[nLines++] = "[Back]  Clear clipboard";
-            lines[nLines++] = "[A]     Open / Enter";
-            lines[nLines++] = "[B]     Back / Up";
-        }
-        else
-        {
-            lines[nLines++] = "[A]     Open / Enter";
-            lines[nLines++] = "[B]     Back / Up";
-            lines[nLines++] = "[X]     Launch XBE";
-            lines[nLines++] = "[Y]     Mark item";
-            lines[nLines++] = "[LT/RT] Page up/down";
-            lines[nLines++] = "[Start] FTP on/off";
-        }
-
-        float cw = 148.f;
-        float ch = CPad * 2.f + (float)nLines * CLH;
-
-        FillRect(CX, CY, CX + cw, CY + ch,
-            D3DCOLOR_ARGB(180, 6, 10, 24));
-        HLine(CY, CX, CX + cw, COL_BORDER);
-        HLine(CY + ch, CX, CX + cw, COL_BORDER);
-        VLine(CX, CY, CY + ch, COL_BORDER);
-        VLine(CX + cw, CY, CY + ch, COL_BORDER);
-
-        float ty = CY + CPad;
-        for (int li = 0; li < nLines; ++li)
-        {
-            DrawText(CX + CPad, ty, lines[li], 0.95f,
-                D3DCOLOR_XRGB(160, 180, 210));
-            ty += CLH;
-        }
-    }
-
     // ---- FTP widget (lower right) ----------------------------------------
     DrawFtpWidget();
 
@@ -2341,6 +2510,10 @@ static void Render(const DiagLogo& logo)
         DrawText(DX + 10.f, DY + 30.f, "[B] Confirm", 1.05f, D3DCOLOR_XRGB(255, 80, 80));
         DrawText(DX + 10.f, DY + 46.f, "[Back] Cancel", 1.05f, COL_GRAY);
     }
+
+    // ---- Destination picker overlay --------------------------------------
+    if (s_fosState == FOS_PICK_DEST)
+        DrawDestPicker();
 
     // ---- Clipboard status bar (bottom of list, above bot bar) ------------
     if (s_clipCount > 0 && !s_opRunning && s_fosState == FOS_IDLE)
@@ -2418,6 +2591,115 @@ void FileExplorer_Tick(const DiagLogo& logo)
     // Block navigation input while file op running
     if (s_opRunning) { s_prevBtns = cur; Render(logo); return; }
 
+    // ---- Destination picker input ----------------------------------------
+    if (s_fosState == FOS_PICK_DEST)
+    {
+        // [DPad Down]
+        if (EdgeDown(cur, s_prevBtns, BTN_DPAD_DOWN))
+        {
+            if (s_pickCursor < s_pickEntryCount - 1)
+            {
+                s_pickCursor++;
+                if (s_pickCursor >= s_pickScroll + PICK_ROWS_VISIBLE)
+                    s_pickScroll++;
+            }
+        }
+        // [DPad Up]
+        if (EdgeDown(cur, s_prevBtns, BTN_DPAD_UP))
+        {
+            if (s_pickCursor > 0)
+            {
+                s_pickCursor--;
+                if (s_pickCursor < s_pickScroll)
+                    s_pickScroll--;
+            }
+        }
+        // [A] — at root: enter drive
+        //       inside dir + has subfolders: navigate into selected subfolder
+        //       inside dir + no subfolders: confirm current path as destination
+        if (EdgeDown(cur, s_prevBtns, BTN_A))
+        {
+            if (s_pickAtRoot)
+            {
+                if (s_pickEntryCount > 0)
+                {
+                    FileEntry& pe = s_pickEntries[s_pickCursor];
+                    char drivePath[8];
+                    drivePath[0] = pe.name[0]; drivePath[1] = ':';
+                    drivePath[2] = '\\'; drivePath[3] = '\0';
+                    PickLoadDirectory(drivePath);
+                    s_pickCursor = 0;
+                    s_pickScroll = 0;
+                }
+            }
+            else
+            {
+                if (s_pickEntryCount > 0)
+                {
+                    // Navigate into selected subfolder
+                    char sub[MAX_PATH_LEN];
+                    StrCopy(sub, sizeof(sub), s_pickPath);
+                    int pl = 0; while (sub[pl]) pl++;
+                    if (pl > 0 && sub[pl - 1] != '\\') { sub[pl++] = '\\'; sub[pl] = '\0'; }
+                    AppendStr(sub, sizeof(sub), s_pickEntries[s_pickCursor].name);
+                    PickLoadDirectory(sub);
+                    s_pickCursor = 0;
+                    s_pickScroll = 0;
+                }
+                else
+                {
+                    // No subfolders — confirm current path
+                    SnapMarkedToClipboard(s_pendingOp);
+                    FileOpStartTo(s_pickPath);
+                    s_fosState = FOS_IDLE;
+                    s_pendingOp = FILEOP_NONE;
+                }
+            }
+        }
+        // [Black] or [White] — confirm current picker path as destination
+        if ((EdgeDown(cur, s_prevBtns, BTN_BLACK) || EdgeDown(cur, s_prevBtns, BTN_WHITE))
+            && !s_pickAtRoot)
+        {
+            SnapMarkedToClipboard(s_pendingOp);
+            FileOpStartTo(s_pickPath);
+            s_fosState = FOS_IDLE;
+            s_pendingOp = FILEOP_NONE;
+        }
+        // [B] — go up one level, or cancel if at root
+        if (EdgeDown(cur, s_prevBtns, BTN_B))
+        {
+            if (s_pickAtRoot)
+            {
+                s_fosState = FOS_IDLE;
+                s_pendingOp = FILEOP_NONE;
+            }
+            else
+            {
+                int pl = 0; while (s_pickPath[pl]) pl++;
+                if (pl > 0 && s_pickPath[pl - 1] == '\\') pl--;
+                int sep = -1;
+                for (int k = pl - 1; k >= 0; --k)
+                    if (s_pickPath[k] == '\\') { sep = k; break; }
+                if (sep <= 2)
+                    PickLoadDriveList();
+                else
+                {
+                    char parent[MAX_PATH_LEN];
+                    int n = sep < MAX_PATH_LEN - 1 ? sep : MAX_PATH_LEN - 1;
+                    for (int k = 0; k < n; ++k) parent[k] = s_pickPath[k];
+                    parent[n] = '\0';
+                    PickLoadDirectory(parent);
+                }
+                s_pickCursor = 0;
+                s_pickScroll = 0;
+            }
+        }
+
+        s_prevBtns = cur;
+        Render(logo);
+        return;
+    }
+
     // [DPad Down]
     if (EdgeDown(cur, s_prevBtns, BTN_DPAD_DOWN))
     {
@@ -2490,39 +2772,38 @@ void FileExplorer_Tick(const DiagLogo& logo)
         }
     }
 
-    // [Black] — copy marked to clipboard, or paste clipboard here
+    // [Black] — copy marked items: open destination picker
     if (EdgeDown(cur, s_prevBtns, BTN_BLACK))
     {
-        if (s_fosState == FOS_IDLE && !s_atRoot)
+        if (s_fosState == FOS_IDLE && !s_atRoot && s_markedCount > 0)
         {
-            if (s_markedCount > 0)
-            {
-                // Snapshot marked items as COPY clipboard
-                SnapMarkedToClipboard(FILEOP_COPY);
-            }
-            else if (s_clipCount > 0)
-            {
-                // Paste clipboard into current directory
-                FileOpStart(s_clipOp == FILEOP_NONE ? FILEOP_COPY : s_clipOp);
-            }
+            s_pendingOp = FILEOP_COPY;
+            PickLoadDriveList();
+            s_pickCursor = 0;
+            s_pickScroll = 0;
+            s_fosState = FOS_PICK_DEST;
+        }
+        else if (s_fosState == FOS_IDLE && !s_atRoot && s_clipCount > 0)
+        {
+            // No marks but clipboard present — paste here (original behaviour)
+            FileOpStart(s_clipOp == FILEOP_NONE ? FILEOP_COPY : s_clipOp);
         }
     }
 
-    // [White] — move marked items here, or move clipboard here
+    // [White] — move marked items: open destination picker
     if (EdgeDown(cur, s_prevBtns, BTN_WHITE))
     {
-        if (s_fosState == FOS_IDLE && !s_atRoot)
+        if (s_fosState == FOS_IDLE && !s_atRoot && s_markedCount > 0)
         {
-            if (s_markedCount > 0)
-            {
-                // Snapshot as MOVE clipboard — user navigates to dest, then
-                // presses White (or Black) again to execute
-                SnapMarkedToClipboard(FILEOP_MOVE);
-            }
-            else if (s_clipCount > 0)
-            {
-                FileOpStart(FILEOP_MOVE);
-            }
+            s_pendingOp = FILEOP_MOVE;
+            PickLoadDriveList();
+            s_pickCursor = 0;
+            s_pickScroll = 0;
+            s_fosState = FOS_PICK_DEST;
+        }
+        else if (s_fosState == FOS_IDLE && !s_atRoot && s_clipCount > 0)
+        {
+            FileOpStart(FILEOP_MOVE);
         }
     }
 

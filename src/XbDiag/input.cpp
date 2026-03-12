@@ -199,6 +199,15 @@ void GetTriggers(int& lt, int& rt, int& black, int& white,
 }
 
 // -----------------------------------------------------------------------------
+// IsPortConnected – returns true if a controller handle is open on this port
+// -----------------------------------------------------------------------------
+bool IsPortConnected(int port)
+{
+    if (port < 0 || port >= MAX_PORTS) return false;
+    return g_padHandles[port] != NULL;
+}
+
+// -----------------------------------------------------------------------------
 // SetRumble – drives left (low-freq) and right (high-freq) motors
 // Only calls XInputSetState on the one port that last returned a successful
 // XInputGetState — avoids blocking on a stale/bad handle.  Two guards:

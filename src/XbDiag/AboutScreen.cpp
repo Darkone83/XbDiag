@@ -6,13 +6,14 @@
 //     App name + version  (large, centered)
 //     Purpose statement   (two lines, centered)
 //     Horizontal rule
-//     Three info rows: target / memory / renderer
+//     Target hardware row + modules rows (two lines)
 //
 //   Lower panel (DIVIDER_Y to BOT_BAR_Y):
 //     Two credit cards side by side, centered:
 //       Left  - tr.dds   "Team Resurgent"
 //       Right - dc.dds   "Darkone Customs"
 //     Logos loaded on OnEnter, released on [B] back.
+//     Rotating Xbox trivia ticker above the bot bar.
 
 #include "AboutScreen.h"
 #include "font.h"
@@ -246,7 +247,9 @@ static void Render(const DiagLogo& logo)
     y += LINE_H;
 
     DrawText(LM, y, "MODULES         :", LS, COL_GRAY);
-    DrawText(VM2, y, "SysInfo  RAM  SMBus  Temp  HDD  EEPROM  Video Contoller Stress File Exp", LS, COL_WHITE);
+    DrawText(VM2, y, "SysInfo  RAM Test  SMBus Scan  Temp Monitor  HDD Info", LS, COL_WHITE);
+    y += LINE_H;
+    DrawText(VM2, y, "EEPROM  Video Out  Stress Test  File Explorer", LS, COL_WHITE);
 
     // -------------------------------------------------------------------------
     // Divider + logo panel background

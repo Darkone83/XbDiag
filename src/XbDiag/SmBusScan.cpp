@@ -249,8 +249,179 @@ static const DeviceRegs s_devRegs[] =
 static const int s_devRegsCount = sizeof(s_devRegs) / sizeof(s_devRegs[0]);
 
 // ============================================================================
-// Module state
+// Runtime device table  — loaded from D:\smbid.id at startup (local XBE folder)
+// Supplements the built-in s_known[].  Max 32 user entries.
 // ============================================================================
+
+static const int   USER_KNOWN_MAX = 32;
+static const char* SMBID_PATH = "D:\\smbid.id";
+
+struct UserDevice
+{
+    BYTE addr;
+    char name[12];
+    char desc[80];
+    char notes[80];
+};
+
+static UserDevice s_userKnown[USER_KNOWN_MAX];
+static int        s_userKnownCount = 0;
+static bool       s_idFileLoaded = false;   // true = loaded from file (even if 0 entries)
+
+// ---- Tiny string helpers (no CRT) ------------------------------------------
+
+static bool IdIsHexDigit(char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static int IdHexVal(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+// Copy src -> dst (up to dstMax-1 chars), trim leading/trailing spaces, null-terminate
+static void IdTrimCopy(char* dst, int dstMax, const char* src, int srcLen)
+{
+    // trim leading
+    while (srcLen > 0 && (*src == ' ' || *src == '\t')) { ++src; --srcLen; }
+    // trim trailing
+    while (srcLen > 0 && (src[srcLen - 1] == ' ' || src[srcLen - 1] == '\t' ||
+        src[srcLen - 1] == '\r' || src[srcLen - 1] == '\n'))
+        --srcLen;
+    if (srcLen >= dstMax) srcLen = dstMax - 1;
+    for (int i = 0; i < srcLen; ++i) dst[i] = src[i];
+    dst[srcLen] = '\0';
+}
+
+// ---- Parse one line: "0xAD | NAME | desc | notes"  -------------------------
+// Returns true if the line produced a valid entry.
+static bool IdParseLine(const char* line, int len, UserDevice& out)
+{
+    // Skip blank lines and comment lines (# or ;)
+    int i = 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) ++i;
+    if (i >= len || line[i] == '#' || line[i] == ';' || line[i] == '\r' || line[i] == '\n')
+        return false;
+
+    // Find four pipe-delimited fields
+    const char* fields[4] = { NULL, NULL, NULL, NULL };
+    int          flens[4] = { 0, 0, 0, 0 };
+    int field = 0;
+    fields[0] = line;
+    for (int j = 0; j < len && field < 3; ++j)
+    {
+        if (line[j] == '|')
+        {
+            flens[field] = (int)(line + j - fields[field]);
+            ++field;
+            fields[field] = line + j + 1;
+        }
+    }
+    flens[field] = (int)(line + len - fields[field]);
+    if (field < 3) return false;   // need at least 4 fields
+
+    // Field 0: address — accept 0xNN or NN (hex)
+    const char* af = fields[0];
+    int alen = flens[0];
+    while (alen > 0 && (*af == ' ' || *af == '\t')) { ++af; --alen; }
+    while (alen > 0 && (af[alen - 1] == ' ' || af[alen - 1] == '\t')) --alen;
+    if (alen >= 2 && af[0] == '0' && (af[1] == 'x' || af[1] == 'X')) { af += 2; alen -= 2; }
+    if (alen < 1 || alen > 2) return false;
+    if (!IdIsHexDigit(af[0])) return false;
+    int addr = IdHexVal(af[0]);
+    if (alen == 2) { if (!IdIsHexDigit(af[1])) return false; addr = addr * 16 + IdHexVal(af[1]); }
+    if (addr > 0x7F) return false;
+
+    out.addr = (BYTE)addr;
+    IdTrimCopy(out.name, sizeof(out.name), fields[1], flens[1]);
+    IdTrimCopy(out.desc, sizeof(out.desc), fields[2], flens[2]);
+    IdTrimCopy(out.notes, sizeof(out.notes), fields[3], flens[3]);
+    if (out.name[0] == '\0') return false;
+    return true;
+}
+
+// ---- Write the default smbid.id to disk ------------------------------------
+static bool IdWriteDefault()
+{
+    HANDLE hf = CreateFile(SMBID_PATH,
+        GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+
+    // File content — plain ASCII, written as one block
+    static const char body[] =
+        "# smbid.id  -  XbDiag SMBus device ID database\r\n"
+        "# Edit this file to add your own known devices.\r\n"
+        "#\r\n"
+        "# Format (one device per line):\r\n"
+        "#   address (hex) | short name (<=11 chars) | description | register map notes\r\n"
+        "#\r\n"
+        "# Lines beginning with # or ; are comments and are ignored.\r\n"
+        "# Addresses are 7-bit (e.g. 0x10 for the PIC/SMC).\r\n"
+        "# Entries in this file supplement the built-in device table.\r\n"
+        "# If an address is in both, the built-in entry takes priority.\r\n"
+        "#\r\n"
+        "# Example (remove the leading # to activate):\r\n"
+        "; 0x48 | LM75 TEMP | LM75 / LM75A temperature sensor | Reg 0x00=temp 0x01=config 0x02=hyst 0x03=limit\r\n"
+        "#\r\n"
+        "# Add your entries below this line:\r\n"
+        "\r\n";
+
+    DWORD written = 0;
+    BOOL  ok = WriteFile(hf, body, (DWORD)(sizeof(body) - 1), &written, NULL);
+    CloseHandle(hf);
+    return ok && (written == sizeof(body) - 1);
+}
+
+// ---- Load smbid.id into s_userKnown[] --------------------------------------
+static void IdLoad()
+{
+    s_userKnownCount = 0;
+    s_idFileLoaded = false;
+
+    HANDLE hf = CreateFile(SMBID_PATH,
+        GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    if (hf == INVALID_HANDLE_VALUE)
+    {
+        // File not present — generate it; fall back to internal DB either way
+        IdWriteDefault();
+        return;
+    }
+
+    // Read entire file (cap at 8KB — plenty for any reasonable ID list)
+    static char buf[8192];
+    DWORD bytesRead = 0;
+    BOOL  ok = ReadFile(hf, buf, sizeof(buf) - 1, &bytesRead, NULL);
+    CloseHandle(hf);
+    if (!ok || bytesRead == 0) { s_idFileLoaded = true; return; }
+    buf[bytesRead] = '\0';
+
+    // Walk lines
+    char* p = buf;
+    char* end = buf + bytesRead;
+    while (p < end && s_userKnownCount < USER_KNOWN_MAX)
+    {
+        // Find end of line
+        char* nl = p;
+        while (nl < end && *nl != '\n') ++nl;
+        int lineLen = (int)(nl - p);
+
+        UserDevice dev;
+        if (IdParseLine(p, lineLen, dev))
+            s_userKnown[s_userKnownCount++] = dev;
+
+        p = (nl < end) ? nl + 1 : end;
+    }
+
+    s_idFileLoaded = true;
+}
+
+// ============================================================================
+// Module state\n// ============================================================================
 
 enum ScanPhase { PHASE_SCANNING, PHASE_DONE };
 
@@ -277,10 +448,27 @@ static bool EdgeDown(WORD cur, WORD prev, WORD btn)
     return ((cur & btn) != 0) && ((prev & btn) == 0);
 }
 
+// Scratch KnownDevice used to surface a UserDevice through FindKnown's return type.
+// Single static instance — only valid until the next call.
+static KnownDevice s_userKnownScratch;
+
 static const KnownDevice* FindKnown(int addr)
 {
+    // Built-in table has priority
     for (int i = 0; i < s_knownCount; ++i)
         if (s_known[i].addr == (BYTE)addr) return &s_known[i];
+    // User-loaded entries from smbid.id
+    for (int i = 0; i < s_userKnownCount; ++i)
+    {
+        if (s_userKnown[i].addr == (BYTE)addr)
+        {
+            s_userKnownScratch.addr = s_userKnown[i].addr;
+            s_userKnownScratch.name = s_userKnown[i].name;
+            s_userKnownScratch.desc = s_userKnown[i].desc;
+            s_userKnownScratch.notes = s_userKnown[i].notes;
+            return &s_userKnownScratch;
+        }
+    }
     return NULL;
 }
 
@@ -338,6 +526,7 @@ void SmBusScan_OnEnter()
 {
     s_prevBtns = 0;
     s_cursor = 0x10;   // start on PIC16L (7-bit 0x10 = sw 0x20)
+    IdLoad();          // load / generate smbid.id; falls back to internal DB silently
     ResetScan();
 }
 
@@ -602,6 +791,28 @@ static void DrawInfoPanel()
             s_results[s_cursor].scanned ? "NAK" : "NOT SCANNED");
         DrawText(px, py, msg, 1.2f,
             s_results[s_cursor].scanned ? D3DCOLOR_XRGB(55, 60, 85) : COL_DIM);
+    }
+
+    // ---- ID source badge (bottom-right of panel) ----------------------------
+    {
+        char badge[40];
+        if (s_idFileLoaded && s_userKnownCount > 0)
+        {
+            StrCopy(badge, sizeof(badge), "smbid.id  +");
+            char cnt[6]; IntToStr(s_userKnownCount, cnt, sizeof(cnt));
+            StrCat2(badge, sizeof(badge), badge, cnt);
+            StrCat2(badge, sizeof(badge), badge, " user");
+        }
+        else if (s_idFileLoaded)
+        {
+            StrCopy(badge, sizeof(badge), "smbid.id  (no entries)");
+        }
+        else
+        {
+            StrCopy(badge, sizeof(badge), "internal db");
+        }
+        DrawTextR(PANEL_X + PANEL_W - 8.f, PANEL_BOTTOM - LINE_H - 2.f,
+            badge, 1.0f, COL_DIM);
     }
 }
 

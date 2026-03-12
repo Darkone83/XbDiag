@@ -8,10 +8,12 @@
 //   Right column: Video / Thermal / Storage / Network
 //   Bottom strip: CPU MHz | GPU MHz (live color bar)
 //
-// Revision detection (three independent sources, majority wins):
-//   1. PCI NV2A revision byte  (most reliable, hardware-read)
-//   2. Video encoder ID        (correlates strongly with board rev)
-//   3. EEPROM serial prefix    (factory serial encodes region/line)
+// Revision detection (PrometheOS getHardwareRevision method):
+//   1. PIC reg 0x01 x3 reads  -> 3-char board string (P01/P05/P11/P2L)
+//   2. Encoder SMBus probe    -> splits P11 into 1.2/1.3 vs 1.4/1.5
+//   3. NV2A PCI rev byte      -> splits 1.2 vs 1.3 (0xA1 / 0xA2)
+//   4. Focus chip ID reg 0x00 -> splits 1.4 vs 1.5 (0x54 / 0x09)
+//   5. NV2A EMRS RAM strap    -> splits P2L into 1.6 vs 1.6b
 //
 // CPU speed: measured via TSC delta over a 100ms GetTickCount() window.
 // GPU speed: NV2A PRAMDAC NVPLL at MMIO 0xFD680500 - decode M/N/P.
@@ -104,6 +106,11 @@ struct SysData
     // Export
     bool exportDone;
     bool exportOK;
+
+    // BIOS dump
+    bool biosDumpDone;
+    bool biosDumpOK;
+    DWORD biosDumpSize;     // bytes written (256KB or 1MB)
 };
 
 static SysData  s_data;
@@ -355,26 +362,36 @@ static void AtaSwapStr(const WORD* words, int nWords, char* out, int outLen)
 }
 
 // ============================================================================
-// Board revision detection  (ref: PrometheOS xboxConfig::getXboxVersion)
+// Board revision detection  (ref: PrometheOS getHardwareRevision)
 // ============================================================================
 //
-// Primary method: read PIC reg 0x01 three times — the PIC16L shifts out one
+// Primary method: read PIC reg 0x01 three times - the PIC16L shifts out one
 // byte per read on the same register, giving a 3-char board string:
-//   P01 = 1.0   P05 = 1.1   P11 = 1.2/1.3/1.4/1.5   P2L = 1.6/1.6b
-//   DBG = Debug kit   01D/D01 variants = Dev kit
+//   P01 = 1.0
+//   P05 = 1.1
+//   P11 = 1.2 / 1.3 / 1.4 / 1.5  (disambiguated below)
+//   P2L = 1.6 / 1.6b              (disambiguated below)
+//   DBG = Debug/Alpha kit   D01 variants = Dev kit
 //
-// P11 disambiguation: probe Focus encoder (SMBADDR_ENC_FOCUS 0xD4).
-//   ACK  -> 1.4/1.5  (Focus FS454 present)
-//   NAK  -> 1.2/1.3  (Conexant, no Focus)
+// P11 disambiguation (PrometheOS method):
+//   Probe Conexant encoder (SMBADDR_ENC_CNXT 0x8A):
+//     ACK -> 1.2 or 1.3.  Further: NV2A PCI revision byte (reg 0x08 bits[7:0])
+//              0xA1 -> 1.2    0xA2 -> 1.3    other -> 1.2/1.3
+//   Probe Focus encoder (SMBADDR_ENC_FOCUS 0xD4):
+//     ACK -> 1.4 or 1.5.  Further: Focus chip ID reg 0x00
+//              0x54 (FS454) -> 1.4    0x09 (FS455) -> 1.5    other -> 1.4/1.5
+//   Both NAK -> 1.2/1.3 (fallback)
 //
-// P2L disambiguation: read NV2A EMRS strap at 0xFD101000 bits [19:18].
-//   Samsung  (!=3) -> 1.6
-//   Hynix    (==3) -> 1.6b
+// P2L disambiguation:
+//   NV2A EMRS strap bits[19:18] at MMIO 0xFD101000.
+//   Hynix RAM (strap==3) -> 1.6b    Samsung (strap!=3) -> 1.6
+//
+// nvRev = NV2A PCI revision byte already read in LoadData() - passed in
+//         to avoid a redundant PCI config read.
 // ============================================================================
 
-static void DetectBoardRevision(SysData& d)
+static void DetectBoardRevision(SysData& d, BYTE nvRev)
 {
-    // Read 3 bytes from PIC reg 0x01 (shifts out 1 char per read)
     BYTE b0 = 0, b1 = 0, b2 = 0;
     bool ok = SMBusRead(SMBADDR_PIC, 0x01, b0) &&
         SMBusRead(SMBADDR_PIC, 0x01, b1) &&
@@ -383,18 +400,19 @@ static void DetectBoardRevision(SysData& d)
     d.boardRevPIC[0] = ok ? (char)b0 : '?';
     d.boardRevPIC[1] = ok ? (char)b1 : '?';
     d.boardRevPIC[2] = ok ? (char)b2 : '?';
-    d.boardRevPIC[3] = '\0';
+    d.boardRevPIC[3] = ' ';
 
     if (!ok) { StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "UNKNOWN"); return; }
 
-    // Dev kit variants
-    if ((b0 == '0' && b1 == '1' && b2 == 'D') || (b0 == 'D' && b1 == '0' && b2 == '1') ||
-        (b0 == '1' && b1 == 'D' && b2 == '0') || (b0 == '0' && b1 == 'D' && b2 == '1'))
+    // Dev kit variants (D01 / 01D / 1D0 etc.)
+    if ((b0 == 'D' || b1 == 'D' || b2 == 'D') &&
+        (b0 == '0' || b1 == '0' || b2 == '0') &&
+        (b0 == '1' || b1 == '1' || b2 == '1'))
     {
         StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "DEV KIT"); return;
     }
 
-    // Debug kit
+    // Debug / Alpha kit
     if ((b0 == 'D' && b1 == 'B' && b2 == 'G') || (b0 == 'B' && b1 == '1' && b2 == '1'))
     {
         StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "DEBUG KIT"); return;
@@ -410,23 +428,40 @@ static void DetectBoardRevision(SysData& d)
         StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.1"); return;
     }
 
-    if ((b0 == 'P' && b1 == '1' && b2 == '1') || (b0 == '1' && b1 == 'P' && b2 == '1') ||
+    // 1.2 / 1.3 / 1.4 / 1.5  (all report P11 from PIC)
+    if ((b0 == 'P' && b1 == '1' && b2 == '1') ||
+        (b0 == '1' && b1 == 'P' && b2 == '1') ||
         (b0 == '1' && b1 == '1' && b2 == 'P'))
     {
-        // Disambiguate 1.2/1.3 vs 1.4/1.5 by probing Focus encoder
-        BYTE dummy = 0;
-        if (SMBusRead(SMBADDR_ENC_FOCUS, 0x00, dummy))
-            StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.4/1.5");  // Focus ACK
-        else
-            StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.2/1.3"); // Focus NAK
+        BYTE encId = 0;
+
+        // Probe Conexant (0x8A) - present on 1.2 and 1.3
+        if (SMBusRead(SMBADDR_ENC_CNXT, 0x00, encId))
+        {
+            // NV2A-A1 (0xA1) -> 1.2    NV2A-A2 (0xA2) -> 1.3
+            if (nvRev == 0xA1) StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.2");
+            else if (nvRev == 0xA2) StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.3");
+            else                    StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.2/1.3");
+            return;
+        }
+
+        // Probe Focus (0xD4) - present on 1.4 and 1.5
+        if (SMBusRead(SMBADDR_ENC_FOCUS, 0x00, encId))
+        {
+            // FS454 (0x54) -> 1.4    FS455 (0x09) -> 1.5
+            if (encId == 0x54) StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.4");
+            else if (encId == 0x09) StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.5");
+            else                    StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.4/1.5");
+            return;
+        }
+
+        StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.2/1.3");
         return;
     }
 
+    // 1.6 / 1.6b  (P2L)
     if (b0 == 'P' && b1 == '2' && b2 == 'L')
     {
-        // Disambiguate 1.6 vs 1.6b by NV2A EMRS strap bits[19:18] at 0xFD101000.
-        // Hynix RAM (strap==3) = 1.6b, Samsung (strap!=3) = 1.6.
-        // Guard: confirm NV2A vendor is NVIDIA before touching MMIO.
         DWORD vendor = PciRead32(0, 1, 0, 0x00);
         if ((vendor & 0xFFFF) == 0x10DE)
         {
@@ -442,7 +477,7 @@ static void DetectBoardRevision(SysData& d)
         return;
     }
 
-    // Unrecognised PIC string — show raw bytes
+    // Unrecognised PIC string - show raw bytes
     StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), d.boardRevPIC);
 }
 
@@ -468,37 +503,44 @@ static void ReadSysData()
         d.isXemu = !isGenuineIntel;
     }
 
-    // --- CPU brand (CPUID 0x80000002-4) ---
+    // --- CPU brand string (CPUID 0x80000002-4) ---
+    // Guard: verify extended leaves up to 0x80000004 are supported first.
     {
-        char* bp = d.cpuBrand;
-        for (DWORD leaf = 0x80000002UL; leaf <= 0x80000004UL; ++leaf)
+        DWORD ea, eb, ec, ed;
+        DoCpuid(0x80000000UL, ea, eb, ec, ed);
+        bool brandSupported = (ea >= 0x80000004UL);
+
+        if (brandSupported)
         {
-            DWORD ea, eb, ec, ed;
-            DoCpuid(leaf, ea, eb, ec, ed);
-            DWORD r[4] = { ea, eb, ec, ed };
-            for (int ri = 0; ri < 4; ++ri)
+            char* bp = d.cpuBrand;
+            for (DWORD leaf = 0x80000002UL; leaf <= 0x80000004UL; ++leaf)
             {
-                bp[0] = (char)(r[ri] & 0xFF);
-                bp[1] = (char)((r[ri] >> 8) & 0xFF);
-                bp[2] = (char)((r[ri] >> 16) & 0xFF);
-                bp[3] = (char)((r[ri] >> 24) & 0xFF);
-                bp += 4;
+                DoCpuid(leaf, ea, eb, ec, ed);
+                DWORD r[4] = { ea, eb, ec, ed };
+                for (int ri = 0; ri < 4; ++ri)
+                {
+                    bp[0] = (char)(r[ri] & 0xFF);
+                    bp[1] = (char)((r[ri] >> 8) & 0xFF);
+                    bp[2] = (char)((r[ri] >> 16) & 0xFF);
+                    bp[3] = (char)((r[ri] >> 24) & 0xFF);
+                    bp += 4;
+                }
+            }
+            d.cpuBrand[47] = '\0';
+            int start = 0;
+            while (d.cpuBrand[start] == ' ') ++start;
+            if (start > 0)
+            {
+                int i = 0;
+                while (d.cpuBrand[start + i])
+                {
+                    d.cpuBrand[i] = d.cpuBrand[start + i]; ++i;
+                }
+                d.cpuBrand[i] = '\0';
             }
         }
-        d.cpuBrand[47] = '\0';
-        int start = 0;
-        while (d.cpuBrand[start] == ' ') ++start;
-        if (start > 0)
-        {
-            int i = 0;
-            while (d.cpuBrand[start + i])
-            {
-                d.cpuBrand[i] = d.cpuBrand[start + i]; ++i;
-            }
-            d.cpuBrand[i] = '\0';
-        }
-        // If brand string is empty or garbage, substitute known hardware value
-        if (d.cpuBrand[0] < 0x20 || d.cpuBrand[0] == (char)0xFF)
+
+        if (!brandSupported || d.cpuBrand[0] < 0x20 || d.cpuBrand[0] == (char)0xFF)
         {
             if (d.isXemu)
                 StrCopy(d.cpuBrand, sizeof(d.cpuBrand), "Intel PIII 733 (xemu)");
@@ -507,13 +549,70 @@ static void ReadSysData()
         }
     }
 
-    // --- CPU IC name ---
-    // All Xbox revisions use the Intel Coppermine-128 (Pentium III mobile).
-    // Stepping varies by board revision and is not useful to display.
+    // --- CPU IC identification ---
+    // Under xemu: show the brand string directly with * marker.
+    // On real hardware: derive from CPUID leaf 1 family/model.
+    //   Model  8 (0x08) = Coppermine  (retail Xbox: 128KB L2)
+    //   Model 11 (0x0B) = Tualatin    (upgrade: PIII-S 512KB or Celeron 256KB)
+    //   Model  8 + "Celeron" in brand = Celeron Coppermine upgrade
     if (d.isXemu)
-        StrCopy(d.cpuIC, sizeof(d.cpuIC), "Coppermine-128*");
+    {
+        StrCopy(d.cpuIC, sizeof(d.cpuIC), d.cpuBrand);
+        int icLen = 0;
+        while (d.cpuIC[icLen]) ++icLen;
+        if (icLen > 0 && icLen < (int)sizeof(d.cpuIC) - 1 && d.cpuIC[icLen - 1] != '*')
+        {
+            d.cpuIC[icLen] = '*'; d.cpuIC[icLen + 1] = '\0';
+        }
+    }
     else
-        StrCopy(d.cpuIC, sizeof(d.cpuIC), "Coppermine-128");
+    {
+        DWORD ea1, eb1, ec1, ed1;
+        DoCpuid(1, ea1, eb1, ec1, ed1);
+        BYTE cpuFamily = (BYTE)((ea1 >> 8) & 0x0F);
+        BYTE cpuModel = (BYTE)((ea1 >> 4) & 0x0F);
+        BYTE cpuStepping = (BYTE)(ea1 & 0x0F);
+        (void)cpuStepping;
+
+        // Scan brand string for "Celeron"
+        bool isCeleron = false;
+        {
+            const char* needle = "Celeron";
+            const char* hay = d.cpuBrand;
+            for (int hi = 0; hay[hi]; ++hi)
+            {
+                int ni = 0;
+                while (needle[ni] && hay[hi + ni] == needle[ni]) ++ni;
+                if (!needle[ni]) { isCeleron = true; break; }
+            }
+        }
+
+        if (cpuFamily == 6 && cpuModel == 8)
+        {
+            if (isCeleron)
+                StrCopy(d.cpuIC, sizeof(d.cpuIC), "Celeron (Coppermine)");
+            else
+                StrCopy(d.cpuIC, sizeof(d.cpuIC), "Coppermine-128");
+        }
+        else if (cpuFamily == 6 && cpuModel == 0x0B)
+        {
+            if (isCeleron)
+                StrCopy(d.cpuIC, sizeof(d.cpuIC), "Tualatin-256 (Cel)");
+            else
+                StrCopy(d.cpuIC, sizeof(d.cpuIC), "Tualatin-512 (PIII-S)");
+        }
+        else if (cpuFamily == 6)
+        {
+            char mt[6];
+            IntToHex(cpuModel, 2, mt, sizeof(mt));
+            StrCopy(d.cpuIC, sizeof(d.cpuIC), "P6 model 0x");
+            StrCat2(d.cpuIC, sizeof(d.cpuIC), d.cpuIC, mt);
+        }
+        else
+        {
+            StrCopy(d.cpuIC, sizeof(d.cpuIC), "Unknown CPU");
+        }
+    }
 
     // --- CPU speed (TSC measurement) ---
     {
@@ -595,8 +694,8 @@ static void ReadSysData()
         }
     }
 
-    // --- Board revision (PIC reg 0x01 method, ref: PrometheOS getXboxVersion) ---
-    DetectBoardRevision(d);
+    // --- Board revision (PrometheOS getHardwareRevision method) ---
+    DetectBoardRevision(d, pciRevByte);
 
     // --- AV pack (PIC SMBus 0x45 reg 0x04 bits [2:0]) ---
     {
@@ -951,6 +1050,67 @@ static void WriteLine(HANDLE hf, const char* label, const char* value)
     WriteFile(hf, line, StrLen(line), &w, NULL);
 }
 
+// ============================================================================
+// BIOS dump
+// ============================================================================
+//
+// The Xbox flash ROM is memory-mapped read-only at the top of the 32-bit
+// address space. Common sizes:
+//   256KB retail BIOS: mapped at 0xFFFC0000 - 0xFFFFFFFF
+//   1MB mod chip BIOS: mapped at 0xFFF00000 - 0xFFFFFFFF
+//
+// Detection: if the first 256KB bank at 0xFFF00000 matches the bank at
+// 0xFFFC0000 it is a 256KB chip (ROM tiled to fill 1MB address window).
+// If they differ it is a genuine 1MB image - dump the full megabyte.
+// Output: D:\bios.bin (XBE launch directory, always writable).
+// ============================================================================
+
+static void DumpBios()
+{
+    SysData& d = s_data;
+
+    const BYTE* base256 = (const BYTE*)0xFFFC0000UL; // top 256KB always valid
+    const BYTE* base1M = (const BYTE*)0xFFF00000UL; // base of potential 1MB
+
+    // Determine image size: compare first 16 bytes at each 256KB boundary.
+    // On a 256KB chip the ROM is tiled four times, so the banks are identical.
+    // On a 1MB chip bank 0 (0xFFF00000) holds distinct data from bank 3 (0xFFFC0000).
+    bool is1MB = false;
+    for (int bi = 0; bi < 16; ++bi)
+    {
+        if (base1M[bi] != base256[bi]) { is1MB = true; break; }
+    }
+
+    const BYTE* dumpBase = is1MB ? base1M : base256;
+    DWORD       dumpSize = is1MB ? (1024UL * 1024UL) : (256UL * 1024UL);
+
+    HANDLE hf = CreateFileA("D:\\bios.bin", GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE)
+    {
+        d.biosDumpDone = true; d.biosDumpOK = false; return;
+    }
+
+    // Write in 4KB pages to avoid one massive WriteFile call
+    const DWORD PAGE = 4096;
+    DWORD written = 0;
+    bool  ok = true;
+    for (DWORD offset = 0; offset < dumpSize && ok; offset += PAGE)
+    {
+        DWORD chunk = (dumpSize - offset < PAGE) ? (dumpSize - offset) : PAGE;
+        DWORD w = 0;
+        if (!WriteFile(hf, dumpBase + offset, chunk, &w, NULL) || w != chunk)
+            ok = false;
+        else
+            written += w;
+    }
+
+    CloseHandle(hf);
+    d.biosDumpSize = written;
+    d.biosDumpDone = true;
+    d.biosDumpOK = ok;
+}
+
 static void ExportSysInfo()
 {
     HANDLE hf = CreateFileA("D:\\sysinfo.txt", GENERIC_WRITE, 0, NULL,
@@ -1014,6 +1174,9 @@ void SysInfo_OnEnter()
     s_dataLoaded = false;
     s_data.exportDone = false;
     s_data.exportOK = false;
+    s_data.biosDumpDone = false;
+    s_data.biosDumpOK = false;
+    s_data.biosDumpSize = 0;
 
     // Start the network stack here, before the loading frame renders.
     // DHCP needs time to complete; starting early and polling later in
@@ -1054,10 +1217,15 @@ static void Render(const DiagLogo& logo)
 {
     g_pDevice->BeginScene();
 
-    const char* hint = s_data.exportDone
-        ? (s_data.exportOK ? "[A] Exported OK    [B] Back"
-            : "[A] Export failed  [B] Back")
-        : "[A] Export    [B] Back";
+    const char* hint;
+    if (s_data.biosDumpDone)
+        hint = s_data.biosDumpOK ? "[A] Export  [Y] BIOS dumped OK  [B] Back"
+        : "[A] Export  [Y] BIOS dump FAIL  [B] Back";
+    else if (s_data.exportDone)
+        hint = s_data.exportOK ? "[A] Exported OK  [Y] Dump BIOS  [B] Back"
+        : "[A] Export fail  [Y] Dump BIOS  [B] Back";
+    else
+        hint = "[A] Export    [Y] Dump BIOS    [B] Back";
 
     DrawPageChrome(logo, "SYSTEM INFO", hint);
 
@@ -1080,19 +1248,17 @@ static void Render(const DiagLogo& logo)
     const float LH = LINE_H - 1.f;
     const float GAP = 6.f;
 
-    // Bottom strip height reserved for CPU/GPU speed bar
-    const float STRIP_H = 22.f;
-    const float STRIP_Y = BOT_BAR_Y - STRIP_H - 2.f;
-
     float y1 = CONTENT_Y + 4.f;
     float y2 = CONTENT_Y + 4.f;
 
-    VLine(C2 - 10.f, CONTENT_Y + 2.f, STRIP_Y - 2.f, COL_BORDER);
+    VLine(C2 - 10.f, CONTENT_Y + 2.f, BOT_BAR_Y - 24.f, COL_BORDER);
 
     // ---- LEFT: CPU ----
     DrawSection(C1, y1, RULEW, "CPU");                          y1 += LH + 4.f;
     DrawRow(C1, y1, V1, "CPU    :", d.cpuIC, COL_CYAN);  y1 += LH;
-    DrawRow(C1, y1, V1, "SPEED  :", d.cpuSpeedMHz, COL_WHITE); y1 += LH + GAP;
+    DrawRow(C1, y1, V1, "SPEED  :", d.cpuSpeedMHz, COL_WHITE); y1 += LH;
+    DrawRow(C1, y1, V1, "BRAND  :", d.cpuBrand,
+        d.isXemu ? COL_YELLOW : COL_DIM);                       y1 += LH + GAP;
 
     // ---- LEFT: Memory ----
     DrawSection(C1, y1, RULEW, "MEMORY");                       y1 += LH + 4.f;
@@ -1175,57 +1341,19 @@ static void Render(const DiagLogo& logo)
     DrawRow(C2, y2, V2, "IP     :", d.ipAddr,
         d.ipOK ? COL_GREEN : COL_DIM);
 
-    // ---- BOTTOM STRIP: CPU / GPU speed ----
-    HLine(STRIP_Y, 0.f, SW, COL_BORDER);
-    FillRectGrad(0.f, STRIP_Y + 1.f, SW, STRIP_Y + STRIP_H,
-        D3DCOLOR_XRGB(16, 20, 44), D3DCOLOR_XRGB(10, 12, 28));
-
-    float sy = STRIP_Y + (STRIP_H - LINE_H) * 0.5f + 1.f;
-
-    // CPU label + speed
-    DrawText(LM, sy, "CPU:", 1.2f, COL_GRAY);
-    DrawText(LM + 34.f, sy, d.cpuSpeedMHz, 1.2f, COL_CYAN);
-
-    // Small filled bar proportional to expected 733MHz range (cap at 1200)
+    // ---- BOTTOM STRIP: CPU / GPU speed (text only) ----
     {
-        float barX = LM + 34.f + TW(d.cpuSpeedMHz, 1.2f) + 8.f;
-        float barW = 80.f;
-        float barH = 7.f;
-        float barY = sy + (LINE_H - barH) * 0.5f;
-        float fill = (float)d.cpuMHz / 1200.f;
-        if (fill > 1.f) fill = 1.f;
-        FillRect(barX, barY, barX + barW, barY + barH,
-            D3DCOLOR_XRGB(20, 25, 55));
-        FillRectGrad(barX, barY, barX + barW * fill, barY + barH,
-            D3DCOLOR_XRGB(60, 200, 255),
-            D3DCOLOR_XRGB(30, 120, 180));
-        HLine(barY, barX, barX + barW, COL_BORDER);
-        HLine(barY + barH, barX, barX + barW, COL_BORDER);
-        VLine(barX, barY, barY + barH, COL_BORDER);
-        VLine(barX + barW, barY, barY + barH, COL_BORDER);
-    }
-
-    // GPU label + speed (right side)
-    float gpuX = SW * 0.5f + 8.f;
-    DrawText(gpuX, sy, "GPU:", 1.2f, COL_GRAY);
-    DrawText(gpuX + 34.f, sy, d.gpuSpeedMHz, 1.2f, COL_CYAN);
-
-    {
-        float barX = gpuX + 34.f + TW(d.gpuSpeedMHz, 1.2f) + 8.f;
-        float barW = 80.f;
-        float barH = 7.f;
-        float barY = sy + (LINE_H - barH) * 0.5f;
-        float fill = (float)d.gpuMHz / 400.f;
-        if (fill > 1.f) fill = 1.f;
-        FillRect(barX, barY, barX + barW, barY + barH,
-            D3DCOLOR_XRGB(20, 25, 55));
-        FillRectGrad(barX, barY, barX + barW * fill, barY + barH,
-            D3DCOLOR_XRGB(80, 255, 160),
-            D3DCOLOR_XRGB(30, 160, 80));
-        HLine(barY, barX, barX + barW, COL_BORDER);
-        HLine(barY + barH, barX, barX + barW, COL_BORDER);
-        VLine(barX, barY, barY + barH, COL_BORDER);
-        VLine(barX + barW, barY, barY + barH, COL_BORDER);
+        const float STRIP_H = 22.f;
+        const float STRIP_Y = BOT_BAR_Y - STRIP_H - 2.f;
+        HLine(STRIP_Y, 0.f, SW, COL_BORDER);
+        FillRectGrad(0.f, STRIP_Y + 1.f, SW, STRIP_Y + STRIP_H,
+            D3DCOLOR_XRGB(16, 20, 44), D3DCOLOR_XRGB(10, 12, 28));
+        float sy = STRIP_Y + (STRIP_H - LINE_H) * 0.5f + 1.f;
+        DrawText(LM, sy, "CPU:", 1.2f, COL_GRAY);
+        DrawText(LM + 34.f, sy, d.cpuSpeedMHz, 1.2f, COL_CYAN);
+        float gpuX = SW * 0.5f + 8.f;
+        DrawText(gpuX, sy, "GPU:", 1.2f, COL_GRAY);
+        DrawText(gpuX + 34.f, sy, d.gpuSpeedMHz, 1.2f, COL_CYAN);
     }
 
     g_pDevice->EndScene();
@@ -1257,6 +1385,8 @@ void SysInfo_Tick(const DiagLogo& logo)
     }
     if (EdgeDown(cur, s_prevBtns, BTN_A))
         ExportSysInfo();
+    if (EdgeDown(cur, s_prevBtns, BTN_Y))
+        DumpBios();
 
     s_prevBtns = cur;
     Render(logo);

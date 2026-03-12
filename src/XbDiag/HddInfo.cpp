@@ -76,6 +76,12 @@ static const int MSTATE_MENU = 0;
 #define ATA_REG_STATUS  0x1F7
 #define ATA_REG_CMD     0x1F7
 
+// Secondary ATA channel — DVD drive on Xbox
+#define ATA2_REG_DATA   0x170
+#define ATA2_REG_DEVICE 0x176
+#define ATA2_REG_STATUS 0x177
+#define ATA2_REG_CMD    0x177
+
 #define ATA_SR_BSY      0x80
 #define ATA_SR_DRQ      0x08
 #define ATA_SR_ERR      0x01
@@ -134,6 +140,14 @@ struct HddData
     char  regionStr[24];
     char  serialEEPROM[14];   // 12 chars + null
 
+    // Partitions (E/F/G only — X/Y/Z cache skipped)
+    struct PartInfo {
+        char   letter;
+        bool   present;
+        char   totalStr[12];   // "XX.X GB"
+        char   freeStr[12];    // "XX.X GB"
+    } parts[3];  // [0]=E [1]=F [2]=G
+
     // Export
     bool  exportDone;
     bool  exportOK;
@@ -144,15 +158,92 @@ struct HddData
     bool  smartExportDone;
     bool  smartExportOK;
     BYTE  smartBuf[512];     // raw SMART READ DATA response
+
+    // DVD drive (secondary ATA channel, ATAPI IDENTIFY)
+    bool  dvdDetected;
+    char  dvdModel[44];      // model string from IDENTIFY word[27..46]
 };
 
 // View toggle — Info (drive + EEPROM) or SMART attribute table
-enum HddView { VIEW_INFO = 0, VIEW_SMART };
+enum HddView { VIEW_INFO = 0, VIEW_SMART, VIEW_BENCH, VIEW_DVD_BENCH };
 
 static HddData s_data;
 static WORD    s_prevBtns;
 static bool    s_loaded;
 static HddView s_view;
+
+#define BENCH_FILE       "E:\\xbdiag_bench.tmp"
+#define BENCH_FILE_SIZE  (8 * 1024 * 1024)   // 8 MB write test
+#define BENCH_CHUNK      (64 * 1024)          // 64 KB per tick
+#define BENCH_SEEK_ITERS 256
+
+enum BenchState
+{
+    BENCH_IDLE = 0,
+    BENCH_WRITE,
+    BENCH_READ,
+    BENCH_SEEK,
+    BENCH_DONE
+};
+
+struct BenchData
+{
+    BenchState  state;
+    bool        readOnly;           // true = write failed, fell back to read-only
+    char        readSrc[64];        // path of file used for read/seek test
+
+    // Write
+    HANDLE      hWrite;
+    DWORD       writeTotal;         // bytes written so far
+    DWORD       writeT0;
+    float       writeMBs;           // result
+
+    // Read
+    HANDLE      hRead;
+    DWORD       readTotal;
+    DWORD       readT0;
+    float       readMBs;            // result
+
+    // Seek
+    HANDLE      hSeek;
+    int         seekIdx;
+    DWORD       seekT0;
+    float       seekMs;             // result avg ms
+
+    // Cleanup
+    bool        tmpExists;          // we own BENCH_FILE and must delete it
+
+    // Export
+    bool        exportDone;
+    bool        exportOK;
+
+    // Error message (fallback path or failure note)
+    char        statusMsg[80];
+};
+
+static BenchData   s_bench;
+static BYTE        s_benchBuf[BENCH_CHUNK];  // static — not stack
+
+// ---- DVD benchmark ----
+#define DVD_BENCH_SIZE   (16 * 1024 * 1024)  // 16 MB sequential read
+#define DVD_BENCH_CHUNK  (64 * 1024)          // 64 KB per tick
+// D:\ is the DVD drive on Xbox (kernel maps \Device\Cdrom0 -> D: at boot)
+#define DVD_DRIVE        "D:\\"
+
+enum DvdBenchState { DVD_IDLE = 0, DVD_WAITING, DVD_READING, DVD_DONE };
+
+struct DvdBenchData
+{
+    DvdBenchState state;
+    HANDLE        hFile;
+    DWORD         readTotal;
+    DWORD         readT0;
+    float         readMBs;
+    char          statusMsg[80];
+};
+
+static DvdBenchData s_dvdBench;
+static BYTE         s_dvdBuf[DVD_BENCH_CHUNK];
 
 // ============================================================================
 // Helpers
@@ -186,6 +277,37 @@ extern "C" VOID __stdcall KeStallExecutionProcessor(ULONG Microseconds);
 extern "C" LONG __stdcall ExQueryNonVolatileSetting(
     ULONG ValueIndex, ULONG* Type, void* Value,
     ULONG ValueLength, ULONG* ResultLength);
+
+// Drive letter mounting — required before any Win32 file I/O on HDD partitions
+typedef struct _XBOX_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    char* Buffer;
+} XBOX_STRING;
+extern "C" LONG WINAPI IoCreateSymbolicLink(XBOX_STRING* symLink, XBOX_STRING* target);
+
+static void MountHddDrives()
+{
+    static const struct { const char* letter; const char* device; } k[] =
+    {
+        { "C", "\\Device\\Harddisk0\\Partition2" },
+        { "E", "\\Device\\Harddisk0\\Partition1" },
+        { "F", "\\Device\\Harddisk0\\Partition6" },
+        { "G", "\\Device\\Harddisk0\\Partition7" },
+    };
+    char linkBuf[8];
+    for (int i = 0; i < 4; ++i)
+    {
+        linkBuf[0] = '\\'; linkBuf[1] = '?'; linkBuf[2] = '?'; linkBuf[3] = '\\';
+        linkBuf[4] = k[i].letter[0];
+        linkBuf[5] = ':'; linkBuf[6] = '\0';
+        const char* dev = k[i].device;
+        int devLen = 0; while (dev[devLen]) devLen++;
+        XBOX_STRING sLink = { 6, 7, linkBuf };
+        XBOX_STRING sDev = { (USHORT)devLen, (USHORT)(devLen + 1), (char*)dev };
+        IoCreateSymbolicLink(&sLink, &sDev);
+    }
+}
 
 
 static bool AtaWaitReady(DWORD msTimeout)
@@ -254,6 +376,75 @@ static bool AtaIdentify(WORD buf[256])
         buf[i] = w;
     }
     return true;
+}
+
+// Probe secondary ATA channel (0x170) for an ATAPI device (DVD drive).
+// Sends IDENTIFY PACKET DEVICE (0xA1). Returns true if an ATAPI device
+// responds. Word[0] bits[14:8] = 0x85 confirms CD/DVD type.
+static bool AtaIdentifyDvd(WORD buf[256])
+{
+    // Select master on secondary channel
+    BYTE devsel = 0xA0;
+    __asm { mov dx, ATA2_REG_DEVICE }
+    __asm { mov al, devsel          }
+    __asm { out dx, al              }
+
+    // 5 status reads (400ns settle)
+    for (int i = 0; i < 5; ++i)
+    {
+        BYTE dummy = 0;
+        __asm { mov dx, ATA2_REG_STATUS }
+        __asm { in  al, dx              }
+        __asm { mov dummy, al           }
+    }
+
+    // Wait for not-busy (2s timeout)
+    DWORD t0 = GetTickCount();
+    for (;;)
+    {
+        BYTE sr = 0;
+        __asm { mov dx, ATA2_REG_STATUS }
+        __asm { in  al, dx              }
+        __asm { mov sr, al              }
+        if (!(sr & ATA_SR_BSY)) break;
+        if ((GetTickCount() - t0) > 2000) return false;
+        KeStallExecutionProcessor(100);
+    }
+
+    // Issue IDENTIFY PACKET DEVICE (0xA1)
+    BYTE cmd = 0xA1;
+    __asm { mov dx, ATA2_REG_CMD }
+    __asm { mov al, cmd          }
+    __asm { out dx, al           }
+
+    // Wait for DRQ
+    t0 = GetTickCount();
+    bool drq = false;
+    while ((GetTickCount() - t0) < 3000)
+    {
+        BYTE sr = 0;
+        __asm { mov dx, ATA2_REG_STATUS }
+        __asm { in  al, dx              }
+        __asm { mov sr, al              }
+        if (sr & ATA_SR_BSY) { KeStallExecutionProcessor(100); continue; }
+        if (sr & ATA_SR_ERR) return false;
+        if (sr & ATA_SR_DRQ) { drq = true; break; }
+        KeStallExecutionProcessor(50);
+    }
+    if (!drq) return false;
+
+    // Read 256 words
+    for (int i = 0; i < 256; ++i)
+    {
+        WORD w = 0;
+        __asm { mov dx, ATA2_REG_DATA }
+        __asm { in  ax, dx            }
+        __asm { mov w, ax             }
+        buf[i] = w;
+    }
+
+    // Confirm ATAPI: word[0] bits[14:8] should be 0x85 for CD/DVD
+    return ((buf[0] >> 8) & 0xFF) == 0x85;
 }
 
 // Issue ATA SMART READ DATA (0xB0 / 0xD0) — fills buf[512].
@@ -418,6 +609,9 @@ static void AtaStr(const WORD* words, int nWords, char* out, int outLen)
 static void LoadData()
 {
     HddData& d = s_data;
+
+    // Ensure HDD partitions are accessible via drive letters before any file I/O
+    MountHddDrives();
 
     // ---- ATA IDENTIFY ----
     d.ataOK = AtaIdentify(d.identBuf);
@@ -605,8 +799,69 @@ static void LoadData()
         }
     }
 
+    // ---- Partition sizes (E/F/G) ----
+    {
+        const char* letters = "EFG";
+        for (int pi = 0; pi < 3; ++pi)
+        {
+            d.parts[pi].letter = letters[pi];
+            d.parts[pi].present = false;
+
+            char path[8];
+            path[0] = letters[pi]; path[1] = ':'; path[2] = '\\'; path[3] = '\0';
+
+            ULARGE_INTEGER freeToCaller, total, free;
+            if (GetDiskFreeSpaceExA(path, &freeToCaller, &total, &free))
+            {
+                d.parts[pi].present = true;
+
+                // Total GB (one decimal)
+                DWORD totalMB = (DWORD)(total.QuadPart / (1024ULL * 1024ULL));
+                DWORD totalGB = totalMB / 1024;
+                DWORD totalDec = (totalMB % 1024) * 10 / 1024;
+                char t[12];
+                IntToStr((int)totalGB, t, sizeof(t));
+                StrCopy(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), t);
+                StrCat2(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), d.parts[pi].totalStr, ".");
+                IntToStr((int)totalDec, t, sizeof(t));
+                StrCat2(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), d.parts[pi].totalStr, t);
+                StrCat2(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), d.parts[pi].totalStr, " GB");
+
+                // Free GB (one decimal)
+                DWORD freeMB = (DWORD)(free.QuadPart / (1024ULL * 1024ULL));
+                DWORD freeGB = freeMB / 1024;
+                DWORD freeDec = (freeMB % 1024) * 10 / 1024;
+                IntToStr((int)freeGB, t, sizeof(t));
+                StrCopy(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), t);
+                StrCat2(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), d.parts[pi].freeStr, ".");
+                IntToStr((int)freeDec, t, sizeof(t));
+                StrCat2(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), d.parts[pi].freeStr, t);
+                StrCat2(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), d.parts[pi].freeStr, " GB");
+            }
+        }
+    }
+
     d.exportDone = false;
     d.exportOK = false;
+
+    // ---- DVD drive (secondary ATA channel, ATAPI IDENTIFY) ----
+    d.dvdDetected = false;
+    StrCopy(d.dvdModel, sizeof(d.dvdModel), "Not detected");
+    {
+        WORD dvdIdent[256];
+        ZeroMemory(dvdIdent, sizeof(dvdIdent));
+        if (AtaIdentifyDvd(dvdIdent))
+        {
+            d.dvdDetected = true;
+            AtaStr(&dvdIdent[27], 20, d.dvdModel, sizeof(d.dvdModel));
+            if (d.dvdModel[0] == '\0')
+                StrCopy(d.dvdModel, sizeof(d.dvdModel), "ATAPI DVD Drive");
+        }
+    }
+
+    // Init DVD bench state
+    ZeroMemory(&s_dvdBench, sizeof(s_dvdBench));
+    s_dvdBench.state = DVD_IDLE;
 }
 
 // ============================================================================
@@ -832,14 +1087,16 @@ static void ExportSmart()
 }
 
 
+static void BenchCleanup();  // forward declaration
+
 void HddInfo_OnEnter()
 {
     s_prevBtns = 0;
     s_view = VIEW_INFO;
     s_loaded = false;
-    // Zero the data struct on every entry — LoadData uses StrCopy/StrCat2
-    // into fields that assume a clean buffer, and exportDone/exportOK must
-    // never carry a stale fail state from a previous visit.
+    // Cleanup any leftover benchmark temp file from a prior visit
+    BenchCleanup();
+    ZeroMemory(&s_bench, sizeof(s_bench));
     ZeroMemory(&s_data, sizeof(s_data));
 }
 
@@ -881,9 +1138,16 @@ static void Render(const DiagLogo& logo)
     g_pDevice->BeginScene();
 
     const char* hint = s_data.exportDone
-        ? (s_data.exportOK ? "[A] Exported OK    [Right] SMART    [B] Back"
-            : "[A] Export failed  [Right] SMART    [B] Back")
-        : "[A] Export    [Right] SMART    [B] Back";
+        ? (s_data.exportOK
+            ? (s_data.dvdDetected
+                ? "[A] Saved OK    [Right] SMART  [RT] Bench  [LT] DVD  [B] Back"
+                : "[A] Saved OK    [Right] SMART  [RT] Bench  [B] Back")
+            : (s_data.dvdDetected
+                ? "[A] Save failed [Right] SMART  [RT] Bench  [LT] DVD  [B] Back"
+                : "[A] Save failed [Right] SMART  [RT] Bench  [B] Back"))
+        : (s_data.dvdDetected
+            ? "[A] Save hddinfo.txt  [Right] SMART  [RT] Bench  [LT] DVD  [B] Back"
+            : "[A] Save hddinfo.txt  [Right] SMART  [RT] Bench  [B] Back");
 
     DrawPageChrome(logo, "HDD INFO", hint);
 
@@ -936,6 +1200,33 @@ static void Render(const DiagLogo& logo)
     }
     else DrawText(COL_L, y1, "Drive not detected", 1.2f, COL_RED);
 
+    // ---- LEFT: PARTITIONS ----
+    y1 += LH + GAP;
+    DrawText(COL_L, y1, "PARTITIONS", 1.2f, COL_YELLOW);
+    HLine(y1 + LH + 1.f, COL_L, COL_R - 12.f, COL_BORDER);
+    y1 += LH + 5.f;
+    {
+        bool anyPart = false;
+        for (int pi = 0; pi < 3; ++pi)
+        {
+            const HddData::PartInfo& p = d.parts[pi];
+            if (!p.present) continue;
+            anyPart = true;
+            char label[6]; label[0] = p.letter; label[1] = ':'; label[2] = ' ';
+            label[3] = ' '; label[4] = ' '; label[5] = '\0';
+            // "X:    12.3 GB  free: 8.1 GB"
+            char val[40];
+            StrCopy(val, sizeof(val), p.totalStr);
+            StrCat2(val, sizeof(val), val, "  free: ");
+            StrCat2(val, sizeof(val), val, p.freeStr);
+            DrawText(COL_L, y1, label, 1.2f, COL_GRAY);
+            DrawText(COL_L + 24.f, y1, val, 1.2f, COL_WHITE);
+            y1 += LH;
+        }
+        if (!anyPart)
+            DrawText(COL_L, y1, "No partitions found", 1.2f, COL_GRAY);
+    }
+
     // ---- RIGHT: SECURITY / EEPROM ----
     DrawText(COL_R, y2, "EEPROM SECURITY", 1.3f, COL_YELLOW);
     HLine(y2 + LH + 1.f, COL_R, SW - LM, COL_BORDER);
@@ -987,10 +1278,10 @@ static void RenderSmart(const DiagLogo& logo)
         hint = "[Left] Drive Info    [B] Back";
     else if (d.smartExportDone)
         hint = d.smartExportOK
-        ? "[A] Exported OK    [Left] Drive Info    [B] Back"
-        : "[A] Export failed  [Left] Drive Info    [B] Back";
+        ? "[A] Saved OK    [Left] Drive Info    [B] Back"
+        : "[A] Save failed [Left] Drive Info    [B] Back";
     else
-        hint = "[A] Export    [Left] Drive Info    [B] Back";
+        hint = "[A] Save smart.txt    [Left] Drive Info    [B] Back";
 
     DrawPageChrome(logo, "HDD SMART", hint);
 
@@ -1041,10 +1332,6 @@ static void RenderSmart(const DiagLogo& logo)
         BYTE thr = p[5];
         const BYTE* raw = p + 6;
 
-        // Alternate row tint
-        if ((i & 1) == 0)
-            FillRect(LM - 2.f, y - 1.f, SW - LM, y + LH2 - 1.f, 0x10FFFFFF);
-
         // ID
         char idStr[4]; IntToHex(id, 2, idStr, sizeof(idStr));
         DrawText(CX_ID, y, idStr, 1.05f, COL_DIM);
@@ -1089,6 +1376,746 @@ static void RenderSmart(const DiagLogo& logo)
     g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
 
+
+// ============================================================================
+// HDD Benchmark
+// ============================================================================
+
+
+
+// Simple LCG for seek offsets — no CRT rand needed
+static DWORD BenchRand(DWORD& seed)
+{
+    seed = seed * 1664525UL + 1013904223UL;
+    return seed;
+}
+
+static void BenchFindReadSource()
+{
+    // Try to find the largest readable file on E:\ as fallback read source
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA("E:\\*", &fd);
+    DWORD  bestSize = 0;
+    s_bench.readSrc[0] = '\0';
+
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (fd.nFileSizeLow > bestSize)
+            {
+                bestSize = fd.nFileSizeLow;
+                StrCopy(s_bench.readSrc, sizeof(s_bench.readSrc), "E:\\");
+                StrCat2(s_bench.readSrc, sizeof(s_bench.readSrc),
+                    s_bench.readSrc, fd.cFileName);
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+}
+
+static void BenchStartRead()
+{
+    s_bench.hRead = CreateFileA(s_bench.readSrc, GENERIC_READ, FILE_SHARE_READ,
+        NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (s_bench.hRead == INVALID_HANDLE_VALUE)
+    {
+        // Read source unreadable — skip straight to seek or done
+        s_bench.readMBs = 0.f;
+        s_bench.state = BENCH_SEEK;
+        StrCopy(s_bench.statusMsg, sizeof(s_bench.statusMsg), "Read source unavailable");
+        return;
+    }
+    s_bench.readTotal = 0;
+    s_bench.readT0 = GetTickCount();
+    s_bench.state = BENCH_READ;
+}
+
+static void BenchStart()
+{
+    ZeroMemory(&s_bench, sizeof(s_bench));
+
+    // Fill write buffer with a simple pattern
+    for (int i = 0; i < BENCH_CHUNK; i += 4)
+    {
+        s_benchBuf[i + 0] = 0xDE; s_benchBuf[i + 1] = 0xAD;
+        s_benchBuf[i + 2] = 0xBE; s_benchBuf[i + 3] = 0xEF;
+    }
+
+    // Attempt write on E:\ first, fall back to D:\ (XBE dir, always writable)
+    const char* writePaths[2] = { BENCH_FILE, "D:\\xbdiag_bench.tmp" };
+    for (int wi = 0; wi < 2; ++wi)
+    {
+        s_bench.hWrite = CreateFileA(writePaths[wi], GENERIC_WRITE, 0, NULL,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (s_bench.hWrite != INVALID_HANDLE_VALUE)
+        {
+            StrCopy(s_bench.readSrc, sizeof(s_bench.readSrc), writePaths[wi]);
+            s_bench.tmpExists = true;
+            s_bench.writeTotal = 0;
+            s_bench.writeT0 = GetTickCount();
+            s_bench.state = BENCH_WRITE;
+            return;
+        }
+    }
+
+    // Both write paths failed — true read-only fallback
+    s_bench.readOnly = true;
+    s_bench.writeMBs = 0.f;
+    // Capture error code for diagnosis
+    DWORD writeErr = GetLastError();
+    char errCode[12];
+    IntToStr((int)writeErr, errCode, sizeof(errCode));
+
+    // Try to find an existing file to benchmark reads against
+    BenchFindReadSource();
+    if (s_bench.readSrc[0] != '\0')
+    {
+        StrCopy(s_bench.statusMsg, sizeof(s_bench.statusMsg),
+            "Write failed (err ");
+        StrCat2(s_bench.statusMsg, sizeof(s_bench.statusMsg),
+            s_bench.statusMsg, errCode);
+        StrCat2(s_bench.statusMsg, sizeof(s_bench.statusMsg),
+            s_bench.statusMsg, ") - READ ONLY MODE");
+        BenchStartRead();
+        return;
+    }
+
+    // Nothing to read either — can't benchmark
+    StrCopy(s_bench.statusMsg, sizeof(s_bench.statusMsg),
+        "Write failed (err ");
+    StrCat2(s_bench.statusMsg, sizeof(s_bench.statusMsg),
+        s_bench.statusMsg, errCode);
+    StrCat2(s_bench.statusMsg, sizeof(s_bench.statusMsg),
+        s_bench.statusMsg, ") - no readable files found");
+    s_bench.state = BENCH_DONE;
+}
+
+static void BenchCleanup()
+{
+    if (s_bench.hWrite != INVALID_HANDLE_VALUE && s_bench.hWrite != NULL)
+    {
+        CloseHandle(s_bench.hWrite); s_bench.hWrite = INVALID_HANDLE_VALUE;
+    }
+    if (s_bench.hRead != INVALID_HANDLE_VALUE && s_bench.hRead != NULL)
+    {
+        CloseHandle(s_bench.hRead); s_bench.hRead = INVALID_HANDLE_VALUE;
+    }
+    if (s_bench.hSeek != INVALID_HANDLE_VALUE && s_bench.hSeek != NULL)
+    {
+        CloseHandle(s_bench.hSeek); s_bench.hSeek = INVALID_HANDLE_VALUE;
+    }
+    if (s_bench.tmpExists)
+    {
+        // Delete whichever path was used (readSrc holds the write path)
+        if (s_bench.readSrc[0] != '\0')
+            DeleteFileA(s_bench.readSrc);
+        else
+            DeleteFileA(BENCH_FILE);
+        s_bench.tmpExists = false;
+    }
+}
+
+static void ExportBench()
+{
+    s_bench.exportDone = false;
+    s_bench.exportOK = false;
+
+    HANDLE hf = CreateFileA("D:\\hddbench.txt", GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE)
+    {
+        s_bench.exportDone = true; return;
+    }
+
+    DWORD w;
+    char  line[128];
+
+    const char* hdr = "XbDiag HDD Benchmark\r\n====================\r\n";
+    WriteFile(hf, hdr, StrLen(hdr), &w, NULL);
+
+    // Drive identity
+    StrCopy(line, sizeof(line), "Drive:      ");
+    StrCat2(line, sizeof(line), line, s_data.model);
+    StrCat2(line, sizeof(line), line, "\r\n");
+    WriteFile(hf, line, StrLen(line), &w, NULL);
+
+    StrCopy(line, sizeof(line), "Serial:     ");
+    StrCat2(line, sizeof(line), line, s_data.serial);
+    StrCat2(line, sizeof(line), line, "\r\n");
+    WriteFile(hf, line, StrLen(line), &w, NULL);
+
+    StrCopy(line, sizeof(line), "Interface:  ");
+    StrCat2(line, sizeof(line), line, s_data.udmaMode);
+    StrCat2(line, sizeof(line), line, "\r\n");
+    WriteFile(hf, line, StrLen(line), &w, NULL);
+
+    StrCopy(line, sizeof(line), "Mode:       ");
+    StrCat2(line, sizeof(line), line, s_bench.readOnly ? "READ ONLY (write failed)" : "Full read/write");
+    StrCat2(line, sizeof(line), line, "\r\n\r\n");
+    WriteFile(hf, line, StrLen(line), &w, NULL);
+
+    // Results — format float as "XX.X"
+    auto FmtFloat = [](float v, char* out, int outLen) {
+        int whole = Ftoi(v);
+        float frac = v - (float)whole;
+        if (frac < 0.f) frac = 0.f;
+        int dec = Ftoi(frac * 10.f);
+        char t[12];
+        IntToStr(whole, t, sizeof(t));
+        StrCopy(out, outLen, t);
+        StrCat2(out, outLen, out, ".");
+        IntToStr(dec, t, sizeof(t));
+        StrCat2(out, outLen, out, t);
+        };
+
+    char val[16];
+
+    if (!s_bench.readOnly)
+    {
+        FmtFloat(s_bench.writeMBs, val, sizeof(val));
+        StrCopy(line, sizeof(line), "Write Speed: ");
+        StrCat2(line, sizeof(line), line, val);
+        StrCat2(line, sizeof(line), line, " MB/s\r\n");
+        WriteFile(hf, line, StrLen(line), &w, NULL);
+    }
+
+    FmtFloat(s_bench.readMBs, val, sizeof(val));
+    StrCopy(line, sizeof(line), "Read Speed:  ");
+    StrCat2(line, sizeof(line), line, val);
+    StrCat2(line, sizeof(line), line, " MB/s\r\n");
+    WriteFile(hf, line, StrLen(line), &w, NULL);
+
+    FmtFloat(s_bench.seekMs, val, sizeof(val));
+    StrCopy(line, sizeof(line), "Seek Time:   ");
+    StrCat2(line, sizeof(line), line, val);
+    StrCat2(line, sizeof(line), line, " ms avg\r\n");
+    WriteFile(hf, line, StrLen(line), &w, NULL);
+
+    if (s_bench.readOnly && s_bench.statusMsg[0])
+    {
+        StrCopy(line, sizeof(line), "Note:        ");
+        StrCat2(line, sizeof(line), line, s_bench.statusMsg);
+        StrCat2(line, sizeof(line), line, "\r\n");
+        WriteFile(hf, line, StrLen(line), &w, NULL);
+    }
+
+    FlushFileBuffers(hf);
+    CloseHandle(hf);
+    s_bench.exportDone = true;
+    s_bench.exportOK = true;
+}
+
+// One tick of benchmark work — called every frame during VIEW_BENCH
+static void BenchTick()
+{
+    switch (s_bench.state)
+    {
+    case BENCH_WRITE:
+    {
+        DWORD toWrite = BENCH_CHUNK;
+        DWORD remaining = BENCH_FILE_SIZE - s_bench.writeTotal;
+        if (toWrite > remaining) toWrite = remaining;
+
+        DWORD written = 0;
+        WriteFile(s_bench.hWrite, s_benchBuf, toWrite, &written, NULL);
+        s_bench.writeTotal += written;
+
+        if (s_bench.writeTotal >= (DWORD)BENCH_FILE_SIZE || written == 0)
+        {
+            CloseHandle(s_bench.hWrite);
+            s_bench.hWrite = INVALID_HANDLE_VALUE;
+
+            DWORD elapsed = GetTickCount() - s_bench.writeT0;
+            if (elapsed > 0)
+                s_bench.writeMBs = (float)s_bench.writeTotal / 1048576.f
+                / ((float)elapsed / 1000.f);
+
+            // Move to read phase
+            BenchStartRead();
+        }
+        break;
+    }
+
+    case BENCH_READ:
+    {
+        DWORD bytesRead = 0;
+        ReadFile(s_bench.hRead, s_benchBuf, BENCH_CHUNK, &bytesRead, NULL);
+        s_bench.readTotal += bytesRead;
+
+        // Stop after 8MB read (same as write size)
+        if (bytesRead == 0 || s_bench.readTotal >= (DWORD)BENCH_FILE_SIZE)
+        {
+            CloseHandle(s_bench.hRead);
+            s_bench.hRead = INVALID_HANDLE_VALUE;
+
+            DWORD elapsed = GetTickCount() - s_bench.readT0;
+            if (elapsed > 0 && s_bench.readTotal > 0)
+                s_bench.readMBs = (float)s_bench.readTotal / 1048576.f
+                / ((float)elapsed / 1000.f);
+
+            s_bench.state = BENCH_SEEK;
+
+            // Open seek handle (random reads — no sequential flag)
+            s_bench.hSeek = CreateFileA(s_bench.readSrc, GENERIC_READ,
+                FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS, NULL);
+            if (s_bench.hSeek == INVALID_HANDLE_VALUE)
+            {
+                s_bench.seekMs = 0.f;
+                s_bench.state = BENCH_DONE;
+                // Cleanup temp file
+                if (s_bench.tmpExists)
+                {
+                    DeleteFileA(BENCH_FILE); s_bench.tmpExists = false;
+                }
+            }
+            else
+            {
+                s_bench.seekIdx = 0;
+                s_bench.seekT0 = GetTickCount();
+            }
+        }
+        break;
+    }
+
+    case BENCH_SEEK:
+    {
+        // Do 8 seek+read operations per tick to keep it responsive
+        static DWORD seekSeed = 0xDEADBEEF;
+        int perTick = 8;
+        if (s_bench.seekIdx + perTick > BENCH_SEEK_ITERS)
+            perTick = BENCH_SEEK_ITERS - s_bench.seekIdx;
+
+        // Get file size for offset range
+        DWORD fileSize = GetFileSize(s_bench.hSeek, NULL);
+        if (fileSize < 512) fileSize = 512;
+        DWORD range = (fileSize / 512) - 1;
+
+        for (int si = 0; si < perTick; ++si)
+        {
+            DWORD sector = range > 0 ? (BenchRand(seekSeed) % range) : 0;
+            DWORD offset = sector * 512;
+            SetFilePointer(s_bench.hSeek, (LONG)offset, NULL, FILE_BEGIN);
+            DWORD bytesRead = 0;
+            ReadFile(s_bench.hSeek, s_benchBuf, 512, &bytesRead, NULL);
+        }
+        s_bench.seekIdx += perTick;
+
+        if (s_bench.seekIdx >= BENCH_SEEK_ITERS)
+        {
+            CloseHandle(s_bench.hSeek);
+            s_bench.hSeek = INVALID_HANDLE_VALUE;
+
+            DWORD elapsed = GetTickCount() - s_bench.seekT0;
+            if (BENCH_SEEK_ITERS > 0)
+                s_bench.seekMs = (float)elapsed / (float)BENCH_SEEK_ITERS;
+
+            // Delete temp file
+            if (s_bench.tmpExists)
+            {
+                DeleteFileA(BENCH_FILE); s_bench.tmpExists = false;
+            }
+
+            s_bench.state = BENCH_DONE;
+        }
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+// Render benchmark bar (value 0..maxVal mapped to barW pixels)
+static void DrawBenchBar(float x, float y, float barW, float val, float maxVal, DWORD col)
+{
+    float frac = val / maxVal;
+    if (frac > 1.f) frac = 1.f;
+    if (frac < 0.f) frac = 0.f;
+    const float BH = 7.f;
+    FillRect(x, y + 2.f, x + barW, y + 2.f + BH, D3DCOLOR_XRGB(20, 25, 40));
+    DWORD dimR = ((col >> 16) & 0xFF) >> 1;
+    DWORD dimG = ((col >> 8) & 0xFF) >> 1;
+    DWORD dimB = ((col) & 0xFF) >> 1;
+    FillRectGrad(x, y + 2.f, x + barW * frac, y + 2.f + BH, col,
+        D3DCOLOR_XRGB(dimR, dimG, dimB));
+    HLine(y + 2.f, x, x + barW, COL_BORDER);
+    HLine(y + 2.f + BH, x, x + barW, COL_BORDER);
+}
+
+static void RenderBench(const DiagLogo& logo)
+{
+    g_pDevice->BeginScene();
+
+    const char* hint;
+    if (s_bench.state == BENCH_IDLE)
+        hint = "[A] Start Benchmark    [Left] Drive Info    [B] Back";
+    else if (s_bench.state == BENCH_DONE)
+    {
+        if (s_bench.exportDone)
+            hint = s_bench.exportOK
+            ? "[A] Saved OK    [Left] Drive Info    [B] Back"
+            : "[A] Save failed [Left] Drive Info    [B] Back";
+        else
+            hint = "[A] Save hddbench.txt    [Left] Drive Info    [B] Back";
+    }
+    else
+        hint = "Benchmarking...    [B] Cancel";
+
+    DrawPageChrome(logo, "HDD BENCHMARK", hint);
+
+    float y = CONTENT_Y + 8.f;
+    const float VX = LM + 140.f;
+    const float BX = VX + 80.f;
+    const float BW = 180.f;
+    const float RLH = LINE_H + 2.f;
+
+    // Drive info strip
+    DrawText(LM, y, "DRIVE :", 1.2f, COL_GRAY);
+    DrawText(VX, y, s_data.model, 1.2f, COL_CYAN);
+    y += RLH;
+    DrawText(LM, y, "IFACE :", 1.2f, COL_GRAY);
+    DrawText(VX, y, s_data.udmaMode, 1.2f, COL_WHITE);
+    y += RLH + 4.f;
+    HLine(y, LM, SW - LM, COL_BORDER);
+    y += 6.f;
+
+    // Read-only notice
+    if (s_bench.readOnly)
+    {
+        DrawText(LM, y, "READ ONLY MODE", 1.2f, COL_YELLOW);
+        y += RLH;
+        DrawText(LM, y, s_bench.statusMsg, 1.1f, D3DCOLOR_XRGB(180, 140, 60));
+        y += RLH + 4.f;
+    }
+
+    // Results
+    auto FmtFloat = [](float v, char* out, int outLen) {
+        int whole = Ftoi(v);
+        float frac = v - (float)whole;
+        if (frac < 0.f) frac = 0.f;
+        int dec = Ftoi(frac * 10.f);
+        char t[12];
+        IntToStr(whole, t, sizeof(t));
+        StrCopy(out, outLen, t);
+        StrCat2(out, outLen, out, ".");
+        IntToStr(dec, t, sizeof(t));
+        StrCat2(out, outLen, out, t);
+        };
+
+    char valStr[20];
+
+    // WRITE
+    if (!s_bench.readOnly)
+    {
+        DrawText(LM, y, "WRITE :", 1.2f, COL_GRAY);
+        if (s_bench.state == BENCH_WRITE)
+        {
+            // Progress during write
+            DWORD pct = s_bench.writeTotal * 100 / BENCH_FILE_SIZE;
+            char prog[12]; IntToStr((int)pct, prog, sizeof(prog));
+            StrCat2(prog, sizeof(prog), prog, "%");
+            DrawText(VX, y, prog, 1.2f, COL_YELLOW);
+        }
+        else if (s_bench.writeMBs > 0.f || s_bench.state > BENCH_WRITE)
+        {
+            FmtFloat(s_bench.writeMBs, valStr, sizeof(valStr));
+            StrCat2(valStr, sizeof(valStr), valStr, " MB/s");
+            DrawText(VX, y, valStr, 1.2f, COL_GREEN);
+            DrawBenchBar(BX, y, BW, s_bench.writeMBs, 100.f, COL_GREEN);
+        }
+        else
+            DrawText(VX, y, "---", 1.2f, COL_DIM);
+        y += RLH;
+    }
+
+    // READ
+    DrawText(LM, y, "READ  :", 1.2f, COL_GRAY);
+    if (s_bench.state == BENCH_READ)
+    {
+        DWORD pct = s_bench.readTotal * 100 / BENCH_FILE_SIZE;
+        char prog[12]; IntToStr((int)pct, prog, sizeof(prog));
+        StrCat2(prog, sizeof(prog), prog, "%");
+        DrawText(VX, y, prog, 1.2f, COL_YELLOW);
+    }
+    else if (s_bench.readMBs > 0.f)
+    {
+        FmtFloat(s_bench.readMBs, valStr, sizeof(valStr));
+        StrCat2(valStr, sizeof(valStr), valStr, " MB/s");
+        DrawText(VX, y, valStr, 1.2f, COL_CYAN);
+        DrawBenchBar(BX, y, BW, s_bench.readMBs, 120.f, COL_CYAN);
+    }
+    else
+        DrawText(VX, y, "---", 1.2f, COL_DIM);
+    y += RLH;
+
+    // SEEK
+    DrawText(LM, y, "SEEK  :", 1.2f, COL_GRAY);
+    if (s_bench.state == BENCH_SEEK)
+    {
+        char prog[16];
+        IntToStr(s_bench.seekIdx, prog, sizeof(prog));
+        StrCat2(prog, sizeof(prog), prog, "/256");
+        DrawText(VX, y, prog, 1.2f, COL_YELLOW);
+    }
+    else if (s_bench.seekMs > 0.f)
+    {
+        FmtFloat(s_bench.seekMs, valStr, sizeof(valStr));
+        StrCat2(valStr, sizeof(valStr), valStr, " ms avg");
+        DWORD seekCol = (s_bench.seekMs < 5.f) ? COL_GREEN
+            : (s_bench.seekMs < 15.f) ? COL_CYAN : COL_YELLOW;
+        DrawText(VX, y, valStr, 1.2f, seekCol);
+        // Seek bar inverted: lower is better, max display 30ms
+        float seekFrac = s_bench.seekMs / 30.f;
+        if (seekFrac > 1.f) seekFrac = 1.f;
+        DrawBenchBar(BX, y, BW, seekFrac, 1.f, seekCol);
+    }
+    else
+        DrawText(VX, y, "---", 1.2f, COL_DIM);
+    y += RLH;
+
+    // Read source (fallback)
+    if (s_bench.readOnly && s_bench.readSrc[0])
+    {
+        y += 4.f;
+        DrawText(LM, y, "SOURCE:", 1.2f, COL_GRAY);
+        DrawText(VX, y, s_bench.readSrc, 1.1f, D3DCOLOR_XRGB(160, 160, 160));
+        y += RLH;
+    }
+
+    // Idle prompt
+    if (s_bench.state == BENCH_IDLE)
+    {
+        y += 8.f;
+        DrawText(LM, y, "Press [A] to start benchmark", 1.2f, COL_GRAY);
+    }
+
+    g_pDevice->EndScene();
+    g_pDevice->Present(NULL, NULL, NULL, NULL);
+}
+
+// ============================================================================
+// DVD Benchmark
+// ============================================================================
+
+
+static void DvdBenchCleanup();  // forward declaration — defined after DvdBenchTryStart
+
+// Enter the waiting-for-disc state — just resets and shows the prompt
+static void DvdBenchStart()
+{
+    ZeroMemory(&s_dvdBench, sizeof(s_dvdBench));
+    s_dvdBench.state = DVD_WAITING;
+    s_dvdBench.hFile = INVALID_HANDLE_VALUE;
+}
+
+// Called when user presses [A] from DVD_WAITING — mounts and probes disc
+static void DvdBenchTryStart()
+{
+    // Clean up any previous mount
+    DvdBenchCleanup();
+
+    // Check disc readiness — GetFileAttributesA on D:\ returns 0xFFFFFFFF if no disc
+    DWORD attr = GetFileAttributesA("D:\\");
+    if (attr == 0xFFFFFFFF)
+    {
+        StrCopy(s_dvdBench.statusMsg, sizeof(s_dvdBench.statusMsg),
+            "No disc inserted or drive not ready");
+        s_dvdBench.state = DVD_DONE;
+        return;
+    }
+
+    // Find a readable file — try default.xbe first, then enumerate root
+    const char* candidates[] = { "D:\\default.xbe", "D:\\default.xex", NULL };
+    HANDLE hf = INVALID_HANDLE_VALUE;
+
+    for (int i = 0; candidates[i] && hf == INVALID_HANDLE_VALUE; ++i)
+    {
+        hf = CreateFileA(candidates[i], GENERIC_READ, FILE_SHARE_READ,
+            NULL, OPEN_EXISTING,
+            FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    }
+
+    if (hf == INVALID_HANDLE_VALUE)
+    {
+        WIN32_FIND_DATA fd;
+        HANDLE hFind = FindFirstFileA("D:\\*", &fd);
+        while (hFind != INVALID_HANDLE_VALUE)
+        {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                fd.nFileSizeLow >= (1024 * 1024))
+            {
+                char path[64];
+                StrCat2(path, sizeof(path), "D:\\", fd.cFileName);
+                hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                    NULL, OPEN_EXISTING,
+                    FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+                if (hf != INVALID_HANDLE_VALUE) break;
+            }
+            if (!FindNextFileA(hFind, &fd)) break;
+        }
+        if (hFind != INVALID_HANDLE_VALUE) FindClose(hFind);
+    }
+
+    if (hf == INVALID_HANDLE_VALUE)
+    {
+        StrCopy(s_dvdBench.statusMsg, sizeof(s_dvdBench.statusMsg),
+            "Disc present but no readable file found");
+        s_dvdBench.state = DVD_DONE;
+        return;
+    }
+
+    s_dvdBench.hFile = hf;
+    s_dvdBench.readTotal = 0;
+    s_dvdBench.readT0 = GetTickCount();
+    s_dvdBench.state = DVD_READING;
+    StrCopy(s_dvdBench.statusMsg, sizeof(s_dvdBench.statusMsg), "Reading...");
+}
+
+static void DvdBenchCleanup()
+{
+    if (s_dvdBench.hFile && s_dvdBench.hFile != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(s_dvdBench.hFile);
+        s_dvdBench.hFile = INVALID_HANDLE_VALUE;
+    }
+    // No unmount needed — D:\ is the kernel-mapped DVD drive letter
+}
+
+static void DvdBenchTick()
+{
+    if (s_dvdBench.state != DVD_READING) return;
+
+    DWORD got = 0;
+    BOOL ok = ReadFile(s_dvdBench.hFile, s_dvdBuf, DVD_BENCH_CHUNK, &got, NULL);
+
+    if (!ok || got == 0)
+    {
+        // EOF or error — finalise
+        DWORD elapsed = GetTickCount() - s_dvdBench.readT0;
+        if (elapsed > 0 && s_dvdBench.readTotal > 0)
+        {
+            float secs = (float)elapsed / 1000.f;
+            s_dvdBench.readMBs = ((float)s_dvdBench.readTotal / (1024.f * 1024.f)) / secs;
+            StrCopy(s_dvdBench.statusMsg, sizeof(s_dvdBench.statusMsg), "Complete");
+        }
+        else
+        {
+            StrCopy(s_dvdBench.statusMsg, sizeof(s_dvdBench.statusMsg),
+                !ok ? "Read error" : "File too small");
+        }
+        DvdBenchCleanup();
+        s_dvdBench.state = DVD_DONE;
+        return;
+    }
+
+    s_dvdBench.readTotal += got;
+
+    // Stop after DVD_BENCH_SIZE
+    if (s_dvdBench.readTotal >= DVD_BENCH_SIZE)
+    {
+        DWORD elapsed = GetTickCount() - s_dvdBench.readT0;
+        float secs = elapsed > 0 ? (float)elapsed / 1000.f : 1.f;
+        s_dvdBench.readMBs = ((float)s_dvdBench.readTotal / (1024.f * 1024.f)) / secs;
+        StrCopy(s_dvdBench.statusMsg, sizeof(s_dvdBench.statusMsg), "Complete");
+        DvdBenchCleanup();
+        s_dvdBench.state = DVD_DONE;
+    }
+}
+
+static void RenderDvdBench(const DiagLogo& logo)
+{
+    g_pDevice->BeginScene();
+
+    // Hint bar is state-dependent
+    const char* hint = "[B] Back";
+    if (s_dvdBench.state == DVD_WAITING)
+        hint = "[A] Check disc   [B] Back";
+    else if (s_dvdBench.state == DVD_READING)
+        hint = "[B] Cancel";
+    else if (s_dvdBench.state == DVD_DONE)
+        hint = "[A] Try again   [B] Back";
+
+    DrawPageChrome(logo, "HDD INFO", hint);
+
+    const float BX = LM;
+    const float BW = SW - LM * 2.f - 10.f;
+    float y = CONTENT_Y + 10.f;
+
+    // Title + drive model
+    DrawText(BX, y, "DVD READ SPEED TEST", 1.4f, COL_YELLOW);   y += LINE_H + 4.f;
+    DrawText(BX, y, s_data.dvdModel, 1.2f, COL_CYAN);           y += LINE_H + 12.f;
+
+    if (s_dvdBench.state == DVD_WAITING)
+    {
+        DrawText(BX, y, "Insert a disc and press [A]", 1.3f, COL_WHITE);
+        y += LINE_H + 6.f;
+        DrawText(BX, y, "The drive will be checked for readiness before testing.",
+            1.1f, COL_DIM);
+    }
+    else if (s_dvdBench.state == DVD_READING)
+    {
+        // Progress bar
+        float prog = (float)s_dvdBench.readTotal / (float)DVD_BENCH_SIZE;
+        if (prog > 1.f) prog = 1.f;
+        float barH = 18.f;
+        FillRect(BX, y, BX + BW, y + barH, D3DCOLOR_XRGB(10, 14, 32));
+        if (prog > 0.f)
+            FillRect(BX, y, BX + BW * prog, y + barH, D3DCOLOR_XRGB(0, 160, 220));
+        HLine(y, BX, BX + BW, COL_BORDER);
+        HLine(y + barH, BX, BX + BW, COL_BORDER);
+        VLine(BX, y, y + barH, COL_BORDER);
+        VLine(BX + BW, y, y + barH, COL_BORDER);
+        y += barH + 6.f;
+
+        // MB read so far
+        char t[32];
+        int mbRead = Ftoi((float)s_dvdBench.readTotal / (1024.f * 1024.f));
+        int mbTotal = Ftoi((float)DVD_BENCH_SIZE / (1024.f * 1024.f));
+        IntToStr(mbRead, t, sizeof(t));
+        DrawText(BX, y, t, 1.2f, COL_WHITE);
+        DrawText(BX + TW(t, 1.2f), y, " / ", 1.2f, COL_DIM);
+        IntToStr(mbTotal, t, sizeof(t));
+        DrawText(BX + TW("000 / ", 1.2f), y, t, 1.2f, COL_WHITE);
+        DrawText(BX + TW("000 / 00", 1.2f), y, " MB", 1.2f, COL_DIM);
+    }
+    else // DVD_DONE
+    {
+        if (s_dvdBench.readMBs > 0.f)
+        {
+            // Result
+            DrawText(BX, y, "READ SPEED", 1.3f, COL_GRAY);  y += LINE_H + 4.f;
+
+            // Large result value
+            char mbs[16];
+            int whole = Ftoi(s_dvdBench.readMBs);
+            int frac = Ftoi((s_dvdBench.readMBs - (float)whole) * 10.f);
+            IntToStr(whole, mbs, sizeof(mbs));
+            // append .X
+            int len = 0; while (mbs[len]) ++len;
+            mbs[len++] = '.'; mbs[len++] = '0' + frac; mbs[len] = '\0';
+
+            DrawText(BX, y, mbs, 2.0f, COL_GREEN);
+            DrawText(BX + TW(mbs, 2.0f) + 4.f, y + 6.f, "MB/s", 1.3f, COL_WHITE);
+            y += LINE_H * 2.f + 8.f;
+
+            // Contextual note — DVD-ROM 1x = 1.385 MB/s
+            // Stock Xbox DVD = ~8x CAV (~5-11 MB/s depending on radius)
+            DrawText(BX, y, "Ref: 1x DVD = 1.39 MB/s  |  Stock drive ~5-11 MB/s", 1.1f, COL_DIM);
+        }
+        else
+        {
+            DrawText(BX, y, s_dvdBench.statusMsg, 1.3f, COL_RED);
+        }
+        y += LINE_H + 8.f;
+        DrawText(BX, y, "[A] Run again   [B] Back", 1.2f, COL_YELLOW);
+    }
+
+    g_pDevice->EndScene();
+    g_pDevice->Present(NULL, NULL, NULL, NULL);
+}
+
 // ============================================================================
 // Tick
 // ============================================================================
@@ -1107,28 +2134,112 @@ void HddInfo_Tick(const DiagLogo& logo)
 
     if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
     {
-        RequestState(MSTATE_MENU);
-        s_prevBtns = cur;
-        return;
+        // Let the bench-specific B handlers below consume this if a bench is active
+        bool hddBusy = (s_view == VIEW_BENCH &&
+            s_bench.state != BENCH_IDLE && s_bench.state != BENCH_DONE);
+        bool dvdBusy = (s_view == VIEW_DVD_BENCH);
+        if (!hddBusy && !dvdBusy)
+        {
+            RequestState(MSTATE_MENU);
+            s_prevBtns = cur;
+            return;
+        }
     }
 
-    if (EdgeDown(cur, s_prevBtns, BTN_DPAD_RIGHT))
+    if (EdgeDown(cur, s_prevBtns, BTN_DPAD_RIGHT) && s_view == VIEW_INFO)
         s_view = VIEW_SMART;
     if (EdgeDown(cur, s_prevBtns, BTN_DPAD_LEFT))
+    {
+        if (s_view == VIEW_BENCH)
+            BenchCleanup();
+        else if (s_view == VIEW_DVD_BENCH)
+            DvdBenchCleanup();
         s_view = VIEW_INFO;
+    }
+    if (EdgeDown(cur, s_prevBtns, BTN_RTRIG) && s_view == VIEW_INFO)
+        s_view = VIEW_BENCH;
+    if (EdgeDown(cur, s_prevBtns, BTN_LTRIG) && s_view == VIEW_INFO && s_data.dvdDetected)
+    {
+        s_view = VIEW_DVD_BENCH;
+        DvdBenchStart();   // enter waiting-for-disc prompt immediately
+    }
 
     if (EdgeDown(cur, s_prevBtns, BTN_A))
     {
         if (s_view == VIEW_INFO)
             ExportData();
-        else
+        else if (s_view == VIEW_SMART)
             ExportSmart();
+        else if (s_view == VIEW_BENCH)
+        {
+            if (s_bench.state == BENCH_IDLE)
+                BenchStart();
+            else if (s_bench.state == BENCH_DONE)
+                ExportBench();
+        }
+        else if (s_view == VIEW_DVD_BENCH)
+        {
+            if (s_dvdBench.state == DVD_WAITING)
+                DvdBenchTryStart();
+            else if (s_dvdBench.state == DVD_DONE)
+                DvdBenchStart();   // back to insert-disc prompt
+        }
+    }
+
+    // Cancel HDD benchmark with B
+    if (s_view == VIEW_BENCH && s_bench.state != BENCH_IDLE && s_bench.state != BENCH_DONE)
+    {
+        if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
+        {
+            BenchCleanup();
+            s_bench.state = BENCH_DONE;
+            StrCopy(s_bench.statusMsg, sizeof(s_bench.statusMsg), "Benchmark cancelled");
+            s_prevBtns = cur;
+            RenderBench(logo);
+            return;
+        }
+    }
+
+    // Cancel DVD benchmark with B (only while actively reading)
+    if (s_view == VIEW_DVD_BENCH && s_dvdBench.state == DVD_READING)
+    {
+        if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
+        {
+            DvdBenchCleanup();
+            s_dvdBench.state = DVD_DONE;
+            StrCopy(s_dvdBench.statusMsg, sizeof(s_dvdBench.statusMsg), "Cancelled");
+            s_prevBtns = cur;
+            RenderDvdBench(logo);
+            return;
+        }
+    }
+    // From DVD_WAITING or DVD_DONE, B just goes back to info page
+    if (s_view == VIEW_DVD_BENCH && s_dvdBench.state != DVD_READING)
+    {
+        if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
+        {
+            DvdBenchCleanup();
+            s_view = VIEW_INFO;
+            s_prevBtns = cur;
+            Render(logo);
+            return;
+        }
     }
 
     s_prevBtns = cur;
 
+    // Run one tick of work
+    if (s_view == VIEW_BENCH && s_bench.state != BENCH_IDLE && s_bench.state != BENCH_DONE)
+        BenchTick();
+    if (s_view == VIEW_DVD_BENCH && s_dvdBench.state == DVD_READING)
+        DvdBenchTick();
+
     if (s_view == VIEW_SMART)
         RenderSmart(logo);
+    else if (s_view == VIEW_BENCH)
+        RenderBench(logo);
+    else if (s_view == VIEW_DVD_BENCH)
+        RenderDvdBench(logo);
     else
         Render(logo);
 }
