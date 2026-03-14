@@ -40,7 +40,8 @@ enum
     MSTATE_CTRL = 9,
     MSTATE_STRESS = 10,
     MSTATE_FILES = 11,
-    MSTATE_EXIT = 12,
+    MSTATE_XBSET = 12,
+    MSTATE_EXIT = 13,
 };
 
 // ============================================================================
@@ -135,6 +136,16 @@ static void HandleInput()
     if (EdgeDown(cur, s_prevBtns, BTN_START))
     {
         RequestState(MSTATE_EXIT);
+    }
+    // Back+White chord opens automation settings (hidden menu).
+    // Both must be held; at least one must have just gone down this frame.
+    {
+        bool backHeld = (cur & BTN_BACK) != 0;
+        bool whiteHeld = (cur & BTN_WHITE) != 0;
+        bool backEdge = backHeld && !(s_prevBtns & BTN_BACK);
+        bool whiteEdge = whiteHeld && !(s_prevBtns & BTN_WHITE);
+        if (backHeld && whiteHeld && (backEdge || whiteEdge))
+            RequestState(MSTATE_XBSET);
     }
 
     s_prevBtns = cur;

@@ -268,6 +268,10 @@ static DWORD     s_opDone = 0;
 static DWORD     s_opTotal = 0;
 static int       s_opItemDone = 0;
 static int       s_opItemTotal = 0;
+static bool      s_workTruncated = false;  // true if work list hit MAX_WORK_ITEMS
+static int       s_opSkipCount = 0;       // files skipped due to open/write failure
+static int       s_opDelFail = 0;       // delete failures during MOVE cleanup
+static bool      s_opCopyOK = true;    // false if any file copy write failed
 
 // --- FTP ---
 static FtpCtx    s_ftp;
@@ -933,9 +937,12 @@ static bool FtpAppendListLine(const char* name, bool isDir, DWORD sizeLow)
 
 // Recursively expand srcPath into s_work[], building a flat list of
 // WI_MKDIR and WI_FILE entries. dstPath is the destination for srcPath.
+// Sets s_workTruncated if MAX_WORK_ITEMS is reached so callers can warn.
+// Path-length check: skips any entry whose constructed path would overflow
+// MAX_PATH_LEN rather than silently truncating and corrupting the path.
 static void ExpandToWorkList(const char* srcPath, const char* dstPath, bool isDir)
 {
-    if (s_workCount >= MAX_WORK_ITEMS) return;
+    if (s_workCount >= MAX_WORK_ITEMS) { s_workTruncated = true; return; }
 
     if (!isDir)
     {
@@ -967,7 +974,16 @@ static void ExpandToWorkList(const char* srcPath, const char* dstPath, bool isDi
     do {
         if (fd.cFileName[0] == '.' &&
             (fd.cFileName[1] == '\0' || fd.cFileName[1] == '.')) continue;
-        if (s_workCount >= MAX_WORK_ITEMS) break;
+        if (s_workCount >= MAX_WORK_ITEMS) { s_workTruncated = true; break; }
+
+        // Path-length guard: measure before building to avoid silent truncation.
+        int srcBase = 0; while (srcPath[srcBase]) srcBase++;
+        int nameLen = 0; while (fd.cFileName[nameLen]) nameLen++;
+        // +2 for the separator and null terminator
+        if (srcBase + 1 + nameLen + 1 > MAX_PATH_LEN) continue;  // skip, don't corrupt
+
+        int dstBase = 0; while (dstPath[dstBase]) dstBase++;
+        if (dstBase + 1 + nameLen + 1 > MAX_PATH_LEN) continue;
 
         char src2[MAX_PATH_LEN], dst2[MAX_PATH_LEN];
         StrCopy(src2, sizeof(src2), srcPath);
@@ -986,10 +1002,17 @@ static void ExpandToWorkList(const char* srcPath, const char* dstPath, bool isDi
     FindClose(h);
 }
 
-// Delete a file or directory recursively
+// Delete a file or directory recursively.
+// Returns true only if the entire subtree was deleted without any failures.
+// Accumulates failures into s_opDelFail so the caller can surface them.
 static bool FileDeleteRecursive(const char* path, bool isDir)
 {
-    if (!isDir) return DeleteFileA(path) != 0;
+    if (!isDir)
+    {
+        bool ok = DeleteFileA(path) != 0;
+        if (!ok) s_opDelFail++;
+        return ok;
+    }
 
     char pat[MAX_PATH_LEN + 4];
     StrCopy(pat, sizeof(pat), path);
@@ -997,6 +1020,7 @@ static bool FileDeleteRecursive(const char* path, bool isDir)
     if (pl > 0 && pat[pl - 1] != '\\') { pat[pl++] = '\\'; pat[pl] = '\0'; }
     pat[pl++] = '*'; pat[pl] = '\0';
 
+    bool allOK = true;
     WIN32_FIND_DATA fd;
     HANDLE h = FindFirstFile(pat, &fd);
     if (h != INVALID_HANDLE_VALUE)
@@ -1004,17 +1028,28 @@ static bool FileDeleteRecursive(const char* path, bool isDir)
         do {
             if (fd.cFileName[0] == '.' &&
                 (fd.cFileName[1] == '\0' || fd.cFileName[1] == '.')) continue;
+
+            int pathLen = 0; while (path[pathLen]) pathLen++;
+            int nameLen = 0; while (fd.cFileName[nameLen]) nameLen++;
+            if (pathLen + 1 + nameLen + 1 > MAX_PATH_LEN)
+            {
+                allOK = false; s_opDelFail++;
+                continue;
+            }
+
             char child[MAX_PATH_LEN];
             StrCopy(child, sizeof(child), path);
             int cl = 0; while (child[cl]) cl++;
             if (cl > 0 && child[cl - 1] != '\\') { child[cl++] = '\\'; child[cl] = '\0'; }
             AppendStr(child, sizeof(child), fd.cFileName);
-            FileDeleteRecursive(child,
-                (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+            if (!FileDeleteRecursive(child,
+                (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0))
+                allOK = false;
         } while (FindNextFile(h, &fd));
         FindClose(h);
     }
-    return RemoveDirectoryA(path) != 0;
+    if (!RemoveDirectoryA(path)) { allOK = false; s_opDelFail++; }
+    return allOK;
 }
 
 // Start a file operation — expand clipboard to flat work list, begin ticking.
@@ -1026,6 +1061,10 @@ static void FileOpStartTo(const char* destDir)
     s_opItemDone = 0;
     s_opSrcHandle = INVALID_HANDLE_VALUE;
     s_opDstHandle = INVALID_HANDLE_VALUE;
+    s_workTruncated = false;
+    s_opSkipCount = 0;
+    s_opDelFail = 0;
+    s_opCopyOK = true;
 
     for (int i = 0; i < s_clipCount; ++i)
     {
@@ -1059,6 +1098,10 @@ static void FileOpStart(FileOpType op)
     s_opItemDone = 0;
     s_opSrcHandle = INVALID_HANDLE_VALUE;
     s_opDstHandle = INVALID_HANDLE_VALUE;
+    s_workTruncated = false;
+    s_opSkipCount = 0;
+    s_opDelFail = 0;
+    s_opCopyOK = true;
 
     for (int i = 0; i < s_clipCount; ++i)
     {
@@ -1109,6 +1152,7 @@ static void FileOpTick()
                 NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
             if (s_opSrcHandle == INVALID_HANDLE_VALUE)
             {
+                s_opSkipCount++; s_opCopyOK = false;
                 s_opItemDone++; s_workIdx++; continue;
             }
 
@@ -1118,6 +1162,7 @@ static void FileOpTick()
             {
                 CloseHandle(s_opSrcHandle);
                 s_opSrcHandle = INVALID_HANDLE_VALUE;
+                s_opSkipCount++; s_opCopyOK = false;
                 s_opItemDone++; s_workIdx++; continue;
             }
 
@@ -1147,7 +1192,8 @@ static void FileOpTick()
         }
 
         DWORD nw = 0;
-        WriteFile(s_opDstHandle, s_copyBuf, nr, &nw, NULL);
+        if (!WriteFile(s_opDstHandle, s_copyBuf, nr, &nw, NULL) || nw != nr)
+            s_opCopyOK = false;
         s_opDone += nw;
         break;  // one chunk, then yield
     }
@@ -1164,9 +1210,12 @@ static void FileOpTick()
             FlushFileBuffers(s_opDstHandle); CloseHandle(s_opDstHandle); s_opDstHandle = INVALID_HANDLE_VALUE;
         }
 
-        // MOVE: delete sources after successful copy
-        if (s_workOp == FILEOP_MOVE)
+        // MOVE: delete sources — only if all copies completed cleanly.
+        // If any file was skipped or a write failed, leave sources intact to
+        // avoid data loss from a partial copy.
+        if (s_workOp == FILEOP_MOVE && s_opCopyOK)
         {
+            s_opDelFail = 0;
             for (int i = 0; i < s_clipCount; ++i)
                 FileDeleteRecursive(s_clipboard[i].path, s_clipboard[i].isDir);
         }
@@ -1174,6 +1223,9 @@ static void FileOpTick()
         s_clipCount = 0;
         s_clipOp = FILEOP_NONE;
         s_opRunning = false;
+        // Stay at FOS_IDLE but surface any warnings via the skip/fail counts.
+        // The render path checks s_workTruncated, s_opSkipCount, s_opDelFail
+        // and draws a warning banner if any are non-zero.
         s_fosState = FOS_IDLE;
         s_opSrcName[0] = '\0';
         s_workCount = 0;
@@ -1806,6 +1858,40 @@ static void FtpHandleCommand(char* cmd)
     {
         // FileZilla sends "OPTS UTF8 ON" — just accept it
         FtpReply(200, "OK.");
+    }
+    else if (verb[0] == 'C' && verb[1] == 'L' && verb[2] == 'N' && verb[3] == 'T')
+    {
+        // FileZilla identifies itself with CLNT — accept silently
+        FtpReply(200, "OK.");
+    }
+    else if (verb[0] == 'M' && verb[1] == 'L' && verb[2] == 'S' && verb[3] == 'D')
+    {
+        // FileZilla prefers MLSD over LIST — not implemented, but reply 502
+        // so FileZilla retries with LIST rather than treating it as fatal.
+        FtpReply(502, "MLSD not implemented, use LIST.");
+    }
+    else if (verb[0] == 'E' && verb[1] == 'P' && verb[2] == 'S' && verb[3] == 'V')
+    {
+        // FileZilla tries EPSV before PASV — not supported, fall back to PASV.
+        FtpReply(500, "EPSV not supported, use PASV.");
+    }
+    else if (verb[0] == 'A' && verb[1] == 'B' && verb[2] == 'O' && verb[3] == 'R')
+    {
+        // Abort current transfer if any
+        if (s_ftp.xferFile != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(s_ftp.xferFile); s_ftp.xferFile = INVALID_HANDLE_VALUE;
+        }
+        if (s_ftp.dataSock != INVALID_SOCKET)
+        {
+            closesocket(s_ftp.dataSock); s_ftp.dataSock = INVALID_SOCKET;
+        }
+        s_ftp.xferType = XFER_NONE;
+        s_ftp.listPending = false;
+        s_ftp.listBufLen = 0; s_ftp.listBufOff = 0;
+        s_ftp.retrBufLen = 0; s_ftp.retrBufOff = 0;
+        if (s_ftp.state == FTP_TRANSFER) s_ftp.state = FTP_CONNECTED;
+        FtpReply(226, "Abort successful.");
     }
     else if (verb[0] == 'N' && verb[1] == 'O' && verb[2] == 'O' && verb[3] == 'P')
     {
@@ -2487,6 +2573,46 @@ static void Render(const DiagLogo& logo)
         IntToStr(Ftoi(frac * 100.f), pctBuf, sizeof(pctBuf));
         AppendStr(pctBuf, sizeof(pctBuf), "%");
         DrawText(OX + OP + BW + 4.f, ty, pctBuf, 1.05f, COL_WHITE);
+    }
+
+    // ---- Post-operation warning banner ------------------------------------
+    // Shown after an op completes if anything was truncated, skipped, or
+    // failed to delete.  Stays visible until the user navigates away.
+    if (!s_opRunning && s_fosState == FOS_IDLE &&
+        (s_workTruncated || s_opSkipCount > 0 || s_opDelFail > 0))
+    {
+        const float WW = 380.f;
+        const float WX = (SW - WW) * 0.5f;
+        const float WY = 160.f;
+        const float WH = s_workTruncated ? 70.f : 56.f;
+
+        FillRect(WX, WY, WX + WW, WY + WH, D3DCOLOR_ARGB(240, 40, 12, 0));
+        HLine(WY, WX, WX + WW, COL_ORANGE);
+        HLine(WY + WH, WX, WX + WW, COL_ORANGE);
+
+        float wy = WY + 7.f;
+        DrawText(WX + 8.f, wy, "! OPERATION WARNING", 1.15f, COL_ORANGE); wy += 15.f;
+
+        if (s_workTruncated)
+        {
+            DrawText(WX + 8.f, wy,
+                "Work list full — some files were NOT copied.", 1.05f, COL_RED);
+            wy += 13.f;
+        }
+        if (s_opSkipCount > 0)
+        {
+            char sl[48]; StrCopy(sl, sizeof(sl), "Files skipped (open/write error): ");
+            char sc[8];  IntToStr(s_opSkipCount, sc, sizeof(sc));
+            StrCat2(sl, sizeof(sl), sl, sc);
+            DrawText(WX + 8.f, wy, sl, 1.05f, COL_ORANGE); wy += 13.f;
+        }
+        if (s_opDelFail > 0)
+        {
+            char dl[48]; StrCopy(dl, sizeof(dl), "Source delete failures: ");
+            char dc[8];  IntToStr(s_opDelFail, dc, sizeof(dc));
+            StrCat2(dl, sizeof(dl), dl, dc);
+            DrawText(WX + 8.f, wy, dl, 1.05f, COL_ORANGE);
+        }
     }
 
     // ---- Confirm delete overlay ------------------------------------------

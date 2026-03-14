@@ -21,8 +21,8 @@ XbDiag is a native RXDK application that runs directly on original Xbox hardware
 | 03 | **SMBus Scan** | Full 0x00–0x7F address scan with live ACK/NAK grid, known-device decode, and per-register read panel |
 | 04 | **Temp Monitor** | Live CPU and board temperatures via ADM1032 (rev 1.0–1.5) or PIC/Xcalibur (rev 1.6), with scrolling history graph |
 | 05 | **EEPROM Viewer** | Full 256-byte EEPROM decode — serial number, region, HDD key, LAN MAC, confounder, checksum, and binary export |
-| 06 | **Video Info** | Encoder type and chip ID (Conexant/Focus/Xcalibur), encoder output standard (NTSC/PAL), AV pack type, real refresh rate, NV2A GPU clocks and framebuffer info, NTSC/PAL color bar test patterns |
-| 07 | **HDD Info** | ATA IDENTIFY — model, serial, firmware, capacity (LBA28/LBA48), UDMA mode, SMART, HDD benchmark (write/read/seek), DVD drive detection and read speed test |
+| 06 | **Video Info** | Encoder type and chip ID, AV pack type, refresh rate, NV2A GPU/memory clocks, NTSC/PAL color bar patterns, and live video mode switching test |
+| 07 | **HDD Info** | ATA IDENTIFY — model, serial, firmware, capacity (LBA28/LBA48), UDMA mode, SMART, HDD benchmark, DVD drive detection and read speed test |
 | 08 | **Controller Test** | Port connection status strip (all 4 ports), digital buttons, analog sticks, triggers, Black/White — live visualizer plus rumble motor subcard |
 | 09 | **Stress Test** | CPU and RAM stress tests with live temperature monitoring and configurable thermal auto-abort |
 | 10 | **File Explorer** | Full file manager with FTP server, file copy/move/delete, multi-select, and XBE launcher |
@@ -41,23 +41,23 @@ If a DVD drive is detected on the secondary ATA channel, its model string is sho
 Live SMART attribute table — attribute ID, name, value, worst, threshold, and raw data for all reported attributes. Export to `D:\smart.txt` with `[A]`.
 
 ### HDD Benchmark `[RT]`
-Sequential write, sequential read, and random seek test against a temporary 8MB file on `E:\` (falls back to `D:\`). Results displayed as MB/s bars with numeric readout. Export to `D:\hddbench.txt` with `[A]` after completion.
+Sequential write, sequential read, and random seek test against a temporary 64MB file on `E:\` (falls back to `D:\`). Results displayed as MB/s bars with numeric readout. Export to `D:\hddbench.txt` with `[A]` after completion.
 
 | Button | Action |
 |--------|--------|
-| `[A]` | Start benchmark / export results when done |
+| `[A]` | Confirm and start benchmark / export results when done |
 | `[B]` | Cancel in-progress benchmark |
 | `[Left]` | Return to info view |
 
 ### DVD Read Speed Test `[LT]`
-Available only when a DVD drive is detected on the secondary ATA channel via ATAPI IDENTIFY (word[0] bits[14:8] = 0x85 confirms CD/DVD device type). Performs a timed 16MB sequential read from a disc in the drive using `D:\` — the kernel-mapped DVD drive letter.
+Available only when a DVD drive is detected on the secondary ATA channel via ATAPI IDENTIFY. Performs a timed 16MB sequential read from a disc in the drive.
 
 | Button | Action |
 |--------|--------|
 | `[A]` | Check disc readiness and start test |
 | `[B]` | Cancel in-progress test / return to info |
 
-On entering the DVD bench view, the drive is checked before the test begins. If no disc is present or the drive is not ready, a clear error is shown. Insert a disc and press `[A]` again to retry. Result is shown in MB/s with a reference note (1x DVD = 1.39 MB/s; stock Xbox drives typically read 5–11 MB/s depending on disc radius).
+Result is shown in MB/s with a reference note (1x DVD = 1.39 MB/s; stock Xbox drives typically read 5–11 MB/s depending on disc radius).
 
 ---
 
@@ -66,13 +66,16 @@ On entering the DVD bench view, the drive is checked before the test begins. If 
 ### Info View
 Displays encoder type (Conexant CX25871, Focus FS454/455, or Xcalibur), chip ID, AV pack type, encoder output standard (NTSC / PAL-B/G / PAL-M / PAL-N), backbuffer resolution, real refresh rate (read from D3D display mode), and color depth.
 
-**NV2A GPU section** reads live from MMIO (guarded by PCI vendor ID check):
+**NV2A GPU section** reads live from MMIO:
 
 | Field | Source | Notes |
 |-------|--------|-------|
-| `MEM CLK` | MPLL @ 0xFD680504 | ~200 MHz on retail hardware |
+| `GPU CLK` | NVPLL @ 0xFD680500 | ~233 MHz on retail hardware |
+| `MEM CLK` | MPLL @ 0xFD680504 | ~200 MHz DDR on retail hardware |
 | `PIX CLK` | VPLL1 @ 0xFD680508 | ~13 MHz (480i), ~27 MHz (480p), ~74 MHz (720p) |
 | `FB BASE` | PCRTC_START @ 0xFD600810 | VRAM scanout offset, shown in hex |
+
+Raw NVPLL and MPLL register values are displayed beneath each clock field for hardware diagnosis. A `*` suffix on a clock value indicates the MMIO read returned 0 and a hardware default was substituted.
 
 ### Color Bar Test Patterns
 | Button | Pattern |
@@ -81,7 +84,24 @@ Displays encoder type (Conexant CX25871, Focus FS454/455, or Xcalibur), chip ID,
 | `[Y]` | PAL EBU Tech 3373 8-bar pattern |
 | `[B]` | Return to info view |
 
-Useful for verifying encoder output integrity on a CRT or capture device. NTSC bars use 75% SMPTE colors with a blue-only stripe and PLUGE region. PAL bars use 100% full-field EBU colors with a grey/black reference strip.
+### Mode Switch Test `[WHITE]`
+Cycles through the video modes supported by the connected AV pack, applying each via D3D `Reset()` with the corresponding presentation flags. Full-screen color bars are displayed in the active mode with a live hardware verification readout showing the actual backbuffer dimensions as reported by `GetBackBuffer()`. This confirms whether the GPU framebuffer committed to the requested resolution.
+
+| Button | Action |
+|--------|--------|
+| `[WHITE]` | Next mode |
+| `[BLACK]` | Previous mode |
+| `[B]` | Restore original mode and return to info view |
+
+Modes are filtered by AV pack type at entry:
+
+| AV Pack | Available Modes |
+|---------|----------------|
+| Composite / S-Video / SCART | 480i, 576i PAL |
+| VGA | 480i, 480p |
+| HDTV Component | 480i, 480p, 576i PAL, 720p, 1080i |
+
+The hardware verify readout (`HW: WxH  OK / MISMATCH`) is deferred by two frames after each switch to allow the NV2A scanout registers to settle before sampling. A `MISMATCH` result indicates the D3D Reset succeeded but the GPU framebuffer did not commit to the requested resolution — typically caused by an AV pack that cannot carry the signal.
 
 ---
 
@@ -93,21 +113,27 @@ A live strip at the top of the screen shows connection status for all four contr
 ### Button / Stick Visualizer
 Displays all digital buttons (A, B, X, Y, Black, White, Start, Back, D-pad, thumbstick clicks), both analog sticks with live position dot, and trigger pressure bars. Analog button pressure is shown as a numeric value below each button.
 
+### Stick Test `[Start+DPad Up]`
+Three sub-tests selectable with `[Left]` / `[Right]`:
+- **Dead-zone** — raw XY scatter plot with configurable dead-zone ring
+- **Circularity** — traces the stick gate path vs an ideal circle
+- **Drift** — samples at-rest position over ~3 seconds and reports average XY offset
+
 ### Rumble Subcard `[A]`
-Dedicated subcard for testing the left (low-frequency) and right (high-frequency) rumble motors independently, with adjustable intensity.
+Dedicated subcard for testing the left (low-frequency) and right (high-frequency) rumble motors independently, with adjustable intensity via triggers.
 
 ---
 
 ## Stress Test
 
 ### CPU Stress `[A]`
-Sustained integer and FPU load. Live CPU and board temperatures shown throughout.
+Sustained FPU/integer burn using a Prime95-derived eight-real FFT kernel. Live CPU and board temperatures shown throughout with a scrolling graph. A configurable thermal threshold (adjustable before starting) will auto-abort if the CPU exceeds the limit.
 
 ### RAM Stress `[X]`
-Allocates a large contiguous block and runs sustained read/write passes. Temperatures monitored throughout.
+Allocates the largest available contiguous block per bank and runs sustained moving-inversions read/write passes. Temperatures monitored throughout.
 
 ### Thermal Auto-Abort
-A configurable temperature threshold (adjustable in 5°C steps before starting the test) will automatically halt the test if the CPU exceeds the limit. This protects marginal or poorly cooled hardware from running to damage during a sustained load test.
+Adjustable in 5°C steps before starting the test. If the hottest sensor (CPU die or board) reaches the threshold the test halts immediately and the result is flagged as a thermal abort.
 
 ---
 
@@ -138,7 +164,7 @@ The File Explorer is a full single-pane file manager for navigating and managing
 
 Marked items are shown in **green**. Marks persist while you navigate to your destination — mark your files, navigate to the target folder, then paste.
 
-Copy and move operations run as a tick-driven background task so large transfers (including multi-GB files) show a live progress widget and keep the UI responsive throughout. The FTP server continues to operate during file operations.
+Copy and move operations run as a tick-driven background task so large transfers show a live progress widget and keep the UI responsive throughout.
 
 ### FTP Server
 
@@ -188,12 +214,13 @@ Place the built `default.xbe` and the `tex\` folder together in the same directo
 Diagnostic output files written by the tool:
 
 ```
-eeprom.bin    (written by EEPROM Viewer export)
-hddinfo.txt   (written by HDD Info export)
-sysinfo.txt   (written by System Info export)
-smart.txt     (written by HDD Info SMART export)
-hddbench.txt  (written by HDD Info benchmark export)
-ramresult.csv (written by RAM Test export)
+D:\eeprom.bin     (written by EEPROM Viewer export)
+D:\hddinfo.txt    (written by HDD Info export)
+D:\sysinfo.txt    (written by System Info export)
+D:\smart.txt      (written by HDD Info SMART export)
+D:\hddbench.txt   (written by HDD Info benchmark export)
+D:\bios.bin       (written by System Info BIOS dump)
+D:\ramresult.csv  (written by RAM Test export)
 ```
 
 ---
@@ -212,7 +239,7 @@ Patterns applied per chunk:
 Each pass follows a strict write → `wbinvd` → read/verify sequence to prevent L2 cache masking real DRAM faults.
 
 ### Stress Soak `[X]` 15 min / `[Y]` 30 min
-Allocates the largest contiguous block available per bank (up to the full bank size) and runs memtest86-style moving inversions across the entire live allocation simultaneously. Phases:
+Allocates the largest contiguous block available per bank and runs memtest86-style moving inversions across the entire live allocation simultaneously. Phases:
 
 | Phase | Operation |
 |-------|-----------|
@@ -223,7 +250,7 @@ Allocates the largest contiguous block available per bank (up to the full bank s
 | 5/6 | WRITE — address XOR `0xDEADBEEF` |
 | 6/6 | READ — verify address XOR pattern |
 
-All adjacent cells are live simultaneously during soak — this catches coupling faults and marginal cells under sustained bus load that chunk tests cannot detect. Errors are bucketed back to the 2MB display grid for reporting.
+All adjacent cells are live simultaneously during soak — this catches coupling faults and marginal cells under sustained bus load that chunk tests cannot detect.
 
 ---
 
@@ -247,9 +274,10 @@ XbDiag uses software-shifted 8-bit addresses (hardware 7-bit address left-shifte
 
 - **Rev 1.6 temperatures** are read via PIC registers (0x09/0x0A). Xcalibur readings are noisier than ADM1032 — values are averaged across 10 samples to compensate.
 - **EEPROM export** writes to the title directory (`D:\`). If the directory is read-only the export will silently fail and the status indicator on screen will show `FAIL`.
-- **xemu compatibility**: The PIC SMBus device (0x20) may not respond in xemu. The Video Info and Temp Monitor screens handle this gracefully and show a note on screen. NV2A MMIO reads in Video Info are guarded by a PCI vendor ID check and will show `N/A` if the guard fails. All other modules work normally.
-- **LBA48 capacity** is displayed correctly for drives over 137GB. Drives over 2TB will display a `+` suffix indicating the upper 32 address bits are non-zero, but the displayed sector count is capped to the lower 32 bits.
-- **DVD read speed test** requires a disc to be inserted before starting. Discs with no files at the root of the filesystem (or files all under 1MB) will report an error. The test reads up to 16MB sequentially — on short discs the test ends at EOF and reports the speed for however much was read.
+- **xemu compatibility**: The PIC SMBus device (0x20) may not respond in xemu. Video Info and Temp Monitor handle this gracefully. NV2A MMIO reads in Video Info are guarded by a PCI vendor ID check and will show `N/A` if the guard fails. CPU detection uses the hypervisor present bit (CPUID leaf 1, ECX bit 31) to distinguish xemu from real hardware. All other modules work normally.
+- **LBA48 capacity** is displayed correctly for drives over 137GB. Drives over 2TB will display a `+` suffix indicating the upper 32 address bits are non-zero.
+- **DVD read speed test** requires a disc to be inserted before starting. Discs with no files at the root of the filesystem will report an error.
+- **Video mode switching** (`[WHITE]` in Video Info) switches the D3D device via `Reset()`. Modes unsupported by the connected AV pack will be rejected silently by the NV2A encoder — the hardware verify readout will show `MISMATCH` in that case. The original mode is always restored cleanly on exit.
 - **FTP passive mode only** — active mode (PORT) is not supported. Configure your FTP client to use passive mode.
 
 ---

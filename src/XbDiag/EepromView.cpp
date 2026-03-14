@@ -1475,3 +1475,64 @@ void EepromView_Tick(const DiagLogo& logo)
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
+// ============================================================================
+// AutoRun — read EEPROM and report key fields
+// ============================================================================
+
+void EepromView_AutoRun(HANDLE hReport)
+{
+    ReadEeprom();
+
+    char line[128]; DWORD w;
+    auto WL = [&](const char* lbl, const char* val)
+        {
+            StrCopy(line, sizeof(line), lbl);
+            StrCat2(line, sizeof(line), line, val);
+            StrCat2(line, sizeof(line), line, "\r\n");
+            WriteFile(hReport, line, StrLen(line), &w, NULL);
+        };
+
+    if (!s_readOK) { WL("EEPROM:       ", "Read failed"); return; }
+
+    // Serial: bytes 0x34-0x3F (12 chars)
+    char serial[14];
+    for (int i = 0; i < 12; ++i) serial[i] = (char)s_eeprom[0x34 + i];
+    serial[12] = '\0';
+    WL("Serial:       ", serial);
+
+    // MAC: bytes 0x40-0x45
+    {
+        char mac[20]; char* mp = mac;
+        static const char hex[] = "0123456789ABCDEF";
+        for (int i = 0; i < 6; ++i)
+        {
+            BYTE b = s_eeprom[0x40 + i];
+            *mp++ = hex[b >> 4]; *mp++ = hex[b & 0xF];
+            if (i < 5) *mp++ = ':';
+        }
+        *mp = '\0';
+        WL("MAC:          ", mac);
+    }
+
+    // Video standard: bytes 0x58-0x5B
+    {
+        DWORD vs = (DWORD)s_eeprom[0x58] | ((DWORD)s_eeprom[0x59] << 8)
+            | ((DWORD)s_eeprom[0x5A] << 16) | ((DWORD)s_eeprom[0x5B] << 24);
+        const char* vsStr = "Unknown";
+        if (vs == 0x00400100) vsStr = "NTSC-M";
+        else if (vs == 0x00400200) vsStr = "NTSC-J";
+        else if (vs == 0x00800300) vsStr = "PAL-I 50Hz";
+        else if (vs == 0x00400400) vsStr = "PAL-M 60Hz";
+        WL("Video Std:    ", vsStr);
+    }
+
+    // Game region: bytes 0x54-0x57
+    {
+        DWORD gr = (DWORD)s_eeprom[0x54] | ((DWORD)s_eeprom[0x55] << 8)
+            | ((DWORD)s_eeprom[0x56] << 16) | ((DWORD)s_eeprom[0x57] << 24);
+        char grHex[12];
+        IntToHex(gr, 8, grHex, sizeof(grHex));
+        char grLine[16]; StrCat2(grLine, sizeof(grLine), "0x", grHex);
+        WL("Game Region:  ", grLine);
+    }
+}

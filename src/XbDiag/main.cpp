@@ -30,6 +30,7 @@
 #include "ControllerTest.h"
 #include "StressTest.h"
 #include "FileExplorer.h"
+#include "XbSet.h"
 
 #include <xtl.h>
 
@@ -61,6 +62,7 @@ enum AppState
     STATE_CTRL,
     STATE_STRESS,
     STATE_FILES,
+    STATE_XBSET,
     STATE_EXIT,
 };
 
@@ -241,6 +243,38 @@ void __cdecl main()
     g_logo.tex = DiagLoadDDS("D:\\tex\\xb.dds", g_logo.w, g_logo.h);
     // Null tex is handled gracefully by DrawLogo / DrawPageChrome
 
+    // ---- Autorun: check for XbDiag.set --------------------------------
+    g_autoSettingsFound = XbSet_LoadSettings();
+    if (g_autoSettingsFound)
+    {
+        DWORD countStart = GetTickCount();
+        bool  cancelled = false;
+        WORD  prevBtns = GetButtons();
+        while ((GetTickCount() - countStart) < 5000 && !cancelled)
+        {
+            PumpInput();
+            WORD cur = GetButtons();
+            if ((cur & 0x2000) && !(prevBtns & 0x2000)) cancelled = true;
+            prevBtns = cur;
+            DWORD elapsed = GetTickCount() - countStart;
+            DWORD remain = (elapsed < 5000) ? (5000 - elapsed) / 1000 + 1 : 1;
+            g_pDevice->BeginScene();
+            DrawPageChrome(g_logo, "XBDIAG AUTORUN", "[B] Cancel");
+            float cy = CONTENT_Y + 40.f;
+            DrawText(LM, cy, "AUTOMATION SETTINGS DETECTED", 1.5f,
+                D3DCOLOR_XRGB(255, 220, 60)); cy += LINE_H * 2.f;
+            DrawText(LM, cy, "Automated diagnostics begin in:", 1.2f,
+                D3DCOLOR_XRGB(180, 180, 180)); cy += LINE_H + 4.f;
+            char secBuf[8]; IntToStr((int)remain, secBuf, sizeof(secBuf));
+            DrawText(LM, cy, secBuf, 4.0f, COL_CYAN); cy += LINE_H * 4.f;
+            DrawText(LM, cy, "Press [B] to cancel", 1.2f, COL_DIM);
+            g_pDevice->EndScene();
+            g_pDevice->Present(NULL, NULL, NULL, NULL);
+        }
+        if (!cancelled)
+            XbSet_AutoRun(g_logo);
+    }
+
     // Initial state
     g_state = STATE_MENU;
     g_prevState = STATE_MENU;
@@ -269,6 +303,7 @@ void __cdecl main()
             case STATE_CTRL:    ControllerTest_OnEnter(); break;
             case STATE_STRESS:  StressTest_OnEnter();     break;
             case STATE_FILES:   FileExplorer_OnEnter();   break;
+            case STATE_XBSET:   XbSet_OnEnter();          break;
             case STATE_EXIT:    ExitToDashboard();     break;
             default:            break;
             }
@@ -292,6 +327,7 @@ void __cdecl main()
         case STATE_CTRL:    ControllerTest_Tick(g_logo); break;
         case STATE_STRESS:  StressTest_Tick(g_logo);     break;
         case STATE_FILES:   FileExplorer_Tick(g_logo);   break;
+        case STATE_XBSET:   XbSet_Tick(g_logo);          break;
         default:            break;
         }
     }

@@ -126,7 +126,7 @@ static const int NUM_FIELDS = sizeof(s_fields) / sizeof(s_fields[0]);
 // State
 // ============================================================================
 
-enum EepView { VIEW_HEX = 0, VIEW_DECODED };
+enum EepView { VIEW_HEX = 0, VIEW_DECODED, VIEW_EDIT };
 
 static BYTE  s_eeprom[256];
 static bool  s_readOK;
@@ -138,6 +138,36 @@ static int     s_decScroll;   // top field index in decoded view
 static bool    s_saveDone;
 static bool    s_saveOK;
 static bool    s_loaded = false;
+
+// ============================================================================
+// Edit view state
+// ============================================================================
+
+// Cards: 0=VIDEO 1=AUDIO 2=REGION 3=TIME
+static int  s_editCard;
+static int  s_editCursor;   // field index within current card
+
+// Working copies of editable fields (loaded from s_eeprom on VIEW_EDIT entry)
+static DWORD s_editVideoStd;   // 1=NTSC-M 2=NTSC-J 3=PAL
+static DWORD s_editVideoFlags; // bitmask
+static DWORD s_editAudioFlags; // low word=mode, high word=AC3/DTS bits
+static DWORD s_editGameRegion; // enum
+static DWORD s_editDvdRegion;  // 1-6
+static DWORD s_editParental;   // 0-6
+static int   s_editTzIndex;    // index into s_tzTable
+
+// Confirm-write prompt state
+static bool  s_editConfirm;    // true = confirm overlay showing
+static bool  s_editWriteDone;  // true = write result showing
+static bool  s_editWriteOK;
+
+// Card field counts
+static const int CARD_FIELD_COUNT[4] = {
+    7,  // VIDEO:  VideoStd, Wide, 720p, 1080i, 480p, Letterbox, PAL60 (PAL60 hidden when not PAL)
+    3,  // AUDIO:  Mode, AC3, DTS
+    3,  // REGION: GameRegion, DvdRegion, Parental
+    1,  // TIME:   TZ picker (1 row)
+};
 
 // ============================================================================
 // Helpers
@@ -512,6 +542,20 @@ static int RowToField(int row)
 extern "C" LONG __stdcall ExQueryNonVolatileSetting(
     ULONG ValueIndex, ULONG* Type, void* Value, ULONG ValueLength, ULONG* ResultLength);
 
+extern "C" LONG __stdcall ExSaveNonVolatileSetting(
+    ULONG ValueIndex, ULONG Type, const void* Value, ULONG ValueLength);
+
+// XC_ index constants (ref: XAPI.H / PrometheOS XKEEPROM)
+#define XC_VIDEO_STANDARD       0x04    // DWORD at 0x48
+#define XC_VIDEO_FLAGS          0x05    // DWORD at 0x4C
+#define XC_AUDIO_FLAGS          0x06    // DWORD at 0x50
+#define XC_GAME_REGION          0x07    // DWORD at 0x54
+#define XC_DVD_REGION           0x08    // DWORD at 0x58
+#define XC_MAX_GAME_RATING      0x09    // DWORD at 0x5C
+#define XC_TIMEZONE_BIAS        0x0A    // int32 at 0x60 (minutes west)
+#define XC_TIMEZONE_STD_BIAS    0x0B    // int32 at 0x64 (DST offset)
+#define REG_DWORD               4       // type tag for ExSaveNonVolatileSetting
+
 static void ReadEeprom()
 {
     ULONG type = 0;
@@ -565,6 +609,11 @@ void EepromView_OnEnter()
     s_saveOK = false;
     s_loaded = false;
     s_readOK = false;
+    s_editCard = 0;
+    s_editCursor = 0;
+    s_editConfirm = false;
+    s_editWriteDone = false;
+    s_editWriteOK = false;
     // Zero the EEPROM buffer so a failed read always shows clean 00-fill,
     // not stale data from a previous visit.
     for (int i = 0; i < 256; ++i) s_eeprom[i] = 0;
@@ -662,9 +711,9 @@ static void RenderHex(const DiagLogo& logo)
 static void RenderDecoded(const DiagLogo& logo)
 {
     const char* hint = s_saveDone
-        ? (s_saveOK ? "[A] Saved OK    [Left] Hex    [B] Back"
-            : "[A] Save failed [Left] Hex    [B] Back")
-        : "[A] Save eeprom.bin    [Left] Hex    [B] Back";
+        ? (s_saveOK ? "[A] Saved OK    [Left] Hex    [Y] Edit    [B] Back"
+            : "[A] Save failed [Left] Hex    [Y] Edit    [B] Back")
+        : "[A] Save eeprom.bin    [Left] Hex    [Y] Edit    [B] Back";
 
     DrawPageChrome(logo, "EEPROM - DECODED VIEW", hint);
 
@@ -696,10 +745,6 @@ static void RenderDecoded(const DiagLogo& logo)
         const BYTE* p = s_eeprom + f.offset;
         float           rowY = hy + (fi - scrollTop) * LH;
 
-        // Alternate row tint
-        if ((fi & 1) == 0)
-            FillRect(LM2 - 2.f, rowY - 1.f, SW - LM, rowY + LH - 1.f, 0x10FFFFFF);
-
         // Field name
         DrawText(DEC_LBL_X, rowY, f.name, 1.15f, COL_YELLOW);
 
@@ -729,7 +774,612 @@ static void RenderDecoded(const DiagLogo& logo)
 }
 
 // ============================================================================
-// Tick
+// Timezone table — matches Xbox dashboard timezone list and kernel bias values.
+// stdBias: minutes WEST of UTC (kernel convention, negate for UTC+ display).
+// dstBias: additional DST offset in minutes (typically -60 = spring forward 1hr).
+//          0 = no DST observed.
+// ============================================================================
+
+struct TzEntry
+{
+    const char* name;   // display name shown to user
+    int         stdBias; // minutes west (stored at 0x60)
+    int         dstBias; // DST offset minutes (stored at 0x64), 0=no DST
+};
+
+static const TzEntry s_tzTable[] =
+{
+    // Name                             stdBias   dstBias
+    { "International Date Line West",    720,       0   }, // UTC-12
+    { "Midway Island, Samoa",            660,       0   }, // UTC-11
+    { "Hawaii",                          600,       0   }, // UTC-10 (no DST)
+    { "Alaska",                          540,     -60   }, // UTC-9
+    { "Pacific Time (US & Canada)",      480,     -60   }, // UTC-8
+    { "Mountain Time (US & Canada)",     420,     -60   }, // UTC-7
+    { "Arizona",                         420,       0   }, // UTC-7 no DST
+    { "Central Time (US & Canada)",      360,     -60   }, // UTC-6
+    { "Mexico City, Tegucigalpa",        360,     -60   }, // UTC-6
+    { "Saskatchewan",                    360,       0   }, // UTC-6 no DST
+    { "Eastern Time (US & Canada)",      300,     -60   }, // UTC-5
+    { "Indiana (East)",                  300,       0   }, // UTC-5 no DST
+    { "Bogota, Lima, Quito",             300,       0   }, // UTC-5 no DST
+    { "Atlantic Time (Canada)",          240,     -60   }, // UTC-4
+    { "Caracas, La Paz",                 240,       0   }, // UTC-4 no DST
+    { "Santiago",                        240,     -60   }, // UTC-4
+    { "Newfoundland",                    210,     -60   }, // UTC-3:30
+    { "Brasilia",                        180,     -60   }, // UTC-3
+    { "Buenos Aires, Georgetown",        180,       0   }, // UTC-3 no DST
+    { "Greenland",                       180,     -60   }, // UTC-3
+    { "Mid-Atlantic",                    120,     -60   }, // UTC-2
+    { "Azores",                           60,     -60   }, // UTC-1
+    { "Cape Verde Islands",               60,       0   }, // UTC-1 no DST
+    { "Greenwich Mean Time (GMT)",          0,       0   }, // UTC+0 no DST
+    { "Dublin, Edinburgh, London",          0,     -60   }, // UTC+0
+    { "Casablanca, Monrovia",               0,       0   }, // UTC+0 no DST
+    { "Amsterdam, Berlin, Rome",          -60,     -60   }, // UTC+1
+    { "Prague, Paris, Madrid",            -60,     -60   }, // UTC+1
+    { "West Central Africa",              -60,       0   }, // UTC+1 no DST
+    { "Athens, Istanbul, Minsk",         -120,     -60   }, // UTC+2
+    { "Bucharest, Cairo, Helsinki",      -120,     -60   }, // UTC+2
+    { "Jerusalem",                       -120,     -60   }, // UTC+2
+    { "Baghdad, Kuwait, Riyadh",         -180,       0   }, // UTC+3 no DST
+    { "Moscow, St. Petersburg",          -180,     -60   }, // UTC+3
+    { "Nairobi",                         -180,       0   }, // UTC+3 no DST
+    { "Tehran",                          -210,     -60   }, // UTC+3:30
+    { "Abu Dhabi, Muscat",               -240,       0   }, // UTC+4 no DST
+    { "Baku, Tbilisi, Yerevan",          -240,     -60   }, // UTC+4
+    { "Kabul",                           -270,       0   }, // UTC+4:30
+    { "Ekaterinburg",                    -300,     -60   }, // UTC+5
+    { "Islamabad, Karachi, Tashkent",    -300,       0   }, // UTC+5 no DST
+    { "Calcutta, Chennai, Mumbai",       -330,       0   }, // UTC+5:30
+    { "Kathmandu",                       -345,       0   }, // UTC+5:45
+    { "Almaty, Novosibirsk",             -360,     -60   }, // UTC+6
+    { "Astana, Dhaka",                   -360,       0   }, // UTC+6 no DST
+    { "Sri Jayawardenepura",             -360,       0   }, // UTC+6 no DST
+    { "Rangoon",                         -390,       0   }, // UTC+6:30
+    { "Bangkok, Hanoi, Jakarta",         -420,       0   }, // UTC+7 no DST
+    { "Krasnoyarsk",                     -420,     -60   }, // UTC+7
+    { "Beijing, Chongqing, Hong Kong",   -480,       0   }, // UTC+8 no DST
+    { "Kuala Lumpur, Singapore",         -480,       0   }, // UTC+8 no DST
+    { "Irkutsk, Ulaan Bataar",           -480,     -60   }, // UTC+8
+    { "Perth",                           -480,       0   }, // UTC+8 no DST
+    { "Taipei",                          -480,       0   }, // UTC+8 no DST
+    { "Osaka, Sapporo, Tokyo",           -540,       0   }, // UTC+9 no DST
+    { "Seoul",                           -540,       0   }, // UTC+9 no DST
+    { "Yakutsk",                         -540,     -60   }, // UTC+9
+    { "Adelaide",                        -570,     -60   }, // UTC+9:30
+    { "Darwin",                          -570,       0   }, // UTC+9:30 no DST
+    { "Brisbane",                        -600,       0   }, // UTC+10 no DST
+    { "Canberra, Melbourne, Sydney",     -600,     -60   }, // UTC+10
+    { "Guam, Port Moresby",              -600,       0   }, // UTC+10 no DST
+    { "Hobart",                          -600,     -60   }, // UTC+10
+    { "Vladivostok",                     -600,     -60   }, // UTC+10
+    { "Magadan, Solomon Is.",            -660,     -60   }, // UTC+11
+    { "Auckland, Wellington",            -720,     -60   }, // UTC+12
+    { "Fiji, Kamchatka",                 -720,       0   }, // UTC+12 no DST
+};
+static const int TZ_COUNT = sizeof(s_tzTable) / sizeof(s_tzTable[0]);
+
+// Find the closest matching entry index for current bias values
+static int TzFindIndex(int stdBias, int dstBias)
+{
+    // Exact match first
+    for (int i = 0; i < TZ_COUNT; ++i)
+        if (s_tzTable[i].stdBias == stdBias && s_tzTable[i].dstBias == dstBias)
+            return i;
+    // Fallback: match stdBias only
+    for (int i = 0; i < TZ_COUNT; ++i)
+        if (s_tzTable[i].stdBias == stdBias)
+            return i;
+    return 0;
+}
+// ============================================================================
+
+// Load working copies from s_eeprom
+static void EditLoadFromEeprom()
+{
+    s_editVideoStd = ReadDW(0x48);
+    s_editVideoFlags = ReadDW(0x4C);
+    s_editAudioFlags = ReadDW(0x50);
+    s_editGameRegion = ReadDW(0x54);
+    s_editDvdRegion = ReadDW(0x58);
+    s_editParental = ReadDW(0x5C);
+    s_editTzIndex = TzFindIndex((int)ReadDW(0x60), (int)ReadDW(0x64));
+}
+
+// Cycle an enum index by delta within [0, count-1]
+static int CycleEnum(int cur, int count, int delta)
+{
+    cur += delta;
+    if (cur < 0) cur = count - 1;
+    if (cur >= count) cur = 0;
+    return cur;
+}
+
+// Write all working copies back via ExSaveNonVolatileSetting
+static bool EditCommit()
+{
+    bool ok = true;
+    LONG r;
+    r = ExSaveNonVolatileSetting(XC_VIDEO_STANDARD, REG_DWORD, &s_editVideoStd, 4);
+    if (r != 0) ok = false;
+    r = ExSaveNonVolatileSetting(XC_VIDEO_FLAGS, REG_DWORD, &s_editVideoFlags, 4);
+    if (r != 0) ok = false;
+    r = ExSaveNonVolatileSetting(XC_AUDIO_FLAGS, REG_DWORD, &s_editAudioFlags, 4);
+    if (r != 0) ok = false;
+    r = ExSaveNonVolatileSetting(XC_GAME_REGION, REG_DWORD, &s_editGameRegion, 4);
+    if (r != 0) ok = false;
+    r = ExSaveNonVolatileSetting(XC_DVD_REGION, REG_DWORD, &s_editDvdRegion, 4);
+    if (r != 0) ok = false;
+    r = ExSaveNonVolatileSetting(XC_MAX_GAME_RATING, REG_DWORD, &s_editParental, 4);
+    if (r != 0) ok = false;
+    ULONG tzStd = (ULONG)s_tzTable[s_editTzIndex].stdBias;
+    r = ExSaveNonVolatileSetting(XC_TIMEZONE_BIAS, REG_DWORD, &tzStd, 4);
+    if (r != 0) ok = false;
+    ULONG tzDst = (ULONG)s_tzTable[s_editTzIndex].dstBias;
+    r = ExSaveNonVolatileSetting(XC_TIMEZONE_STD_BIAS, REG_DWORD, &tzDst, 4);
+    if (r != 0) ok = false;
+    // Re-read EEPROM so decoded/hex views reflect new state
+    ReadEeprom();
+    return ok;
+}
+
+// ============================================================================
+// Edit view — input handling (called from Tick while s_view == VIEW_EDIT)
+// ============================================================================
+
+static void EditHandleInput(WORD cur)
+{
+    // Confirm overlay eats all input except A=yes / B=no
+    if (s_editConfirm)
+    {
+        if (EdgeDown(cur, s_prevBtns, BTN_A))
+        {
+            s_editConfirm = false;
+            s_editWriteOK = EditCommit();
+            s_editWriteDone = true;
+        }
+        if (EdgeDown(cur, s_prevBtns, BTN_B))
+            s_editConfirm = false;
+        return;
+    }
+
+    // After write result: any button dismisses back to decoded
+    if (s_editWriteDone)
+    {
+        s_view = VIEW_DECODED;
+        s_editWriteDone = false;
+        return;
+    }
+
+    // B = discard, back to decoded
+    if (EdgeDown(cur, s_prevBtns, BTN_B))
+    {
+        s_view = VIEW_DECODED;
+        return;
+    }
+
+    // A = request confirm
+    if (EdgeDown(cur, s_prevBtns, BTN_A))
+    {
+        s_editConfirm = true;
+        return;
+    }
+
+    // Left/Right pages between cards
+    if (EdgeDown(cur, s_prevBtns, BTN_DPAD_LEFT))
+    {
+        if (s_editCard > 0) --s_editCard;
+        s_editCursor = 0;
+        return;
+    }
+    if (EdgeDown(cur, s_prevBtns, BTN_DPAD_RIGHT))
+    {
+        if (s_editCard < 3) ++s_editCard;
+        s_editCursor = 0;
+        return;
+    }
+
+    // Up/Down moves cursor
+    int fieldCount = CARD_FIELD_COUNT[s_editCard];
+    if (s_editCard == 0 && s_editVideoStd != 3)
+        fieldCount = 6; // hide PAL-60 slot (cursor 6) when standard is not PAL
+
+    if (EdgeDown(cur, s_prevBtns, BTN_DPAD_UP))
+    {
+        if (s_editCursor > 0) --s_editCursor;
+        return;
+    }
+    if (EdgeDown(cur, s_prevBtns, BTN_DPAD_DOWN))
+    {
+        if (s_editCursor < fieldCount - 1) ++s_editCursor;
+        return;
+    }
+
+    // X/Y = cycle value left/right
+    int delta = 0;
+    if (EdgeDown(cur, s_prevBtns, BTN_X)) delta = -1;
+    if (EdgeDown(cur, s_prevBtns, BTN_Y)) delta = 1;
+    if (delta == 0) return;
+
+    switch (s_editCard)
+    {
+    case 0: // VIDEO
+        switch (s_editCursor)
+        {
+        case 0: // Video Standard — enum 1-3
+        {
+            int idx = (int)s_editVideoStd - 1; // 0-based
+            idx = CycleEnum(idx, 3, delta);
+            s_editVideoStd = (DWORD)(idx + 1);
+            // If leaving PAL, clear PAL-60 flag
+            if (s_editVideoStd != 3)
+                s_editVideoFlags &= ~0x00000040;
+            break;
+        }
+        case 1: s_editVideoFlags ^= 0x00000001; break; // Widescreen
+        case 2: s_editVideoFlags ^= 0x00000002; break; // 720p
+        case 3: s_editVideoFlags ^= 0x00000004; break; // 1080i
+        case 4: s_editVideoFlags ^= 0x00000008; break; // 480p
+        case 5: s_editVideoFlags ^= 0x00000010; break; // Letterbox
+        case 6: s_editVideoFlags ^= 0x00000040; break; // PAL 60Hz (only reachable when PAL)
+        }
+        break;
+
+    case 1: // AUDIO
+        switch (s_editCursor)
+        {
+        case 0: // Audio mode — enum Stereo(0)/Mono(1)/Surround(2)
+        {
+            DWORD mode = s_editAudioFlags & 0x0000FFFF;
+            int idx = (int)mode;
+            if (idx > 2) idx = 0;
+            idx = CycleEnum(idx, 3, delta);
+            s_editAudioFlags = (s_editAudioFlags & 0xFFFF0000) | (DWORD)idx;
+            break;
+        }
+        case 1: s_editAudioFlags ^= 0x00010000; break; // AC3
+        case 2: s_editAudioFlags ^= 0x00020000; break; // DTS
+        }
+        break;
+
+    case 2: // REGION
+        switch (s_editCursor)
+        {
+        case 0: // Game region — enum 0-4 (NA/Japan/RoW/Mfg/All)
+        {
+            static const DWORD gameRegVals[5] = {
+                0x00000001, 0x00000002, 0x00000004,
+                0x80000000, 0xFFFFFFFF
+            };
+            // Find current index
+            int idx = 0;
+            for (int i = 0; i < 5; ++i)
+                if (s_editGameRegion == gameRegVals[i]) { idx = i; break; }
+            idx = CycleEnum(idx, 5, delta);
+            s_editGameRegion = gameRegVals[idx];
+            break;
+        }
+        case 1: // DVD region — 1-6
+        {
+            int idx = (int)s_editDvdRegion - 1;
+            if (idx < 0 || idx > 5) idx = 0;
+            idx = CycleEnum(idx, 6, delta);
+            s_editDvdRegion = (DWORD)(idx + 1);
+            break;
+        }
+        case 2: // Parental — 0-6
+        {
+            int idx = (int)s_editParental;
+            if (idx < 0 || idx > 6) idx = 0;
+            idx = CycleEnum(idx, 7, delta);
+            s_editParental = (DWORD)idx;
+            break;
+        }
+        }
+        break;
+
+    case 3: // TIME
+        switch (s_editCursor)
+        {
+        case 0:
+            s_editTzIndex = CycleEnum(s_editTzIndex, TZ_COUNT, delta);
+            break;
+        }
+        break;
+    }
+}
+
+// ============================================================================
+// Edit view — render
+// ============================================================================
+
+static void RenderEdit(const DiagLogo& logo)
+{
+    // Build page indicator "< VIDEO >" etc.
+    static const char* cardNames[4] = { "VIDEO", "AUDIO", "REGION", "TIME" };
+    char title[48];
+    SafeCopy(title, sizeof(title), "EEPROM EDIT  [");
+    IntToStr(s_editCard + 1, title + StrLen(title), 4);
+    SafeAppend(title, sizeof(title), "/4] ");
+    SafeAppend(title, sizeof(title), cardNames[s_editCard]);
+
+    const char* hint = s_editConfirm
+        ? "[A] Confirm write    [B] Cancel"
+        : "[Up/Dn] Select  [X/Y] Change  [A] Write  [B] Discard  [Lft/Rt] Page";
+
+    DrawPageChrome(logo, title, hint);
+
+    float y = CY + 4.f;
+    const float ROW = LH + 2.f;
+    const float LBL_X = LM2;
+    const float VAL_X = LM2 + 220.f;
+
+    // Confirm overlay
+    if (s_editConfirm)
+    {
+        float bx = 80.f, by = 140.f, bw = 480.f, bh = 100.f;
+        FillRect(bx, by, bx + bw, by + bh, 0xE0101010);
+        HLine(by, bx, bx + bw, COL_YELLOW);
+        HLine(by + bh, bx, bx + bw, COL_YELLOW);
+        VLine(bx, by, by + bh, COL_YELLOW);
+        VLine(bx + bw, by, by + bh, COL_YELLOW);
+        DrawText(bx + 16.f, by + 14.f, "WRITE EEPROM SETTINGS?", 1.3f, COL_YELLOW);
+        DrawText(bx + 16.f, by + 36.f, "This will update: Video, Audio, Region, Timezone.", 1.1f, COL_WHITE);
+        DrawText(bx + 16.f, by + 52.f, "The kernel recalculates the HMAC automatically.", 1.1f, COL_GRAY);
+        DrawText(bx + 16.f, by + 70.f, "[A] Yes, write    [B] Cancel", 1.2f, COL_WHITE);
+        return;
+    }
+
+    // Write result overlay
+    if (s_editWriteDone)
+    {
+        float bx = 80.f, by = 160.f, bw = 480.f, bh = 70.f;
+        FillRect(bx, by, bx + bw, by + bh, 0xE0101010);
+        DWORD borderCol = s_editWriteOK ? COL_GREEN : COL_RED;
+        HLine(by, bx, bx + bw, borderCol);
+        HLine(by + bh, bx, bx + bw, borderCol);
+        VLine(bx, by, by + bh, borderCol);
+        VLine(bx + bw, by, by + bh, borderCol);
+        if (s_editWriteOK)
+            DrawText(bx + 16.f, by + 20.f, "WRITE OK  - Settings saved.", 1.3f, s_editWriteOK ? COL_GREEN : COL_RED);
+        else
+            DrawText(bx + 16.f, by + 20.f, "WRITE FAILED - One or more settings not saved.", 1.2f, COL_RED);
+        DrawText(bx + 16.f, by + 44.f, "Press any button to return.", 1.1f, COL_GRAY);
+        return;
+    }
+
+    // Card page nav arrows
+    if (s_editCard > 0)
+        DrawText(LM2, y, "<  [Left]", 1.1f, COL_GRAY);
+    if (s_editCard < 3)
+        DrawText(SW - LM - 72.f, y, "[Right]  >", 1.1f, COL_GRAY);
+    y += ROW + 2.f;
+    HLine(y - 2.f, LM2, SW - LM, COL_BORDER);
+
+    char buf[48];
+    char t[16];
+
+    switch (s_editCard)
+    {
+        // ------------------------------------------------------------------
+    case 0: // VIDEO
+    {
+        // Row 0: Video Standard
+        {
+            bool sel = (s_editCursor == 0);
+            DrawText(LBL_X, y, "Video Standard", 1.2f, sel ? COL_YELLOW : COL_WHITE);
+            static const char* vstd[3] = { "NTSC-M (N.America)", "NTSC-J (Japan)", "PAL (Europe/AUS)" };
+            int idx = (int)s_editVideoStd - 1;
+            if (idx < 0 || idx > 2) idx = 0;
+            SafeCopy(buf, sizeof(buf), sel ? "< " : "  ");
+            SafeAppend(buf, sizeof(buf), vstd[idx]);
+            if (sel) SafeAppend(buf, sizeof(buf), " >");
+            DrawText(VAL_X, y, buf, 1.2f, sel ? COL_CYAN : COL_WHITE);
+            y += ROW;
+        }
+
+        // Helper macro-style: bitmask rows
+        struct { const char* lbl; DWORD bit; } vflags[5] = {
+            { "Widescreen",  0x00000001 },
+            { "HDTV 720p",   0x00000002 },
+            { "HDTV 1080i",  0x00000004 },
+            { "HDTV 480p",   0x00000008 },
+            { "Letterbox",   0x00000010 },
+        };
+        for (int i = 0; i < 5; ++i)
+        {
+            bool sel = (s_editCursor == i + 1);
+            DrawText(LBL_X + 16.f, y, vflags[i].lbl, 1.15f, sel ? COL_YELLOW : COL_WHITE);
+            bool on = (s_editVideoFlags & vflags[i].bit) != 0;
+            DrawText(VAL_X, y, on ? "[X] ON" : "[ ] OFF", 1.15f,
+                sel ? (on ? COL_GREEN : COL_RED) : (on ? COL_CYAN : COL_GRAY));
+            y += ROW;
+        }
+
+        // PAL-60 — only shown when PAL is selected
+        if (s_editVideoStd == 3)
+        {
+            bool sel = (s_editCursor == 6);
+            DrawText(LBL_X + 16.f, y, "PAL 60Hz", 1.15f, sel ? COL_YELLOW : COL_WHITE);
+            bool on = (s_editVideoFlags & 0x00000040) != 0;
+            DrawText(VAL_X, y, on ? "[X] ON" : "[ ] OFF", 1.15f,
+                sel ? (on ? COL_GREEN : COL_RED) : (on ? COL_CYAN : COL_GRAY));
+            y += ROW;
+        }
+        break;
+    }
+
+    // ------------------------------------------------------------------
+    case 1: // AUDIO
+    {
+        // Row 0: Audio mode
+        {
+            bool sel = (s_editCursor == 0);
+            DrawText(LBL_X, y, "Audio Output", 1.2f, sel ? COL_YELLOW : COL_WHITE);
+            static const char* amodes[3] = { "Stereo", "Mono", "Surround" };
+            DWORD mode = s_editAudioFlags & 0x0000FFFF;
+            int idx = (int)mode;
+            if (idx > 2) idx = 0;
+            SafeCopy(buf, sizeof(buf), sel ? "< " : "  ");
+            SafeAppend(buf, sizeof(buf), amodes[idx]);
+            if (sel) SafeAppend(buf, sizeof(buf), " >");
+            DrawText(VAL_X, y, buf, 1.2f, sel ? COL_CYAN : COL_WHITE);
+            y += ROW;
+        }
+
+        // Row 1: AC3
+        {
+            bool sel = (s_editCursor == 1);
+            DrawText(LBL_X + 16.f, y, "Dolby Digital (AC3)", 1.15f, sel ? COL_YELLOW : COL_WHITE);
+            bool on = (s_editAudioFlags & 0x00010000) != 0;
+            DrawText(VAL_X, y, on ? "[X] ON" : "[ ] OFF", 1.15f,
+                sel ? (on ? COL_GREEN : COL_RED) : (on ? COL_CYAN : COL_GRAY));
+            y += ROW;
+        }
+
+        // Row 2: DTS
+        {
+            bool sel = (s_editCursor == 2);
+            DrawText(LBL_X + 16.f, y, "DTS", 1.15f, sel ? COL_YELLOW : COL_WHITE);
+            bool on = (s_editAudioFlags & 0x00020000) != 0;
+            DrawText(VAL_X, y, on ? "[X] ON" : "[ ] OFF", 1.15f,
+                sel ? (on ? COL_GREEN : COL_RED) : (on ? COL_CYAN : COL_GRAY));
+            y += ROW;
+        }
+        break;
+    }
+
+    // ------------------------------------------------------------------
+    case 2: // REGION
+    {
+        // Warning banner
+        DrawText(LBL_X, y, "! Changing Game Region may affect which games boot !", 1.1f, COL_RED);
+        y += ROW;
+
+        // Row 0: Game Region
+        {
+            bool sel = (s_editCursor == 0);
+            DrawText(LBL_X, y, "Game Region", 1.2f, sel ? COL_YELLOW : COL_WHITE);
+            static const char* greg[5] = {
+                "N. America", "Japan", "Rest of World", "Manufacturing", "ALL (debug)"
+            };
+            static const DWORD gregVals[5] = {
+                0x00000001, 0x00000002, 0x00000004, 0x80000000, 0xFFFFFFFF
+            };
+            int idx = 0;
+            for (int i = 0; i < 5; ++i)
+                if (s_editGameRegion == gregVals[i]) { idx = i; break; }
+            SafeCopy(buf, sizeof(buf), sel ? "< " : "  ");
+            SafeAppend(buf, sizeof(buf), greg[idx]);
+            if (sel) SafeAppend(buf, sizeof(buf), " >");
+            DrawText(VAL_X, y, buf, 1.2f, sel ? COL_CYAN : COL_WHITE);
+            y += ROW;
+        }
+
+        // Row 1: DVD Region
+        {
+            bool sel = (s_editCursor == 1);
+            DrawText(LBL_X, y, "DVD Region", 1.2f, sel ? COL_YELLOW : COL_WHITE);
+            static const char* dvdr[6] = {
+                "1 (USA/CA)", "2 (EUR/JPN)", "3 (SE Asia)",
+                "4 (AUS/LAT)", "5 (USSR)", "6 (China)"
+            };
+            int idx = (int)s_editDvdRegion - 1;
+            if (idx < 0 || idx > 5) idx = 0;
+            SafeCopy(buf, sizeof(buf), sel ? "< " : "  ");
+            SafeAppend(buf, sizeof(buf), dvdr[idx]);
+            if (sel) SafeAppend(buf, sizeof(buf), " >");
+            DrawText(VAL_X, y, buf, 1.2f, sel ? COL_CYAN : COL_WHITE);
+            y += ROW;
+        }
+
+        // Row 2: Parental Control
+        {
+            bool sel = (s_editCursor == 2);
+            DrawText(LBL_X, y, "Parental Control", 1.2f, sel ? COL_YELLOW : COL_WHITE);
+            static const char* pcr[7] = {
+                "DISABLED (All)", "Adults Only", "Mature (M)",
+                "Teen (T)", "Everyone (E)", "Kids to Adults", "Early Childhood"
+            };
+            int idx = (int)s_editParental;
+            if (idx < 0 || idx > 6) idx = 0;
+            SafeCopy(buf, sizeof(buf), sel ? "< " : "  ");
+            SafeAppend(buf, sizeof(buf), pcr[idx]);
+            if (sel) SafeAppend(buf, sizeof(buf), " >");
+            DrawText(VAL_X, y, buf, 1.2f, sel ? COL_CYAN : COL_WHITE);
+            y += ROW;
+        }
+        break;
+    }
+
+    // ------------------------------------------------------------------
+    case 3: // TIME
+    {
+        DrawText(LBL_X, y, "Select your timezone  [X] Prev  [Y] Next", 1.1f, COL_GRAY);
+        y += ROW;
+        HLine(y - 2.f, LM2, SW - LM, COL_BORDER);
+        y += 4.f;
+
+        // Show a context window of 5 entries centred on selected
+        const int CTX = 5;
+        int half = CTX / 2;
+        for (int i = 0; i < CTX; ++i)
+        {
+            int idx = s_editTzIndex - half + i;
+            if (idx < 0 || idx >= TZ_COUNT) { y += ROW; continue; }
+            bool sel = (idx == s_editTzIndex);
+            if (sel)
+                FillRect(LBL_X - 4.f, y - 1.f, SW - LM, y + LH, 0x30204060);
+
+            // Arrow indicator on selected row
+            DrawText(LBL_X, y, sel ? ">" : " ", 1.2f, COL_YELLOW);
+            DrawText(LBL_X + 14.f, y, s_tzTable[idx].name, 1.15f,
+                sel ? COL_CYAN : COL_GRAY);
+
+            // UTC offset on right side for selected row
+            if (sel)
+            {
+                char utcStr[16];
+                int display = -s_tzTable[idx].stdBias;
+                int hrs = display / 60;
+                int mins = display % 60;
+                if (mins < 0) mins = -mins;
+                SafeCopy(utcStr, sizeof(utcStr), "UTC");
+                char t2[8];
+                if (hrs >= 0) SafeAppend(utcStr, sizeof(utcStr), "+");
+                IntToStr(hrs, t2, sizeof(t2)); SafeAppend(utcStr, sizeof(utcStr), t2);
+                if (mins)
+                {
+                    SafeAppend(utcStr, sizeof(utcStr), ":");
+                    if (mins < 10) SafeAppend(utcStr, sizeof(utcStr), "0");
+                    IntToStr(mins, t2, sizeof(t2)); SafeAppend(utcStr, sizeof(utcStr), t2);
+                }
+                DrawText(VAL_X + 60.f, y, utcStr, 1.15f, COL_WHITE);
+
+                // DST note
+                if (s_tzTable[idx].dstBias != 0)
+                    DrawText(VAL_X + 120.f, y, "DST", 1.1f, COL_GREEN);
+                else
+                    DrawText(VAL_X + 120.f, y, "No DST", 1.1f, COL_GRAY);
+            }
+            y += ROW;
+        }
+
+        // Scroll position indicator
+        char posStr[24];
+        SafeCopy(posStr, sizeof(posStr), "  ");
+        char t2[8];
+        IntToStr(s_editTzIndex + 1, t2, sizeof(t2)); SafeAppend(posStr, sizeof(posStr), t2);
+        SafeAppend(posStr, sizeof(posStr), " / ");
+        IntToStr(TZ_COUNT, t2, sizeof(t2)); SafeAppend(posStr, sizeof(posStr), t2);
+        DrawText(LBL_X, y + 4.f, posStr, 1.05f, COL_GRAY);
+        break;
+    }
+    } // end switch card
+}
+
+// ============================================================================
 // ============================================================================
 
 void EepromView_Tick(const DiagLogo& logo)
@@ -748,42 +1398,68 @@ void EepromView_Tick(const DiagLogo& logo)
 
     WORD cur = GetButtons();
 
-    if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
+    // Global B/Back — but not when edit view owns input
+    if (s_view != VIEW_EDIT)
     {
-        RequestState(MSTATE_MENU);
-        s_prevBtns = cur;
-        return;
+        if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
+        {
+            RequestState(MSTATE_MENU);
+            s_prevBtns = cur;
+            return;
+        }
     }
 
-    if (EdgeDown(cur, s_prevBtns, BTN_DPAD_RIGHT))
-        s_view = VIEW_DECODED;
-
-    if (EdgeDown(cur, s_prevBtns, BTN_DPAD_LEFT))
-        s_view = VIEW_HEX;
-
-    if (EdgeDown(cur, s_prevBtns, BTN_A))
-        SaveBin();
-
-    if (s_view == VIEW_HEX)
+    if (s_view == VIEW_EDIT)
     {
-        if (EdgeDown(cur, s_prevBtns, BTN_DPAD_UP))
-        {
-            if (s_hexCurRow > 0)  --s_hexCurRow;
-        }
-        if (EdgeDown(cur, s_prevBtns, BTN_DPAD_DOWN))
-        {
-            if (s_hexCurRow < 15) ++s_hexCurRow;
-        }
+        // Edit view owns all input
+        EditHandleInput(cur);
     }
     else
     {
-        if (EdgeDown(cur, s_prevBtns, BTN_DPAD_UP))
+        // Left/Right only switches views when NOT in edit mode
+        if (EdgeDown(cur, s_prevBtns, BTN_DPAD_RIGHT))
+            s_view = VIEW_DECODED;
+
+        if (EdgeDown(cur, s_prevBtns, BTN_DPAD_LEFT))
+            s_view = VIEW_HEX;
+
+        if (EdgeDown(cur, s_prevBtns, BTN_A))
+            SaveBin();
+
+        // Y enters edit view from decoded
+        if (s_view == VIEW_DECODED && EdgeDown(cur, s_prevBtns, BTN_Y))
         {
-            if (s_decScroll > 0) --s_decScroll;
+            s_editCard = 0;
+            s_editCursor = 0;
+            s_editConfirm = false;
+            s_editWriteDone = false;
+            EditLoadFromEeprom();
+            s_view = VIEW_EDIT;
+            s_prevBtns = cur;
+            return;
         }
-        if (EdgeDown(cur, s_prevBtns, BTN_DPAD_DOWN))
+
+        if (s_view == VIEW_HEX)
         {
-            if (s_decScroll < NUM_FIELDS - DEC_VISIBLE) ++s_decScroll;
+            if (EdgeDown(cur, s_prevBtns, BTN_DPAD_UP))
+            {
+                if (s_hexCurRow > 0)  --s_hexCurRow;
+            }
+            if (EdgeDown(cur, s_prevBtns, BTN_DPAD_DOWN))
+            {
+                if (s_hexCurRow < 15) ++s_hexCurRow;
+            }
+        }
+        else
+        {
+            if (EdgeDown(cur, s_prevBtns, BTN_DPAD_UP))
+            {
+                if (s_decScroll > 0) --s_decScroll;
+            }
+            if (EdgeDown(cur, s_prevBtns, BTN_DPAD_DOWN))
+            {
+                if (s_decScroll < NUM_FIELDS - DEC_VISIBLE) ++s_decScroll;
+            }
         }
     }
 
@@ -792,8 +1468,10 @@ void EepromView_Tick(const DiagLogo& logo)
     g_pDevice->BeginScene();
     if (s_view == VIEW_HEX)
         RenderHex(logo);
-    else
+    else if (s_view == VIEW_DECODED)
         RenderDecoded(logo);
+    else
+        RenderEdit(logo);
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
 }

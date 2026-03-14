@@ -318,7 +318,41 @@ static void Render(const DiagLogo& logo, WORD cur,
         "[START+A] Rumble   [START+B] Exit");
 
     // =========================================================
-    // TRIGGERS  — top row, positioned like shoulder buttons
+    // PORT STATUS STRIP  — centered, above trigger bars
+    // Four boxes: green=connected, dark=disconnected
+    // =========================================================
+    {
+        const float PBW = 46.f;   // box width
+        const float PBH = 20.f;   // box height
+        const float PGAP = 6.f;    // gap between boxes
+        const float totalW = PBW * 4.f + PGAP * 3.f;
+        float px = X_MID - totalW * 0.5f;
+        float py = B + 8.f;
+
+        const char* portLabels[4] = { "1", "2", "3", "4" };
+        for (int p = 0; p < 4; ++p)
+        {
+            bool conn = IsPortConnected(p);
+            float x0 = px + (PBW + PGAP) * (float)p;
+            float x1 = x0 + PBW;
+            float y0 = py;
+            float y1 = py + PBH;
+            float cx = (x0 + x1) * 0.5f;
+            float cy = (y0 + y1) * 0.5f;
+
+            DWORD fill = conn ? D3DCOLOR_XRGB(10, 40, 18) : D3DCOLOR_XRGB(10, 14, 32);
+            DWORD border = conn ? D3DCOLOR_XRGB(80, 255, 110) : COL_BORDER;
+            DWORD tc = conn ? COL_GREEN : COL_DIM;
+
+            FillRect(x0, y0, x1, y1, fill);
+            HLine(y0, x0, x1, border);
+            HLine(y1, x0, x1, border);
+            VLine(x0, y0, y1, border);
+            VLine(x1, y0, y1, border);
+            DrawText(cx - TW(portLabels[p], 1.2f) * 0.5f, cy - 5.f,
+                portLabels[p], 1.2f, tc);
+        }
+    }
     // LT left, RT right
     // =========================================================
 
@@ -338,22 +372,22 @@ static void Render(const DiagLogo& logo, WORD cur,
     Box(metaLCX + WBW * 0.5f + 4.f, metaY,
         WBW, WBH, "START", 1.1f, (cur & BTN_START) != 0);
 
-    // BLACK and WHITE centered around X_MID + 80
+    // WHITE (left) and BLACK (right) — matches physical controller layout
     float metaRCX = X_MID + 90.f;
-    float blkCX = metaRCX - WBW * 0.5f - 4.f;
-    float whtCX = metaRCX + WBW * 0.5f + 4.f;
-    Box(blkCX, metaY, WBW, WBH, "BLK", 1.1f, (cur & BTN_BLACK) != 0);
+    float whtCX = metaRCX - WBW * 0.5f - 4.f;
+    float blkCX = metaRCX + WBW * 0.5f + 4.f;
     Box(whtCX, metaY, WBW, WBH, "WHT", 1.1f, (cur & BTN_WHITE) != 0);
+    Box(blkCX, metaY, WBW, WBH, "BLK", 1.1f, (cur & BTN_BLACK) != 0);
 
-    // Analog value readout below BLACK/WHITE
+    // Analog value readout below WHITE/BLACK
     {
         char bv[5], wv[5];
         IntToStr(blk, bv, sizeof(bv));
         IntToStr(wht, wv, sizeof(wv));
         DWORD bc = blk > 30 ? COL_CYAN : COL_DIM;
         DWORD wc = wht > 30 ? COL_CYAN : COL_DIM;
-        DrawText(blkCX - TW(bv, 1.05f) * 0.5f, metaY + WBH * 0.5f + 4.f, bv, 1.05f, bc);
         DrawText(whtCX - TW(wv, 1.05f) * 0.5f, metaY + WBH * 0.5f + 4.f, wv, 1.05f, wc);
+        DrawText(blkCX - TW(bv, 1.05f) * 0.5f, metaY + WBH * 0.5f + 4.f, bv, 1.05f, bc);
     }
 
     // =========================================================

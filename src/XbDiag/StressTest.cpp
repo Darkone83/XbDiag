@@ -25,21 +25,21 @@
 // CPU stress kernel
 // ===========================================================================
 //
-// Coppermine Pentium III (733MHz) has:
-//   L1 cache: 32KB data
-//   L2 cache: 256KB (on-die, half-speed)
-//   FPU:      fully pipelined, 1 fmul + 1 fadd per clock (dual-issue)
+// Coppermine Pentium III (733MHz):
+//   L1: 32KB data (working set sized to fit exactly)
+//   L2: 256KB on-die half-speed
+//   FPU: fully pipelined, dual-issue FMUL+FADD on independent ops
 //
-// Strategy: keep a 4KB float array (fits entirely in L1) and hammer it with
-// fmul+fadd pairs every iteration.  This is what Prime95 small-FFT mode does
-// on this class of CPU — it's the FPU that generates heat, not integer work.
+// Kernels sourced from Prime95 gwnum library (lucas.mac).
+// All four passes from the one-pass x87 DWT small-FFT torture path:
 //
-// The kernel runs from after Present until the next frame's input poll,
-// so it occupies the full inter-frame gap.  We do NOT cap it to 20ms —
-// we spin the entire time the test is running, yielding only for the
-// DrawPageChrome + Present call (a few hundred µs at most).
+//   EightRealsSweep      eight_reals_fft_cmn    52 clocks/block   2 fmuls
+//   FourComplexSweep     four_complex_fft_cmn   64 clocks/block  12 fmuls
+//   FourComplexSquare    four_complex_square   144 clocks/block  32 fmuls
+//   FourComplexUnfftSweep four_complex_unfft_cmn 65 clocks/block 12 fmuls
 //
-// Load % reported: always 100 while RUNNING (we are saturating the FPU).
+// Working set: SM_N=4096 doubles = 32KB, fills Coppermine L1 exactly.
+// See StressMath.cpp for kernel implementation and coverage numbers.
 //
 // ===========================================================================
 // Abort UX
@@ -52,6 +52,7 @@
 // ===========================================================================
 
 #include "StressTest.h"
+#include "StressMath.h"
 #include "font.h"
 #include "input.h"
 #include <xtl.h>
@@ -64,7 +65,8 @@ static const int MSTATE_MENU = 0;
 // ============================================================================
 
 static const int   HISTORY_LEN = 128;
-static const DWORD SAMPLE_INTERVAL_MS = 500;
+static const DWORD SAMPLE_INTERVAL_MS = 500;   // idle/confirm/threshold
+static const DWORD SAMPLE_INTERVAL_BURN_MS = 1500;  // running — reduces SMBus traffic during soak
 static const DWORD ABORT_HOLD_MS = 5000;
 
 // CPU temp thresholds
@@ -72,8 +74,7 @@ static const int CPU_WARN = 65;
 static const int CPU_HOT = 80;
 static const int GRAPH_MAX = 100;
 
-// FPU stress working set — 4KB, guaranteed fits in Coppermine L1 (32KB)
-static const int FPU_WORK_FLOATS = 1024;  // 1024 * 4 = 4096 bytes
+
 
 // ============================================================================
 // Layout (all Y values are in 640x480 design space)
@@ -136,19 +137,18 @@ static WORD        s_prevBtns = 0;
 
 // Current sensor readings
 static BYTE  s_curCPU = 0;
+static BYTE  s_curMB = 0;   // motherboard temp (PIC reg 0x0A)
 static BYTE  s_curFan = 0;   // raw 0-50 from PIC; display = val*2 %
 static int   s_curMHz = 733;
 static bool  s_sensorOK = false;
 static bool  s_fanOK = false;
+static bool  s_mbOK = false;
 
-// Sensor path
-enum SensorPath { PATH_UNKNOWN = 0, PATH_ADM1032, PATH_PIC_16 };
-static SensorPath s_path = PATH_UNKNOWN;
-
-// PIC averaging
-static int s_avg_cpu_acc = 0;
-static int s_avg_count = 0;
-static const int AVG_SAMPLES = 10;
+// Sensor path: always PIC reg 0x09 for CPU temp (SMC proxies ADM1032 on
+// pre-1.6 boards internally — no need to read ADM1032 directly).
+// 1.6 detection: probe Xcalibur encoder at 0x70; ACK = 1.6 board.
+static bool s_pathKnown = false;
+static bool s_is16 = false;   // true on v1.6 — MB temp needs *0.8-3.556 correction
 
 // Ring buffers
 static BYTE s_histCPU[HISTORY_LEN];
@@ -160,6 +160,12 @@ static int  s_histCount = 0;
 static DWORD s_lastSample = 0;
 static DWORD s_testStartMs = 0;
 
+// Min/max tracking -- reset on test start, updated each sample while running
+static BYTE  s_minCPU = 255;
+static BYTE  s_maxCPU = 0;
+static BYTE  s_minFan = 255;
+static BYTE  s_maxFan = 0;
+
 // Abort hold
 static bool  s_abortHolding = false;
 static DWORD s_abortHoldStart = 0;
@@ -168,9 +174,17 @@ static DWORD s_abortHoldStart = 0;
 static int s_tempThreshold = 75;
 static bool s_thermalAbort = false;  // set true if test stopped by over-temp
 
-// FPU stress working array — static so it's never on the stack
-// Initialised to non-zero in OnEnter so the FPU doesn't short-circuit on 0.0f
-static float s_fpuWork[FPU_WORK_FLOATS];
+// Render interval during CPU stress (ms) — ~10fps keeps the NV2A watchdog
+// fed while burning almost all available CPU time between frames.
+static const DWORD RENDER_INTERVAL_MS = 100;
+static DWORD s_nextRender = 0;
+
+// Real load measurement — tracks actual time spent inside CPUStress()
+// per sample window so we can display a true duty-cycle % instead of
+// hardcoding 100.
+static DWORD s_burnAccumMs = 0;   // ms spent in CPUStress() this window
+static DWORD s_windowStartMs = 0;  // when the current sample window opened
+static BYTE  s_measuredLoad = 0;   // last computed load % (0-100)
 
 // ============================================================================
 // Helpers
@@ -209,6 +223,14 @@ static void PushHistory(BYTE cpu, BYTE load, BYTE fan)
     s_histCPU[wi] = cpu;
     s_histLoad[wi] = load;
     s_histFan[wi] = fan;
+
+    if (s_state == SSTATE_RUNNING)
+    {
+        if (cpu < s_minCPU) s_minCPU = cpu;
+        if (cpu > s_maxCPU) s_maxCPU = cpu;
+        if (fan < s_minFan) s_minFan = fan;
+        if (fan > s_maxFan) s_maxFan = fan;
+    }
 }
 
 // ============================================================================
@@ -231,99 +253,94 @@ static int ReadCPUMHz()
 }
 
 // ============================================================================
-// Sensor sample — mirrors TempMonitor TakeSample, CPU die only
+// Sensor sample — reads CPU temp, MB temp, and fan speed from PIC/SMC.
 // ============================================================================
 
 static void TakeSample()
 {
-    BYTE cpu = 0;
-    bool ok = false;
-
-    if (s_path == PATH_UNKNOWN)
+    // ---- Path detection (one-shot) ----------------------------------------
+    // Always read CPU temp from PIC reg 0x09 — the SMC proxies the ADM1032
+    // internally on 1.0-1.5, so this works on all revisions without a direct
+    // ADM1032 read.  1.6 detection: probe Xcalibur encoder at 0x70 (only
+    // present on 1.6 boards).
+    if (!s_pathKnown)
     {
-        BYTE p = 0;
-        s_path = SMBusRead(SMBADDR_ADM1032, 0x00, p)
-            ? PATH_ADM1032 : PATH_PIC_16;
+        BYTE dummy = 0;
+        s_is16 = SMBusRead(0xE0, 0x00, dummy);  // Xcalibur at 0x70<<1=0xE0
+        // Only commit once PIC responds — avoids locking wrong is16 if
+        // the bus is busy at first sample time.
+        BYTE probe = 0;
+        if (SMBusRead(SMBADDR_PIC, 0x09, probe))
+            s_pathKnown = true;
     }
 
-    if (s_path == PATH_ADM1032)
+    // ---- Fan readback (PIC reg 0x10) ---------------------------------------
+    // Clear s_fanOK at the start of every sample so a failed read is never
+    // masked by a previous success — stale fan values must not appear live.
+    // Upper bound guard: > 50 is an invalid PIC PWM value, discard.
+    s_fanOK = false;
     {
-        BYTE frac = 0;
-        ok = SMBusRead(SMBADDR_ADM1032, 0x01, cpu);
-        if (ok) SMBusRead(SMBADDR_ADM1032, 0x10, frac);
-    }
-    else
-    {
-        BYTE picCPU = 0;
-        ok = SMBusRead(SMBADDR_PIC, 0x09, picCPU);
-        if (ok)
+        BYTE fanRaw = 0;
+        if (SMBusRead(SMBADDR_PIC, 0x10, fanRaw) && fanRaw <= 50)
         {
-            s_avg_cpu_acc += (int)picCPU;
-            ++s_avg_count;
-            if (s_avg_count < AVG_SAMPLES)
-                return;
-            cpu = (BYTE)(s_avg_cpu_acc / AVG_SAMPLES);
-            s_avg_cpu_acc = 0;
-            s_avg_count = 0;
+            s_curFan = fanRaw;
+            s_fanOK = true;
+        }
+        else if (SMBusRead(SMBADDR_PIC, 0x06, fanRaw) && fanRaw <= 50)
+        {
+            s_curFan = fanRaw;
+            s_fanOK = true;
         }
     }
 
-    s_sensorOK = ok;
-    if (!ok) return;
-
-    s_curCPU = cpu;
-
-    BYTE fanRaw = 0;
-    if (SMBusRead(SMBADDR_PIC, 0x10, fanRaw))
+    // ---- CPU + MB temp — read both atomically, commit both or neither ------
+    // s_curMB is only updated when the MB read succeeds in the same sample as
+    // the CPU read.  This prevents a stale MB value from participating in the
+    // thermal abort comparison against a freshly read CPU temp (or vice versa).
+    // 1.6 MB correction: val*0.8 - 3.556 (matches xbox_smbus_poll.cpp exactly).
     {
-        s_curFan = fanRaw;
-        s_fanOK = true;
-    }
+        BYTE cpu = 0, mb = 0;
+        bool cpuOK = SMBusRead(SMBADDR_PIC, 0x09, cpu);
+        bool mbOK = SMBusRead(SMBADDR_PIC, 0x0A, mb);
 
-    // Thermal auto-abort
-    if (s_state == SSTATE_RUNNING && ok && (int)cpu >= s_tempThreshold)
-    {
-        s_state = SSTATE_IDLE;
-        s_thermalAbort = true;
-    }
+        s_sensorOK = cpuOK;
+        s_mbOK = mbOK;
 
-    BYTE load = (s_state == SSTATE_RUNNING) ? 100 : 0;
-    BYTE fanPct = s_fanOK ? (BYTE)((int)s_curFan * 2) : 0;
-    PushHistory(cpu, load, fanPct);
-}
+        if (cpuOK) s_curCPU = cpu;
 
-// ============================================================================
-// FPU stress kernel — Coppermine P3 Prime95-style small-FFT equivalent.
-//
-// Keeps 4KB of floats entirely in L1 cache (32KB on Coppermine).
-// Each iteration issues one fmul + one fadd per element — the Coppermine FPU
-// can dual-issue these, keeping both execution units saturated.
-//
-// We run until GetTickCount() advances to the deadline passed in.
-// The caller sets deadline = now + (frame_budget - render_ms) so the
-// CPU stays fully loaded between frames with only the Present call as idle.
-//
-// The multiply constant (1.00001f / 0.99999f) is chosen so values remain
-// finite indefinitely — no NaN or Inf accumulation over a long run.
-// ============================================================================
-
-static void FPUStress(DWORD deadline)
-{
-    int   n = FPU_WORK_FLOATS;
-    float* w = s_fpuWork;
-
-    // Keep looping until we've burned through to the deadline.
-    // Inner loop: fmul + fadd on adjacent pairs — fills both FPU pipelines.
-    while (GetTickCount() < deadline)
-    {
-        for (int i = 0; i < n - 1; ++i)
+        if (mbOK)
         {
-            w[i] = w[i] * 1.00001f + w[i + 1] * 0.99999f;
+            if (s_is16)
+            {
+                int adj = ((int)mb * 4 / 5) - 4;
+                s_curMB = (BYTE)(adj < 0 ? 0 : adj);
+            }
+            else
+            {
+                s_curMB = mb;
+            }
         }
-        // Fold last element back to prevent values drifting to zero
-        w[n - 1] = w[0] * 1.00001f + w[n - 2] * 0.99999f;
+
+        if (!cpuOK) return;
+
+        // Thermal abort — use max(CPU, MB) to match SMC fan-curve behaviour.
+        // Only include MB in the comparison if the MB read was fresh this sample.
+        BYTE hotTemp = (s_mbOK && s_curMB > s_curCPU) ? s_curMB : s_curCPU;
+        if (s_state == SSTATE_RUNNING && (int)hotTemp >= s_tempThreshold)
+        {
+            s_state = SSTATE_IDLE;
+            s_thermalAbort = true;
+        }
+
+        BYTE load = (s_state == SSTATE_RUNNING) ? s_measuredLoad : 0;
+        BYTE fanPct = s_fanOK ? (BYTE)((int)s_curFan * 2) : 0;
+        PushHistory(cpu, load, fanPct);
     }
 }
+
+// ============================================================================
+// CPUStress(), StressMath_Init() — implemented in StressMath.cpp.
+// ============================================================================
 
 // ============================================================================
 // OnEnter
@@ -337,22 +354,22 @@ void StressTest_OnEnter()
     s_histHead = 0;
     s_histCount = 0;
     s_curCPU = 0;
+    s_curMB = 0;
     s_curFan = 0;
     s_curMHz = 733;
     s_sensorOK = false;
     s_fanOK = false;
-    s_path = PATH_UNKNOWN;
-    s_avg_cpu_acc = 0;
-    s_avg_count = 0;
+    s_mbOK = false;
+    s_pathKnown = false;
+    s_is16 = false;
     s_abortHolding = false;
     s_abortHoldStart = 0;
     s_thermalAbort = false;
     // Note: s_tempThreshold intentionally NOT reset — persists across visits
     s_lastSample = GetTickCount() - SAMPLE_INTERVAL_MS;
 
-    // Seed FPU work array with non-trivial values so first pass is real work
-    for (int i = 0; i < FPU_WORK_FLOATS; ++i)
-        s_fpuWork[i] = 1.0f + (float)(i & 0xFF) * 0.003921f; // 0..1 spread
+    // Seed working buffer and set SQRTHALF for the CPU stress kernel.
+    StressMath_Init();
 }
 
 // ============================================================================
@@ -492,23 +509,27 @@ static void DrawGraph()
         int steps = Ftoi(xB - xA);
         if (steps < 1) steps = 1;
 
-        // CPU Temp — yellow
+        // CPU Temp — TempColor matches panel value exactly
         {
             float yA = GRAPH_B - GRAPH_H * ((float)s_histCPU[idxA] / GRAPH_MAX);
             float yB = GRAPH_B - GRAPH_H * ((float)s_histCPU[idxB] / GRAPH_MAX);
+            DWORD cc = TempColor(
+                (int)s_histCPU[idxB] > (int)s_histCPU[idxA]
+                ? (int)s_histCPU[idxB] : (int)s_histCPU[idxA],
+                CPU_WARN, CPU_HOT);
             for (int s = 0; s <= steps; ++s)
             {
                 float t2 = (float)s / steps;
                 float lx = xA + (xB - xA) * t2;
                 float ly = yA + (yB - yA) * t2;
                 if (lx >= GRAPH_X && lx <= GRAPH_R && ly >= GRAPH_Y && ly <= GRAPH_B)
-                    FillRect(lx - 1.f, ly - 1.f, lx + 1.f, ly + 1.f, COL_YELLOW);
+                    FillRect(lx - 1.f, ly - 1.f, lx + 2.f, ly + 2.f, cc);
             }
         }
 
-        // Load — bright green
+        // Load — green (matches CPU LOAD bar)
         {
-            DWORD lc = D3DCOLOR_XRGB(50, 255, 80);
+            DWORD lc = D3DCOLOR_XRGB(50, 220, 80);
             float yA = GRAPH_B - GRAPH_H * ((float)s_histLoad[idxA] / GRAPH_MAX);
             float yB = GRAPH_B - GRAPH_H * ((float)s_histLoad[idxB] / GRAPH_MAX);
             for (int s = 0; s <= steps; ++s)
@@ -521,7 +542,7 @@ static void DrawGraph()
             }
         }
 
-        // Fan — cyan
+        // Fan — COL_ORANGE matches FAN SPEED panel value color
         {
             float yA = GRAPH_B - GRAPH_H * ((float)s_histFan[idxA] / GRAPH_MAX);
             float yB = GRAPH_B - GRAPH_H * ((float)s_histFan[idxB] / GRAPH_MAX);
@@ -531,7 +552,7 @@ static void DrawGraph()
                 float lx = xA + (xB - xA) * t2;
                 float ly = yA + (yB - yA) * t2;
                 if (lx >= GRAPH_X && lx <= GRAPH_R && ly >= GRAPH_Y && ly <= GRAPH_B)
-                    FillRect(lx, ly - 1.f, lx + 2.f, ly + 1.f, COL_CYAN);
+                    FillRect(lx, ly - 1.f, lx + 2.f, ly + 1.f, COL_ORANGE);
             }
         }
     }
@@ -541,37 +562,83 @@ static void DrawGraph()
     {
         float dotX = GRAPH_R - 3.f;
         float cpuY = GRAPH_B - GRAPH_H * ((float)s_curCPU / GRAPH_MAX);
-        float loadV = (s_state == SSTATE_RUNNING) ? 100.f : 0.f;
+        float loadV = (s_state == SSTATE_RUNNING) ? (float)s_measuredLoad : 0.f;
         float loadY = GRAPH_B - GRAPH_H * (loadV / GRAPH_MAX);
-        FillRect(dotX - 3.f, cpuY - 3.f, dotX + 3.f, cpuY + 3.f, COL_YELLOW);
+        FillRect(dotX - 3.f, cpuY - 3.f, dotX + 3.f, cpuY + 3.f,
+            TempColor((int)s_curCPU, CPU_WARN, CPU_HOT));
         FillRect(dotX - 3.f, loadY - 3.f, dotX + 3.f, loadY + 3.f,
-            D3DCOLOR_XRGB(50, 255, 80));
+            D3DCOLOR_XRGB(50, 220, 80));
         if (s_fanOK)
         {
             float fanY = GRAPH_B - GRAPH_H * ((float)((int)s_curFan * 2) / GRAPH_MAX);
-            FillRect(dotX - 3.f, fanY - 3.f, dotX + 3.f, fanY + 3.f, COL_CYAN);
+            FillRect(dotX - 3.f, fanY - 3.f, dotX + 3.f, fanY + 3.f, COL_ORANGE);
         }
     }
 
-    // Legend (top-right inside graph)
+    // ---- Legend (top-right inside graph) -----------------------------------
     float lx = GRAPH_R - 130.f;
     float ly = GRAPH_Y + 5.f;
-    FillRect(lx, ly, lx + 10.f, ly + 5.f, COL_YELLOW);
-    DrawText(lx + 13.f, ly - 1.f, "CPU TEMP", 1.0f, COL_YELLOW);
-    ly += 11.f;
-    FillRect(lx, ly, lx + 10.f, ly + 5.f, D3DCOLOR_XRGB(50, 255, 80));
-    DrawText(lx + 13.f, ly - 1.f, "LOAD %", 1.0f, D3DCOLOR_XRGB(50, 255, 80));
-    ly += 11.f;
-    FillRect(lx, ly, lx + 10.f, ly + 5.f, COL_CYAN);
-    DrawText(lx + 13.f, ly - 1.f, "FAN %", 1.0f, COL_CYAN);
-
-    // Time scale (only show seconds, not raw sample count)
     {
-        char sc[32]; StrCopy(sc, sizeof(sc), "~");
-        char t2[8];  IntToStr(s_histCount / 2, t2, sizeof(t2));
-        StrCat2(sc, sizeof(sc), sc, t2);
-        StrCat2(sc, sizeof(sc), sc, "s");
-        DrawText(GRAPH_X + 4.f, GRAPH_Y + 4.f, sc, 1.0f, COL_DIM);
+        DWORD cpuLegCol = (s_sensorOK && s_curCPU > 0)
+            ? TempColor((int)s_curCPU, CPU_WARN, CPU_HOT) : COL_GREEN;
+        FillRect(lx, ly, lx + 10.f, ly + 5.f, cpuLegCol);
+        DrawText(lx + 13.f, ly - 1.f, "CPU TEMP", 1.0f, cpuLegCol);
+    }
+    ly += 11.f;
+    FillRect(lx, ly, lx + 10.f, ly + 5.f, D3DCOLOR_XRGB(50, 220, 80));
+    DrawText(lx + 13.f, ly - 1.f, "LOAD %", 1.0f, D3DCOLOR_XRGB(50, 220, 80));
+    ly += 11.f;
+    FillRect(lx, ly, lx + 10.f, ly + 5.f, COL_ORANGE);
+    DrawText(lx + 13.f, ly - 1.f, "FAN %", 1.0f, COL_ORANGE);
+
+    // ---- Lower-left: runtime + min/max stats --------------------------------
+    if (s_state == SSTATE_RUNNING && s_testStartMs > 0)
+    {
+        float bly = GRAPH_B - 11.f;
+
+        // Runtime mm:ss -- uses actual test start time, no sample-count cap
+        DWORD secs = (GetTickCount() - s_testStartMs) / 1000;
+        DWORD mm = secs / 60;
+        DWORD ss = secs % 60;
+        char mmBuf[8], ssBuf[8], timeBuf[24];
+        IntToStr((int)mm, mmBuf, sizeof(mmBuf));
+        IntToStr((int)ss, ssBuf, sizeof(ssBuf));
+        StrCopy(timeBuf, sizeof(timeBuf), "RUN ");
+        StrCat2(timeBuf, sizeof(timeBuf), timeBuf, mmBuf);
+        StrCat2(timeBuf, sizeof(timeBuf), timeBuf, "m");
+        if (ss < 10) StrCat2(timeBuf, sizeof(timeBuf), timeBuf, "0");
+        StrCat2(timeBuf, sizeof(timeBuf), timeBuf, ssBuf);
+        StrCat2(timeBuf, sizeof(timeBuf), timeBuf, "s");
+        DrawText(GRAPH_X + 4.f, bly, timeBuf, 1.0f, COL_DIM);
+
+        // CPU min/max -- color matches panel (TempColor of max)
+        if (s_maxCPU > 0 && s_sensorOK)
+        {
+            char minBuf[8], maxBuf[8], cpuStat[24];
+            IntToStr((int)s_minCPU, minBuf, sizeof(minBuf));
+            IntToStr((int)s_maxCPU, maxBuf, sizeof(maxBuf));
+            StrCopy(cpuStat, sizeof(cpuStat), "CPU ");
+            StrCat2(cpuStat, sizeof(cpuStat), cpuStat, minBuf);
+            StrCat2(cpuStat, sizeof(cpuStat), cpuStat, "-");
+            StrCat2(cpuStat, sizeof(cpuStat), cpuStat, maxBuf);
+            StrCat2(cpuStat, sizeof(cpuStat), cpuStat, "C");
+            DrawText(GRAPH_X + 80.f, bly, cpuStat, 1.0f,
+                TempColor((int)s_maxCPU, CPU_WARN, CPU_HOT));
+        }
+
+        // Fan min/max
+        if (s_maxFan > 0 && s_fanOK)
+        {
+            char minBuf[8], maxBuf[8], fanStat[24];
+            IntToStr((int)s_minFan, minBuf, sizeof(minBuf));
+            IntToStr((int)s_maxFan, maxBuf, sizeof(maxBuf));
+            StrCopy(fanStat, sizeof(fanStat), "FAN ");
+            StrCat2(fanStat, sizeof(fanStat), fanStat, minBuf);
+            StrCat2(fanStat, sizeof(fanStat), fanStat, "-");
+            StrCat2(fanStat, sizeof(fanStat), fanStat, maxBuf);
+            StrCat2(fanStat, sizeof(fanStat), fanStat, "%");
+            DrawText(GRAPH_X + 180.f, bly, fanStat, 1.0f, COL_ORANGE);
+        }
     }
 }
 
@@ -581,8 +648,8 @@ static void DrawGraph()
 
 static void DrawThresholdOverlay()
 {
-    float ow = 320.f;
-    float oh = 120.f;
+    float ow = 380.f;
+    float oh = 140.f;
     float ox = SW * 0.5f - ow * 0.5f;
     float oy = SH * 0.5f - oh * 0.5f;
 
@@ -606,14 +673,17 @@ static void DrawThresholdOverlay()
         : COL_GREEN;
 
     float valW = TW(tDisp, 2.6f);
-    DrawText(ox + (ow - valW) * 0.5f, oy + 30.f, tDisp, 2.6f, tCol);
+    DrawText(ox + (ow - valW) * 0.5f, oy + 34.f, tDisp, 2.6f, tCol);
 
-    // Up/Down arrows hint flanking the value
-    DrawText(ox + (ow - valW) * 0.5f - 22.f, oy + 38.f, "<", 2.0f, COL_GRAY);
-    DrawText(ox + (ow + valW) * 0.5f + 6.f, oy + 38.f, ">", 2.0f, COL_GRAY);
+    // Arrow hints flanking the value
+    DrawText(ox + (ow - valW) * 0.5f - 22.f, oy + 42.f, "<", 2.0f, COL_GRAY);
+    DrawText(ox + (ow + valW) * 0.5f + 6.f, oy + 42.f, ">", 2.0f, COL_GRAY);
 
-    const char* t2 = "[LT] Decrease    [RT] Increase    [A] Continue    [B] Cancel";
-    DrawText(ox + (ow - TW(t2, 1.0f)) * 0.5f, oy + oh - 18.f, t2, 1.0f, COL_GRAY);
+    // Split hint across two lines so it fits the box
+    const char* h1 = "[LT] Decrease    [RT] Increase";
+    const char* h2 = "[A] Continue    [B] Cancel";
+    DrawText(ox + (ow - TW(h1, 1.0f)) * 0.5f, oy + oh - 30.f, h1, 1.0f, COL_GRAY);
+    DrawText(ox + (ow - TW(h2, 1.0f)) * 0.5f, oy + oh - 14.f, h2, 1.0f, COL_GRAY);
 }
 
 // ============================================================================
@@ -722,9 +792,7 @@ static void DrawTabStrip(StressCard active)
 static void RenderCPUCard(const DiagLogo& logo)
 {
     const char* hint =
-        (s_state == SSTATE_IDLE) ? (s_thermalAbort
-            ? "[A] Start Test    [B] Back    [Right] RAM Card"
-            : "[A] Start Test    [B] Back    [Right] RAM Card") :
+        (s_state == SSTATE_IDLE) ? "[A] Start Test    [B] Back    [Right] RAM Card" :
         (s_state == SSTATE_THRESHOLD) ? "[LT] Lower    [RT] Raise    [A] Continue    [B] Cancel" :
         (s_state == SSTATE_CONFIRM) ? "[LT+RT] Confirm    [B] Cancel" :
         "[Right] RAM Card    Hold [Back+A] 5s to Abort";
@@ -790,15 +858,15 @@ static void RenderCPUCard(const DiagLogo& logo)
         char mhzDisp[20]; StrCat2(mhzDisp, sizeof(mhzDisp), mhzBuf, " MHz");
         DrawText(px + P_PAD_X, py + P_BIG_DY, mhzDisp, P_BIG_SC, COL_WHITE);
 
-        const char* sLabel = (s_path == PATH_ADM1032) ? "ICS + ADM1032"
-            : (s_path == PATH_PIC_16) ? "ICS + PIC"
-            : "detecting...";
+        const char* sLabel = !s_pathKnown ? "detecting..."
+            : s_is16 ? "ICS + PIC (v1.6)"
+            : "ICS + PIC";
         DrawText(px + P_PAD_X, py + PANEL_H - 14.f, sLabel, 1.0f, COL_DIM);
     }
 
     // ---- CPU Load bar ----
     {
-        int loadPct = (s_state == SSTATE_RUNNING) ? 100 : 0;
+        int loadPct = (s_state == SSTATE_RUNNING) ? (int)s_measuredLoad : 0;
 
         DrawText(LOAD_BAR_X, LOAD_LBL_Y, "CPU LOAD", 1.1f, COL_YELLOW);
 
@@ -810,7 +878,9 @@ static void RenderCPUCard(const DiagLogo& logo)
 
         if (loadPct > 0)
         {
-            FillRectGrad(bx, by, bx + bw, by + LOAD_BAR_H,
+            float fillW = bw * (loadPct / 100.f);
+            if (fillW > bw) fillW = bw;
+            FillRectGrad(bx, by, bx + fillW, by + LOAD_BAR_H,
                 D3DCOLOR_XRGB(50, 220, 80), D3DCOLOR_XRGB(20, 140, 40));
         }
 
@@ -849,8 +919,6 @@ static void RenderCPUCard(const DiagLogo& logo)
 }
 
 // ============================================================================
-
-// ============================================================================
 // RAM stress engine state
 // All file-scope — mirrors RamTest's stress state machine exactly.
 // ============================================================================
@@ -864,7 +932,7 @@ static void RenderCPUCard(const DiagLogo& logo)
 #define RAM_MAX_CHUNKS          16
 #define RAM_PATTERN_A           0xAA55AA55UL
 #define RAM_PATTERN_B           0x55AA55AAUL
-#define RAM_TICK_MS             150   // time slice per tick
+#define RAM_TICK_MS             30    // time slice per tick — 30ms keeps UI responsive
 
 enum RamChunkState { RCHUNK_UNTESTED = 0, RCHUNK_SKIPPED, RCHUNK_TESTING, RCHUNK_PASS, RCHUNK_FAIL };
 
@@ -877,6 +945,12 @@ enum RamPhase
     RPHASE_P4_READ,
     RPHASE_P5_WRITE,
     RPHASE_P6_READ,
+    // Stress extensions
+    RPHASE_P7_CHECKER_W,   // fwd write checkerboard 0xAAAAAAAA/0x55555555
+    RPHASE_P8_CHECKER_INV, // bwd verify checker, write inverted
+    RPHASE_P9_CHECKER_V,   // fwd verify inverted checker
+    RPHASE_P10_STRIDE_W,   // stride-31 write addr^0xBAADF00D
+    RPHASE_P11_STRIDE_R,   // stride-31 verify
     RPHASE_FREE,
 };
 
@@ -970,13 +1044,18 @@ static const char* RamPhaseLabel(RamPhase ph)
     switch (ph)
     {
     case RPHASE_ALLOC:    return "ALLOCATING";
-    case RPHASE_P1_WRITE: return "1/6  WRITE    fwd  0xAA55AA55";
-    case RPHASE_P2_READW: return "2/6  READ+WRITE  fwd verify / inv write";
-    case RPHASE_P3_READW: return "3/6  READ+WRITE  bwd verify / fwd write";
-    case RPHASE_P4_READ:  return "4/6  READ     fwd verify 0xAA55AA55";
-    case RPHASE_P5_WRITE: return "5/6  WRITE    addr XOR 0xDEADBEEF";
-    case RPHASE_P6_READ:  return "6/6  READ     verify addr XOR";
-    case RPHASE_FREE:     return "COMMITTING";
+    case RPHASE_P1_WRITE:        return " 1/11  WRITE    fwd  0xAA55AA55";
+    case RPHASE_P2_READW:        return " 2/11  RD+WR    fwd verify / inv write";
+    case RPHASE_P3_READW:        return " 3/11  RD+WR    bwd verify / fwd write";
+    case RPHASE_P4_READ:         return " 4/11  READ     fwd verify 0xAA55AA55";
+    case RPHASE_P5_WRITE:        return " 5/11  WRITE    fwd  addr XOR DEADBEEF";
+    case RPHASE_P6_READ:         return " 6/11  READ     fwd verify addr XOR";
+    case RPHASE_P7_CHECKER_W:    return " 7/11  WRITE    fwd  checkerboard AA/55";
+    case RPHASE_P8_CHECKER_INV:  return " 8/11  RD+WR    bwd verify / invert";
+    case RPHASE_P9_CHECKER_V:    return " 9/11  READ     fwd verify inverted";
+    case RPHASE_P10_STRIDE_W:    return "10/11  WRITE    stride-31  addr XOR BAADF00D";
+    case RPHASE_P11_STRIDE_R:    return "11/11  READ     stride-31  verify";
+    case RPHASE_FREE:            return "COMMITTING";
     default:              return "";
     }
 }
@@ -986,11 +1065,16 @@ static DWORD RamPhaseColor(RamPhase ph)
     switch (ph)
     {
     case RPHASE_P1_WRITE:
-    case RPHASE_P5_WRITE: return D3DCOLOR_XRGB(220, 120, 20);
+    case RPHASE_P5_WRITE:
+    case RPHASE_P7_CHECKER_W:
+    case RPHASE_P10_STRIDE_W:  return D3DCOLOR_XRGB(220, 120, 20);
     case RPHASE_P2_READW:
-    case RPHASE_P3_READW: return D3DCOLOR_XRGB(20, 180, 220);
+    case RPHASE_P3_READW:
+    case RPHASE_P8_CHECKER_INV: return D3DCOLOR_XRGB(20, 180, 220);
     case RPHASE_P4_READ:
-    case RPHASE_P6_READ:  return D3DCOLOR_XRGB(40, 200, 80);
+    case RPHASE_P6_READ:
+    case RPHASE_P9_CHECKER_V:
+    case RPHASE_P11_STRIDE_R:  return D3DCOLOR_XRGB(40, 200, 80);
     default:              return D3DCOLOR_XRGB(60, 60, 60);
     }
 }
@@ -998,7 +1082,8 @@ static DWORD RamPhaseColor(RamPhase ph)
 static float RamPhaseProgress()
 {
     if (sr_dwords == 0) return 0.f;
-    if (sr_phase == RPHASE_P3_READW && sr_offset < sr_dwords)
+    if ((sr_phase == RPHASE_P3_READW || sr_phase == RPHASE_P8_CHECKER_INV)
+        && sr_offset < sr_dwords)
     {
         DWORD done = sr_dwords - 1 - sr_offset;
         return (float)done / (float)sr_dwords;
@@ -1163,6 +1248,87 @@ static void RamStressStep()
             if (p[off] != (off ^ 0xDEADBEEFUL))
             {
                 int c = (int)(off / chunkDw); if (c >= sr_chunksPerBank) c = sr_chunksPerBank - 1;
+                sr_chunks[sr_bank][c].errorCount++; sr_bankErr++;
+            }
+            off++;
+            if ((off & 0x3FF) == 0 && (GetTickCount() - tickStart) >= RAM_TICK_MS) break;
+        }
+        if (off >= tot) { RamFlushCache(); sr_phase = RPHASE_P7_CHECKER_W; sr_offset = 0; return; }
+    }
+    // ---- P7: checkerboard write (fwd) -----------------------------------
+    // Alternating 0xAAAAAAAA / 0x55555555 per dword.
+    // Creates maximum bit-switching pressure between adjacent cells.
+    else if (sr_phase == RPHASE_P7_CHECKER_W)
+    {
+        while (off < tot)
+        {
+            p[off] = (off & 1) ? 0x55555555UL : 0xAAAAAAAAUL; off++;
+            if ((off & 0x3FF) == 0 && (GetTickCount() - tickStart) >= RAM_TICK_MS) break;
+        }
+        if (off >= tot) { RamFlushCache(); sr_phase = RPHASE_P8_CHECKER_INV; sr_offset = tot - 1; return; }
+    }
+    // ---- P8: checkerboard invert (bwd read+verify, write inverted) ------
+    // Backward walk: verify AA/55, write 55/AA.
+    // Backward direction forces different row-to-row transitions than P7.
+    else if (sr_phase == RPHASE_P8_CHECKER_INV)
+    {
+        while (off < tot)
+        {
+            DWORD expect = (off & 1) ? 0x55555555UL : 0xAAAAAAAAUL;
+            if (p[off] != expect)
+            {
+                int c = (int)(off / chunkDw); if (c >= sr_chunksPerBank) c = sr_chunksPerBank - 1;
+                sr_chunks[sr_bank][c].errorCount++; sr_bankErr++;
+            }
+            p[off] = (off & 1) ? 0xAAAAAAAAUL : 0x55555555UL;  // inverted
+            if (off == 0) { off = 0xFFFFFFFFUL; break; }
+            off--;
+            if ((off & 0x3FF) == 0x3FF && (GetTickCount() - tickStart) >= RAM_TICK_MS) break;
+        }
+        if (off == 0xFFFFFFFFUL) { RamFlushCache(); sr_phase = RPHASE_P9_CHECKER_V; sr_offset = 0; return; }
+    }
+    // ---- P9: checkerboard verify (fwd) ----------------------------------
+    // Verify inverted pattern placed by P8.
+    else if (sr_phase == RPHASE_P9_CHECKER_V)
+    {
+        while (off < tot)
+        {
+            DWORD expect = (off & 1) ? 0xAAAAAAAAUL : 0x55555555UL;
+            if (p[off] != expect)
+            {
+                int c = (int)(off / chunkDw); if (c >= sr_chunksPerBank) c = sr_chunksPerBank - 1;
+                sr_chunks[sr_bank][c].errorCount++; sr_bankErr++;
+            }
+            off++;
+            if ((off & 0x3FF) == 0 && (GetTickCount() - tickStart) >= RAM_TICK_MS) break;
+        }
+        if (off >= tot) { sr_phase = RPHASE_P10_STRIDE_W; sr_offset = 0; return; }
+    }
+    // ---- P10: stride-31 write -------------------------------------------
+    // Visits every dword in a non-sequential order using stride 31.
+    // 31 is prime and odd, so gcd(31, 2^k) = 1 — complete coverage guaranteed
+    // for any power-of-2 buffer.  Writes addr ^ 0xBAADF00D at each location.
+    // Cache-unfriendly jumps stress the memory controller and prefetch logic.
+    else if (sr_phase == RPHASE_P10_STRIDE_W)
+    {
+        while (off < tot)
+        {
+            DWORD actual = (DWORD)(((DWORD64)off * 31UL) % tot);
+            p[actual] = actual ^ 0xBAADF00DUL; off++;
+            if ((off & 0x3FF) == 0 && (GetTickCount() - tickStart) >= RAM_TICK_MS) break;
+        }
+        if (off >= tot) { RamFlushCache(); sr_phase = RPHASE_P11_STRIDE_R; sr_offset = 0; return; }
+    }
+    // ---- P11: stride-31 verify ------------------------------------------
+    // Same stride walk as P10 — verifies addr ^ 0xBAADF00D at each location.
+    else if (sr_phase == RPHASE_P11_STRIDE_R)
+    {
+        while (off < tot)
+        {
+            DWORD actual = (DWORD)(((DWORD64)off * 31UL) % tot);
+            if (p[actual] != (actual ^ 0xBAADF00DUL))
+            {
+                int c = (int)(actual / chunkDw); if (c >= sr_chunksPerBank) c = sr_chunksPerBank - 1;
                 sr_chunks[sr_bank][c].errorCount++; sr_bankErr++;
             }
             off++;
@@ -1608,8 +1774,14 @@ static void HandleInput()
                 s_state = SSTATE_RUNNING;
                 s_testStartMs = GetTickCount();
                 s_abortHolding = false;
+                s_nextRender = 0;
+                s_burnAccumMs = 0;
+                s_windowStartMs = GetTickCount();
+                s_measuredLoad = 0;
                 s_histHead = 0;
                 s_histCount = 0;
+                s_minCPU = 255; s_maxCPU = 0;
+                s_minFan = 255; s_maxFan = 0;
             }
             break;
 
@@ -1695,34 +1867,322 @@ void StressTest_Tick(const DiagLogo& logo)
 {
     HandleInput();
 
-    // Sensor sample on interval
-    DWORD now = GetTickCount();
-    if ((now - s_lastSample) >= SAMPLE_INTERVAL_MS)
-    {
-        TakeSample();
-        s_curMHz = ReadCPUMHz();
-        s_lastSample = now;
-    }
-
-    // Render frame
-    g_pDevice->BeginScene();
-    if (s_card == CARD_CPU)
-        RenderCPUCard(logo);
-    else
-        RenderRAMCard(logo);
-    g_pDevice->EndScene();
-    g_pDevice->Present(NULL, NULL, NULL, NULL);
-
-    // CPU FPU stress — burns full inter-frame gap after Present
     if (s_card == CARD_CPU && s_state == SSTATE_RUNNING)
     {
-        DWORD deadline = GetTickCount() + 30;
-        FPUStress(deadline);
+        // ── Savage CPU burn loop ─────────────────────────────────────────────
+        // Load measurement uses fixed, edge-aligned windows so the denominator
+        // is always exactly SAMPLE_INTERVAL_BURN_MS regardless of when sensor
+        // reads or renders happen to fire.
+        //
+        //   load = burnAccumMs / SAMPLE_INTERVAL_BURN_MS   (fixed divisor)
+        //   s_windowStartMs += SAMPLE_INTERVAL_BURN_MS     (aligned advance)
+        //
+        // This eliminates the ±2-5% wobble that comes from using the actual
+        // elapsed time as the denominator when that time drifts due to render
+        // or SMBus overhead landing inside the window boundary.
+
+        DWORD now = GetTickCount();
+
+        // ── Window close + sensor sample ─────────────────────────────────────
+        if ((now - s_windowStartMs) >= SAMPLE_INTERVAL_BURN_MS)
+        {
+            // Fixed denominator: always the intended window size, never the
+            // drifted elapsed time.  Clamp to 100 in case burn somehow overran.
+            DWORD load = (s_burnAccumMs * 100) / SAMPLE_INTERVAL_BURN_MS;
+            s_measuredLoad = (load > 100) ? 100 : (BYTE)load;
+            s_burnAccumMs = 0;
+
+            // Edge-aligned advance: move the window boundary forward by exactly
+            // one window width, not by "now".  Any scheduling jitter stays out
+            // of the next window's denominator.
+            s_windowStartMs += SAMPLE_INTERVAL_BURN_MS;
+
+            TakeSample();
+            s_curMHz = ReadCPUMHz();
+            s_lastSample = s_windowStartMs;   // sample timestamp tracks the boundary
+        }
+
+        // ── Render at ~10fps ─────────────────────────────────────────────────
+        if (now >= s_nextRender)
+        {
+            g_pDevice->BeginScene();
+            RenderCPUCard(logo);
+            g_pDevice->EndScene();
+            g_pDevice->Present(NULL, NULL, NULL, NULL);
+            s_nextRender = GetTickCount() + RENDER_INTERVAL_MS;
+        }
+
+        // ── Burn until 2ms before the next window boundary ───────────────────
+        // Only wall time spent inside CPUStress() enters s_burnAccumMs —
+        // render time and sensor SMBus time are excluded by design.
+        {
+            DWORD burnUntil = s_windowStartMs + SAMPLE_INTERVAL_BURN_MS - 2;
+            DWORD burnStart = GetTickCount();
+            if (burnStart < burnUntil)
+            {
+                CPUStress(burnUntil);
+                s_burnAccumMs += GetTickCount() - burnStart;
+            }
+        }
+    }
+    else
+    {
+        // ── Normal tick (idle/threshold/confirm, or RAM card) ────────────────
+        DWORD now = GetTickCount();
+        if ((now - s_lastSample) >= SAMPLE_INTERVAL_MS)
+        {
+            TakeSample();
+            s_curMHz = ReadCPUMHz();
+            s_lastSample = now;
+        }
+
+        g_pDevice->BeginScene();
+        if (s_card == CARD_CPU)
+            RenderCPUCard(logo);
+        else
+            RenderRAMCard(logo);
+        g_pDevice->EndScene();
+        g_pDevice->Present(NULL, NULL, NULL, NULL);
     }
 
-    // RAM stress step — time-sliced, runs after Present on RAM card
+    // ── RAM stress step (time-sliced, runs every tick on RAM card) ───────────
     if (s_card == CARD_RAM && s_ramState == SSTATE_RUNNING)
     {
         RamStressStep();
     }
+}
+// ============================================================================
+// StressTest_AutoRun — headless CPU stress for XbSet automation
+// Uses the exact same burn loop as StressTest_Tick (CARD_CPU / SSTATE_RUNNING):
+//   same CPUStress kernel, same TakeSample, same edge-aligned measurement windows.
+// Runs for durationMs milliseconds then writes results to hReport.
+// ============================================================================
+
+void StressTest_AutoRun(HANDLE hReport, DWORD durationMs)
+{
+    // Full init — seeds working buffer, resets all sensor state
+    StressTest_OnEnter();
+
+    // Wire up running state directly — bypass threshold/confirm UI
+    s_state = SSTATE_RUNNING;
+    s_testStartMs = GetTickCount();
+    s_burnAccumMs = 0;
+    s_windowStartMs = GetTickCount();
+    s_measuredLoad = 0;
+    s_minCPU = 255; s_maxCPU = 0;
+    s_minFan = 255; s_maxFan = 0;
+    s_thermalAbort = false;
+    s_nextRender = 0;
+
+    DWORD endTime = GetTickCount() + durationMs;
+
+    while (GetTickCount() < endTime && s_state == SSTATE_RUNNING)
+    {
+        DWORD now = GetTickCount();
+
+        // Window close + sensor sample (mirrors StressTest_Tick exactly)
+        if ((now - s_windowStartMs) >= SAMPLE_INTERVAL_BURN_MS)
+        {
+            DWORD load = (s_burnAccumMs * 100) / SAMPLE_INTERVAL_BURN_MS;
+            s_measuredLoad = (load > 100) ? 100 : (BYTE)load;
+            s_burnAccumMs = 0;
+            s_windowStartMs += SAMPLE_INTERVAL_BURN_MS;
+            TakeSample();
+            s_curMHz = ReadCPUMHz();
+            s_lastSample = s_windowStartMs;
+        }
+
+        // Render status every ~500ms so screen doesn't appear frozen
+        DWORD nowR = GetTickCount();
+        if (nowR >= s_nextRender)
+        {
+            DWORD elapsed = nowR - (endTime - durationMs);
+            DWORD remain = (nowR < endTime) ? (endTime - nowR) / 1000 : 0;
+            if (g_pDevice)
+            {
+                g_pDevice->BeginScene();
+                DWORD dim = D3DCOLOR_XRGB(10, 13, 30);
+                g_pDevice->Clear(0, NULL, D3DCLEAR_TARGET, dim, 1.f, 0);
+                float py = 40.f;
+                DrawText(12.f, py, "CPU STRESS TEST (AUTO)", 1.4f,
+                    D3DCOLOR_XRGB(255, 220, 60)); py += 24.f;
+                char sb[64]; char rm[8], cp[8], ld[8];
+                IntToStr((int)remain, rm, sizeof(rm));
+                IntToStr((int)s_maxCPU, cp, sizeof(cp));
+                IntToStr((int)s_measuredLoad, ld, sizeof(ld));
+                StrCopy(sb, sizeof(sb), "Remaining: ");
+                StrCat2(sb, sizeof(sb), sb, rm);
+                StrCat2(sb, sizeof(sb), sb, "s   Peak CPU: ");
+                StrCat2(sb, sizeof(sb), sb, cp);
+                StrCat2(sb, sizeof(sb), sb, "C   Load: ");
+                StrCat2(sb, sizeof(sb), sb, ld);
+                StrCat2(sb, sizeof(sb), sb, "%");
+                DrawText(12.f, py, sb, 1.2f,
+                    D3DCOLOR_XRGB(180, 180, 180));
+                g_pDevice->EndScene();
+                g_pDevice->Present(NULL, NULL, NULL, NULL);
+            }
+            s_nextRender = nowR + 500;
+        }
+
+        // Burn until 2ms before next window boundary
+        DWORD burnUntil = s_windowStartMs + SAMPLE_INTERVAL_BURN_MS - 2;
+        DWORD burnStart = GetTickCount();
+        if (burnStart < burnUntil)
+        {
+            CPUStress(burnUntil);
+            s_burnAccumMs += GetTickCount() - burnStart;
+        }
+    }
+
+    // Stop the burn
+    s_state = SSTATE_IDLE;
+
+    if (!hReport || hReport == INVALID_HANDLE_VALUE) return;
+
+    // Write report
+    char line[256]; DWORD w;
+    auto WL = [&](const char* lbl, const char* val)
+        {
+            StrCopy(line, sizeof(line), lbl);
+            StrCat2(line, sizeof(line), line, val);
+            StrCat2(line, sizeof(line), line, "\r\n");
+            WriteFile(hReport, line, StrLen(line), &w, NULL);
+        };
+
+    // Duration
+    char t[32];
+    DWORD totalSecs = durationMs / 1000;
+    if (totalSecs >= 3600)
+    {
+        char hh[8], mm[8], ss[8];
+        IntToStr((int)(totalSecs / 3600), hh, sizeof(hh));
+        IntToStr((int)((totalSecs % 3600) / 60), mm, sizeof(mm));
+        IntToStr((int)(totalSecs % 60), ss, sizeof(ss));
+        StrCopy(t, sizeof(t), hh); StrCat2(t, sizeof(t), t, "h ");
+        StrCat2(t, sizeof(t), t, mm); StrCat2(t, sizeof(t), t, "m ");
+        StrCat2(t, sizeof(t), t, ss); StrCat2(t, sizeof(t), t, "s");
+    }
+    else
+    {
+        char mm[8], ss[8];
+        IntToStr((int)(totalSecs / 60), mm, sizeof(mm));
+        IntToStr((int)(totalSecs % 60), ss, sizeof(ss));
+        StrCopy(t, sizeof(t), mm); StrCat2(t, sizeof(t), t, "m ");
+        StrCat2(t, sizeof(t), t, ss); StrCat2(t, sizeof(t), t, "s");
+    }
+    WL("Duration:       ", t);
+
+    // Temperature range
+    char minT[8], maxT[8];
+    IntToStr((int)s_minCPU, minT, sizeof(minT));
+    IntToStr((int)s_maxCPU, maxT, sizeof(maxT));
+    StrCopy(t, sizeof(t), minT); StrCat2(t, sizeof(t), t, " C  ->  ");
+    StrCat2(t, sizeof(t), t, maxT); StrCat2(t, sizeof(t), t, " C");
+    WL("CPU Temp range: ", t);
+
+    // Fan speed range
+    if (s_minFan != 255)
+    {
+        char minF[8], maxF[8];
+        IntToStr((int)s_minFan * 2, minF, sizeof(minF));
+        IntToStr((int)s_maxFan * 2, maxF, sizeof(maxF));
+        StrCopy(t, sizeof(t), minF); StrCat2(t, sizeof(t), t, "%  ->  ");
+        StrCat2(t, sizeof(t), t, maxF); StrCat2(t, sizeof(t), t, "%");
+        WL("Fan Speed range:", t);
+    }
+    else
+    {
+        WL("Fan Speed:      ", "Not detected");
+    }
+
+    // Load
+    IntToStr((int)s_measuredLoad, t, sizeof(t));
+    StrCat2(t, sizeof(t), t, "%");  WL("Final Load:     ", t);
+
+    // Thermal abort
+    WL("Thermal Abort:  ", s_thermalAbort ? "YES - threshold hit" : "No");
+
+    // Overall result
+    if (s_thermalAbort)
+        WL("Result:         ", "ABORTED - thermal protection triggered");
+    else if (s_maxCPU >= 85)
+        WL("Result:         ", "WARNING - peak temperature above 85C");
+    else
+        WL("Result:         ", "PASS");
+}
+
+// ============================================================================
+// RamStress_AutoRun — timed RAM stress using the StressTest RAM engine
+// Calls RamOnStart() then drives RamStressStep() until durationMs expires,
+// then calls RamStop() and writes results to hReport.
+// ============================================================================
+
+void RamStress_AutoRun(HANDLE hReport, DWORD durationMs)
+{
+    // Full reset of RAM stress state
+    StressTest_OnEnter();
+    RamOnStart();
+    s_ramState = SSTATE_RUNNING;
+
+    DWORD endTime = GetTickCount() + durationMs;
+
+    static DWORD ramNextRender = 0;
+    while (GetTickCount() < endTime)
+    {
+        RamStressStep();
+
+        // Render status every ~500ms
+        DWORD nowR2 = GetTickCount();
+        if (nowR2 >= ramNextRender && g_pDevice)
+        {
+            DWORD remain2 = (nowR2 < endTime) ? (endTime - nowR2) / 1000 : 0;
+            g_pDevice->BeginScene();
+            DWORD dim2 = D3DCOLOR_XRGB(10, 13, 30);
+            g_pDevice->Clear(0, NULL, D3DCLEAR_TARGET, dim2, 1.f, 0);
+            float py2 = 40.f;
+            DrawText(12.f, py2, "RAM STRESS TEST (AUTO)", 1.4f,
+                D3DCOLOR_XRGB(255, 220, 60)); py2 += 24.f;
+            char sb2[64]; char rm2[8], sw2[8], er2[8];
+            IntToStr((int)remain2, rm2, sizeof(rm2));
+            IntToStr(sr_sweep, sw2, sizeof(sw2));
+            IntToStr((int)(sr_totalErrors + sr_sweepErrors), er2, sizeof(er2));
+            StrCopy(sb2, sizeof(sb2), "Remaining: ");
+            StrCat2(sb2, sizeof(sb2), sb2, rm2);
+            StrCat2(sb2, sizeof(sb2), sb2, "s   Sweeps: ");
+            StrCat2(sb2, sizeof(sb2), sb2, sw2);
+            StrCat2(sb2, sizeof(sb2), sb2, "   Errors: ");
+            StrCat2(sb2, sizeof(sb2), sb2, er2);
+            DrawText(12.f, py2, sb2, 1.2f, D3DCOLOR_XRGB(180, 180, 180));
+            g_pDevice->EndScene();
+            g_pDevice->Present(NULL, NULL, NULL, NULL);
+            ramNextRender = nowR2 + 500;
+        }
+    }
+
+    // Abort cleanly
+    RamStop();
+    s_ramState = SSTATE_IDLE;
+
+    if (!hReport || hReport == INVALID_HANDLE_VALUE) return;
+
+    char line[128]; DWORD w;
+    auto WL = [&](const char* lbl, const char* val)
+        {
+            StrCopy(line, sizeof(line), lbl);
+            StrCat2(line, sizeof(line), line, val);
+            StrCat2(line, sizeof(line), line, "\r\n");
+            WriteFile(hReport, line, StrLen(line), &w, NULL);
+        };
+
+    char t[16];
+    IntToStr((int)(durationMs / 1000), t, sizeof(t));
+    StrCat2(t, sizeof(t), t, "s");             WL("Duration:      ", t);
+    IntToStr(sr_sweep, t, sizeof(t));          WL("Sweeps:        ", t);
+    IntToStr(sr_passCount, t, sizeof(t));      WL("Chunks Pass:   ", t);
+    IntToStr(sr_failCount, t, sizeof(t));      WL("Chunks Fail:   ", t);
+    IntToStr((int)(sr_totalErrors + sr_sweepErrors), t, sizeof(t));
+    WL("Total Errors:  ", t);
+    WL("Result:        ",
+        (sr_failCount == 0 && sr_totalErrors == 0) ? "PASS" : "FAIL - errors detected");
 }

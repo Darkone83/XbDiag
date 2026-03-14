@@ -8,11 +8,13 @@
 //   Right column: Video / Thermal / Storage / Network
 //   Bottom strip: CPU MHz | GPU MHz (live color bar)
 //
-// Revision detection (PrometheOS getHardwareRevision method):
+// Revision detection (aligned with PrometheOS getHardwareRevision):
 //   1. PIC reg 0x01 x3 reads  -> 3-char board string (P01/P05/P11/P2L)
 //   2. Encoder SMBus probe    -> splits P11 into 1.2/1.3 vs 1.4/1.5
-//   3. NV2A PCI rev byte      -> splits 1.2 vs 1.3 (0xA1 / 0xA2)
-//   4. Focus chip ID reg 0x00 -> splits 1.4 vs 1.5 (0x54 / 0x09)
+//      Conexant (0x8A) ACK   -> report "1.2/1.3" (NV2A rev byte is NOT
+//                               reliable; some 1.3 boards have A1 silicon)
+//      Focus (0xD4) ACK      -> chip ID 0x54=FS454->1.4 / 0x09=FS455->1.5
+//   3. P2L -> EMRS strap     -> splits 1.6 vs 1.6b
 //   5. NV2A EMRS RAM strap    -> splits P2L into 1.6 vs 1.6b
 //
 // CPU speed: measured via TSC delta over a 100ms GetTickCount() window.
@@ -51,6 +53,7 @@ struct SysData
     char cpuSpeedMHz[16];       // measured via TSC, e.g. "733 MHz"
     DWORD cpuMHz;               // numeric for status bar
     bool  isXemu;               // true if running under xemu/KVM
+    char cpuLeaf1[12];          // raw CPUID leaf 1 EAX hex e.g. "0x00000683"
 
     // Memory
     char memTotal[12];
@@ -113,11 +116,34 @@ struct SysData
     bool biosDumpDone;
     bool biosDumpOK;
     DWORD biosDumpSize;     // bytes written (256KB or 1MB)
+    BYTE biosDumpError;     // 0=ok 1=map fail 2=file fail 3=write fail
+    DWORD biosDumpLastErr;  // GetLastError() captured on file open fail
 };
 
-static SysData  s_data;
-static WORD     s_prevBtns = 0;
-static bool     s_dataLoaded = false;
+// Flash chip detection result — populated once in ReadSysData()
+struct FlashInfo
+{
+    bool  probed;           // JEDEC autoselect was attempted
+    bool  found;            // recognized chip in known-ID table
+    bool  flashable;        // WE# bridged, known-good command set
+    bool  modchipGuard;     // skipped: modchip owns the LPC bus
+    bool  rev16Guard;       // skipped: rev 1.6/1.6b has no TSOP
+    BYTE  mfrId;            // raw manufacturer byte
+    BYTE  devId;            // raw device byte
+    char  chipName[32];     // human-readable name or status
+    char  sizeStr[8];       // "256KB" / "1MB" / ""
+    char  mfrHex[6];        // "0xDA" etc.
+    char  devHex[6];        // "0x0B" etc.
+};
+
+static SysData   s_data;
+static FlashInfo s_flashInfo;
+static WORD      s_prevBtns = 0;
+static bool      s_dataLoaded = false;
+static bool      s_flashPopupOpen = false;
+
+// Forward declaration — defined after MmMapIoSpace extern block below
+static void DetectFlashChip(FlashInfo& fi);
 
 // ============================================================================
 // Utilities
@@ -375,12 +401,12 @@ static void AtaSwapStr(const WORD* words, int nWords, char* out, int outLen)
 //   P2L = 1.6 / 1.6b              (disambiguated below)
 //   DBG = Debug/Alpha kit   D01 variants = Dev kit
 //
-// P11 disambiguation (PrometheOS method):
+// P11 disambiguation:
 //   Probe Conexant encoder (SMBADDR_ENC_CNXT 0x8A):
-//     ACK -> 1.2 or 1.3.  Further: NV2A PCI revision byte (reg 0x08 bits[7:0])
-//              0xA1 -> 1.2    0xA2 -> 1.3    other -> 1.2/1.3
+//     ACK -> report "1.2/1.3".  NV2A PCI rev byte is NOT used here because
+//            some 1.3 boards ship NV2A-A1 silicon, giving false "1.2" results.
 //   Probe Focus encoder (SMBADDR_ENC_FOCUS 0xD4):
-//     ACK -> 1.4 or 1.5.  Further: Focus chip ID reg 0x00
+//     ACK -> chip ID reg 0x00:
 //              0x54 (FS454) -> 1.4    0x09 (FS455) -> 1.5    other -> 1.4/1.5
 //   Both NAK -> 1.2/1.3 (fallback)
 //
@@ -437,13 +463,12 @@ static void DetectBoardRevision(SysData& d, BYTE nvRev)
     {
         BYTE encId = 0;
 
-        // Probe Conexant (0x8A) - present on 1.2 and 1.3
+        // Probe Conexant (0x8A) - present on 1.2 and 1.3.
+        // NV2A PCI revision byte does NOT reliably distinguish 1.2 from 1.3 —
+        // some 1.3 boards ship NV2A-A1 silicon.  Match PrometheOS: report 1.2/1.3.
         if (SMBusRead(SMBADDR_ENC_CNXT, 0x00, encId))
         {
-            // NV2A-A1 (0xA1) -> 1.2    NV2A-A2 (0xA2) -> 1.3
-            if (nvRev == 0xA1) StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.2");
-            else if (nvRev == 0xA2) StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.3");
-            else                    StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.2/1.3");
+            StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.2/1.3");
             return;
         }
 
@@ -539,7 +564,11 @@ static const char* DetectModchip()
 
 static void DetectHdMod(SysData& d)
 {
-    // Probe: write then read reg 0 at sw-addr 0x88 (7-bit 0x44)
+    char tmp[16];
+    char t[8];
+
+    // ---- Chimeric / generic HDMI adapter (PrometheOS-compatible register protocol) ----
+    // Probe: write then read reg 0 at sw-addr 0x88 (7-bit 0x44).
     // PrometheOS probes with a write first to wake the device.
     BYTE dummy = 0;
     bool probeOK = SMBusWrite(0x88, 0x00, 0x00) && SMBusRead(0x88, 0x00, dummy);
@@ -547,32 +576,54 @@ static void DetectHdMod(SysData& d)
     BYTE busAddr = 0x88;
     if (!probeOK)
     {
-        // Try secondary address 0x86 (7-bit 0x43) used by some adapters
+        // Secondary address 0x86 (7-bit 0x43) used by some adapters
         probeOK = SMBusWrite(0x86, 0x00, 0x00) && SMBusRead(0x86, 0x00, dummy);
-        if (!probeOK)
-        {
-            StrCopy(d.hdModVer, sizeof(d.hdModVer), "Not Detected");
-            return;
-        }
-        busAddr = 0x86;
+        if (probeOK) busAddr = 0x86;
     }
 
-    // Read version regs 0x57/0x58/0x59
-    BYTE v1 = 0, v2 = 0, v3 = 0;
-    SMBusRead(busAddr, 0x57, v1);
-    SMBusRead(busAddr, 0x58, v2);
-    SMBusRead(busAddr, 0x59, v3);
+    if (probeOK)
+    {
+        // Read version regs 0x57/0x58/0x59
+        BYTE v1 = 0, v2 = 0, v3 = 0;
+        SMBusRead(busAddr, 0x57, v1);
+        SMBusRead(busAddr, 0x58, v2);
+        SMBusRead(busAddr, 0x59, v3);
 
-    // Build "V%d.%d.%d" — use separate src buffer to avoid StrCat2 self-alias
-    char tmp[16];
-    char t[8];
-    StrCopy(tmp, sizeof(tmp), "V");
-    IntToStr(v1, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
-    StrCat2(tmp, sizeof(tmp), tmp, ".");
-    IntToStr(v2, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
-    StrCat2(tmp, sizeof(tmp), tmp, ".");
-    IntToStr(v3, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
-    StrCopy(d.hdModVer, sizeof(d.hdModVer), tmp);
+        StrCopy(tmp, sizeof(tmp), "V");
+        IntToStr(v1, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
+        StrCat2(tmp, sizeof(tmp), tmp, ".");
+        IntToStr(v2, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
+        StrCat2(tmp, sizeof(tmp), tmp, ".");
+        IntToStr(v3, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
+        StrCopy(d.hdModVer, sizeof(d.hdModVer), tmp);
+        return;
+    }
+
+    // ---- X-HD (Ryzee119 XboxHDMI) — command-based protocol at sw-addr 0xD2 (7-bit 0x69) ----
+    // Same address as ICS clock generator; X-HD replaces it on the bus when installed.
+    // Probe: read cmd 5 (READ_MODE) — expects 0x01 (bootloader) or 0x02 (application).
+    // Version: cmds 1/2/3 return major/minor/patch bytes.
+    BYTE mode = 0;
+    if (SMBusRead(0xD2, 0x05, mode) && (mode == 0x01 || mode == 0x02))
+    {
+        BYTE v1 = 0, v2 = 0, v3 = 0;
+        SMBusRead(0xD2, 0x01, v1);
+        SMBusRead(0xD2, 0x02, v2);
+        SMBusRead(0xD2, 0x03, v3);
+
+        StrCopy(tmp, sizeof(tmp), "X-HD V");
+        IntToStr(v1, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
+        StrCat2(tmp, sizeof(tmp), tmp, ".");
+        IntToStr(v2, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
+        StrCat2(tmp, sizeof(tmp), tmp, ".");
+        IntToStr(v3, t, sizeof(t)); StrCat2(tmp, sizeof(tmp), tmp, t);
+        if (mode == 0x01)
+            StrCat2(tmp, sizeof(tmp), tmp, " BL");   // sitting in bootloader
+        StrCopy(d.hdModVer, sizeof(d.hdModVer), tmp);
+        return;
+    }
+
+    StrCopy(d.hdModVer, sizeof(d.hdModVer), "Not Detected");
 }
 
 // ============================================================================
@@ -581,20 +632,20 @@ static void DetectHdMod(SysData& d)
 
 static void ReadSysData()
 {
+    // Zero all fields so StrCat2 calls start from a clean slate on re-entry.
+    ZeroMemory(&s_data, sizeof(s_data));
     SysData& d = s_data;
 
     // --- xemu / emulator detection ---
-    // Vendor string from CPUID leaf 0: EBX:EDX:ECX
-    // Real Xbox Intel:  "GenuineIntel"  EBX=0x756E6547 EDX=0x49656E69 ECX=0x6C65746E
-    // xemu/KVM:         "KVMKVMKVM\0\0\0" or host CPU vendor string
-    // We check all three registers — EBX alone is not sufficient.
+    // Hypervisor present bit: CPUID leaf 1, ECX bit 31.
+    // Real Coppermine (family 6 model 8) never sets this bit.
+    // KVM — which xemu uses — always sets it regardless of guest CPU.
+    // Vendor string is NOT used: xemu passes through the host vendor
+    // string, so an Intel host looks identical to real Xbox hardware.
     {
         DWORD ea, eb, ec, ed;
-        DoCpuid(0, ea, eb, ec, ed);
-        bool isGenuineIntel = (eb == 0x756E6547UL &&   // "Genu"
-            ed == 0x49656E69UL &&   // "ineI"
-            ec == 0x6C65746EUL);    // "ntel"
-        d.isXemu = !isGenuineIntel;
+        DoCpuid(1, ea, eb, ec, ed);
+        d.isXemu = (ec & 0x80000000UL) != 0;   // bit 31 = hypervisor present
     }
 
     // --- CPU brand string (CPUID 0x80000002-4) ---
@@ -667,6 +718,9 @@ static void ReadSysData()
         BYTE cpuModel = (BYTE)((ea1 >> 4) & 0x0F);
         BYTE cpuStepping = (BYTE)(ea1 & 0x0F);
         (void)cpuStepping;
+        // Store raw EAX for on-screen diagnosis
+        char eaxHex[10]; IntToHex(ea1, 8, eaxHex, sizeof(eaxHex));
+        StrCat2(d.cpuLeaf1, sizeof(d.cpuLeaf1), "0x", eaxHex);
 
         // Scan brand string for "Celeron"
         bool isCeleron = false;
@@ -1133,6 +1187,9 @@ static void ReadSysData()
 
     d.exportDone = false;
     d.exportOK = false;
+
+    // --- Flash chip (JEDEC autoselect, guarded by modchip + rev 1.6 checks) ---
+    DetectFlashChip(s_flashInfo);
 }
 
 // ============================================================================
@@ -1152,61 +1209,253 @@ static void WriteLine(HANDLE hf, const char* label, const char* value)
 // BIOS dump
 // ============================================================================
 //
-// The Xbox flash ROM is memory-mapped read-only at the top of the 32-bit
-// address space. Common sizes:
-//   256KB retail BIOS: mapped at 0xFFFC0000 - 0xFFFFFFFF
-//   1MB mod chip BIOS: mapped at 0xFFF00000 - 0xFFFFFFFF
+// The Xbox flash ROM is hardware-decoded by the MCPX chip across the top 16MB
+// of physical address space (0xFF000000 - 0xFFFFFFFF). The ROM is aliased
+// throughout this range. Conventional base addresses used by software:
+//   0xFFFC0000 — last 256KB alias (retail / 256KB chip)
+//   0xFFF00000 — last 1MB alias   (mod chip / 1MB chip)
 //
-// Detection: if the first 256KB bank at 0xFFF00000 matches the bank at
-// 0xFFFC0000 it is a 256KB chip (ROM tiled to fill 1MB address window).
-// If they differ it is a genuine 1MB image - dump the full megabyte.
-// Output: D:\bios.bin (XBE launch directory, always writable).
+// On Xbox there is no IOMMU — physical == virtual for ROM/device regions, so
+// direct pointer dereference is safe for mapped ROM space.
+//
+// DANGER ZONE: 0xFFFFFE00 - 0xFFFFFFFF (top 512 bytes).
+// This is the hidden MCPX ROM on revisions 1.1-1.6. The MCPX hides itself
+// during boot before the kernel hands off to the XBE. Accessing this range
+// from a running XBE WILL freeze the system. Hard cap all reads at 0xFFFFFDFF.
+//
+// Size detection: compare 16 bytes at 0xFFF00000 vs 0xFFFC0000.
+// On a 256KB chip the ROM tiles four times — the banks are identical.
+// On a genuine 1MB mod chip the banks differ.
+//
+// Output: E:\BIOSios.bin — HDD data partition, survives reboots.
 // ============================================================================
+// MmMapIoSpace / MmUnmapIoSpace -- kernel exports at ordinals 177 / 183.
+// Declared the same way as HalReadSMBusValue -- plain extern "C", no dllimport.
+// PhysicalAddress is ULONG on Xbox (32-bit, confirmed by @12 stack frame).
+extern "C"
+{
+    PVOID __stdcall MmMapIoSpace(
+        ULONG PhysicalAddress,
+        ULONG NumberOfBytes,
+        ULONG Protect);
+
+    VOID __stdcall MmUnmapIoSpace(
+        PVOID BaseAddress,
+        ULONG NumberOfBytes);
+
+    // IoCreateSymbolicLink — mounts a drive letter before first use.
+    // Returns 0xC0000035 if already mounted, which is fine — just ignore it.
+    typedef struct { USHORT len; USHORT maxLen; char* buf; } XBIOS_STRING;
+    LONG WINAPI IoCreateSymbolicLink(XBIOS_STRING* symLink, XBIOS_STRING* target);
+}
 
 static void DumpBios()
 {
     SysData& d = s_data;
 
-    const BYTE* base256 = (const BYTE*)0xFFFC0000UL; // top 256KB always valid
-    const BYTE* base1M = (const BYTE*)0xFFF00000UL; // base of potential 1MB
+    static const ULONG PHYS_256KB = 0xFFFC0000UL;
+    static const ULONG PHYS_1MB = 0xFFF00000UL;
 
-    // Determine image size: compare first 16 bytes at each 256KB boundary.
-    // On a 256KB chip the ROM is tiled four times, so the banks are identical.
-    // On a 1MB chip bank 0 (0xFFF00000) holds distinct data from bank 3 (0xFFFC0000).
+    // Hard ceiling: never map at or above 0xFFFFFE00 (hidden MCPX ROM).
+    // Top 512 bytes are off-limits on rev 1.1-1.6 consoles -- hard lock.
+    static const ULONG SAFE_TOP = 0xFFFFFE00UL;
+    static const ULONG SIZE_256KB = SAFE_TOP - PHYS_256KB; // 0x3FE00 = 261632 bytes
+    static const ULONG SIZE_1MB = SAFE_TOP - PHYS_1MB;   // 0xFFE00 = 1048064 bytes
+
+    // Protect value 4 = MmNonCached -- required for ROM / device regions.
+    static const ULONG MM_NONCACHED = 4;
+
+    // ---- Size detection: probe 16 bytes at each base ----
+    // Both addresses are well below SAFE_TOP.
     bool is1MB = false;
-    for (int bi = 0; bi < 16; ++bi)
     {
-        if (base1M[bi] != base256[bi]) { is1MB = true; break; }
+        BYTE* v256 = (BYTE*)MmMapIoSpace(PHYS_256KB, 16, MM_NONCACHED);
+        BYTE* v1M = (BYTE*)MmMapIoSpace(PHYS_1MB, 16, MM_NONCACHED);
+
+        if (!v256 || !v1M)
+        {
+            if (v256) MmUnmapIoSpace(v256, 16);
+            if (v1M)  MmUnmapIoSpace(v1M, 16);
+            d.biosDumpError = 1; d.biosDumpDone = true; d.biosDumpOK = false; return;
+        }
+
+        for (int bi = 0; bi < 16; ++bi)
+        {
+            if (v1M[bi] != v256[bi]) { is1MB = true; break; }
+        }
+
+        MmUnmapIoSpace(v256, 16);
+        MmUnmapIoSpace(v1M, 16);
     }
 
-    const BYTE* dumpBase = is1MB ? base1M : base256;
-    DWORD       dumpSize = is1MB ? (1024UL * 1024UL) : (256UL * 1024UL);
+    ULONG dumpPhys = is1MB ? PHYS_1MB : PHYS_256KB;
+    ULONG dumpSize = is1MB ? SIZE_1MB : SIZE_256KB;
 
+    // ---- Open output file BEFORE mapping ROM (avoids heap corruption risk) ----
     HANDLE hf = CreateFileA("D:\\bios.bin", GENERIC_WRITE, 0, NULL,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hf == INVALID_HANDLE_VALUE)
     {
-        d.biosDumpDone = true; d.biosDumpOK = false; return;
+        d.biosDumpLastErr = GetLastError();
+        d.biosDumpError = 2; d.biosDumpDone = true; d.biosDumpOK = false; return;
     }
 
-    // Write in 4KB pages to avoid one massive WriteFile call
-    const DWORD PAGE = 4096;
+    // ---- Map the full dump region ----
+    BYTE* mapped = (BYTE*)MmMapIoSpace(dumpPhys, dumpSize, MM_NONCACHED);
+    if (!mapped)
+    {
+        CloseHandle(hf);
+        d.biosDumpError = 1; d.biosDumpDone = true; d.biosDumpOK = false; return;
+    }
+
+    // ---- Write in 4KB pages ----
+    const ULONG PAGE = 4096;
     DWORD written = 0;
     bool  ok = true;
-    for (DWORD offset = 0; offset < dumpSize && ok; offset += PAGE)
+    for (ULONG offset = 0; offset < dumpSize && ok; offset += PAGE)
     {
-        DWORD chunk = (dumpSize - offset < PAGE) ? (dumpSize - offset) : PAGE;
+        ULONG chunk = (dumpSize - offset < PAGE) ? (dumpSize - offset) : PAGE;
         DWORD w = 0;
-        if (!WriteFile(hf, dumpBase + offset, chunk, &w, NULL) || w != chunk)
-            ok = false;
+        if (!WriteFile(hf, mapped + offset, chunk, &w, NULL) || w != chunk)
+        {
+            ok = false; d.biosDumpError = 3;
+        }
         else
             written += w;
     }
 
     CloseHandle(hf);
+    MmUnmapIoSpace(mapped, dumpSize);
+
     d.biosDumpSize = written;
     d.biosDumpDone = true;
     d.biosDumpOK = ok;
+}
+
+// ============================================================================
+// Flash chip detection (JEDEC autoselect)
+// ============================================================================
+//
+// Xbox TSOP is mapped by MCPX at physical 0xFF000000 (same window as BIOS).
+// JEDEC autoselect sequence: AA→5555, 55→2AAA, 90→5555, read [0]=mfr [1]=dev,
+// then F0→[0] to exit autoselect mode.
+//
+// WE# must be bridged (TSOP mod) for writes to reach the chip.
+// If WE# is not bridged, write cycles are ignored — autoselect never activates
+// and reads return normal ROM data (not 0xDA/0x0B etc.).  Only chips whose
+// JEDEC IDs appear in the known-ID table are marked flashable.
+//
+// Guards checked before any I/O:
+//   - Modchip active  → modchip owns the LPC bus; TSOP not reachable
+//   - Rev 1.6/1.6b   → Xcalibur GPU has no TSOP socket
+//
+static void DetectFlashChip(FlashInfo& fi)
+{
+    // zero-init
+    fi.probed = false;
+    fi.found = false;
+    fi.flashable = false;
+    fi.modchipGuard = false;
+    fi.rev16Guard = false;
+    fi.mfrId = 0xFF;
+    fi.devId = 0xFF;
+    StrCopy(fi.chipName, sizeof(fi.chipName), "Unknown");
+    StrCopy(fi.sizeStr, sizeof(fi.sizeStr), "");
+    StrCopy(fi.mfrHex, sizeof(fi.mfrHex), "0x??");
+    StrCopy(fi.devHex, sizeof(fi.devHex), "0x??");
+
+    // Guard 1: modchip active — LPC bus intercepted, TSOP unreachable
+    // modchipName == "None / TSOP" is the only no-modchip value
+    if (s_data.modchipName[0] != 'N')
+    {
+        fi.modchipGuard = true;
+        return;
+    }
+
+    // Guard 2: rev 1.6 / 1.6b — Xcalibur chip, no TSOP socket
+    {
+        const char* rev = s_data.boardRevFinal;
+        if (rev[0] == '1' && rev[1] == '.' && rev[2] == '6')
+        {
+            fi.rev16Guard = true;
+            return;
+        }
+    }
+
+    fi.probed = true;
+
+    // Map 64KB at 0xFF000000 — covers offsets 0x0000–0xFFFF (incl. 0x5555/0x2AAA)
+    static const ULONG TSOP_PHYS = 0xFF000000UL;
+    static const ULONG MAP_SIZE = 0x10000UL;
+    static const ULONG MM_NONCACHED = 4;
+
+    BYTE* base = (BYTE*)MmMapIoSpace(TSOP_PHYS, MAP_SIZE, MM_NONCACHED);
+    if (!base)
+        return;
+
+    // JEDEC autoselect entry
+    base[0x5555] = 0xAA;
+    base[0x2AAA] = 0x55;
+    base[0x5555] = 0x90;
+
+    BYTE mfr = base[0];
+    BYTE dev = base[1];
+
+    // Exit autoselect
+    base[0] = 0xF0;
+
+    MmUnmapIoSpace(base, MAP_SIZE);
+
+    fi.mfrId = mfr;
+    fi.devId = dev;
+
+    // Build hex strings (no sprintf — manual nibble print)
+    static const char s_hexNib[] = "0123456789ABCDEF";
+    fi.mfrHex[0] = '0'; fi.mfrHex[1] = 'x';
+    fi.mfrHex[2] = s_hexNib[mfr >> 4]; fi.mfrHex[3] = s_hexNib[mfr & 0xF]; fi.mfrHex[4] = '\0';
+    fi.devHex[0] = '0'; fi.devHex[1] = 'x';
+    fi.devHex[2] = s_hexNib[dev >> 4]; fi.devHex[3] = s_hexNib[dev & 0xF]; fi.devHex[4] = '\0';
+
+    // Known Xbox TSOP chips (WE# must be bridged for JEDEC to respond)
+    struct ChipEntry { BYTE mfr; BYTE dev; const char* name; const char* size; };
+    static const ChipEntry s_chips[] = {
+        // 256KB (1.2–1.5) — dominant population
+        { 0xDA, 0x0B, "Winbond W49F002U",      "256KB" },
+        { 0xDA, 0x8C, "Winbond W49F020",        "256KB" },
+        { 0xC2, 0x36, "Macronix MX29F022NTPC",  "256KB" },
+        { 0x20, 0xB0, "ST M29F020",              "256KB" },
+        // 1MB (1.0–1.1 only)
+        { 0x01, 0xD5, "AMD Am29F080B",           "1MB"   },
+        { 0x04, 0xD5, "Fujitsu MBM29F080A",      "1MB"   },
+        { 0xAD, 0xD5, "Hynix HY29F080",          "1MB"   },
+        { 0x20, 0xF1, "ST M29F080A",              "1MB"   },
+        { 0x89, 0xA6, "Sharp LH28F008SCT",        "1MB"   },
+        { 0x00, 0x00, NULL, NULL }   // sentinel
+    };
+
+    for (int i = 0; s_chips[i].name != NULL; ++i)
+    {
+        if (s_chips[i].mfr == mfr && s_chips[i].dev == dev)
+        {
+            fi.found = true;
+            fi.flashable = true;
+            StrCopy(fi.chipName, sizeof(fi.chipName), s_chips[i].name);
+            StrCopy(fi.sizeStr, sizeof(fi.sizeStr), s_chips[i].size);
+            return;
+        }
+    }
+
+    // IDs returned but not in table
+    if (mfr == 0xFF && dev == 0xFF)
+    {
+        // Autoselect did not activate: WE# not bridged, or no TSOP populated
+        StrCopy(fi.chipName, sizeof(fi.chipName), "Not found");
+        return;
+    }
+
+    // Unrecognized non-FF IDs — chip present but unknown command set
+    StrCopy(fi.chipName, sizeof(fi.chipName), "Unknown chip");
+    fi.found = true;
 }
 
 static void ExportSysInfo()
@@ -1272,11 +1521,38 @@ void SysInfo_OnEnter()
 {
     s_prevBtns = 0;
     s_dataLoaded = false;
+    s_flashPopupOpen = false;
     s_data.exportDone = false;
     s_data.exportOK = false;
     s_data.biosDumpDone = false;
     s_data.biosDumpOK = false;
     s_data.biosDumpSize = 0;
+    s_data.biosDumpError = 0;
+
+    // Mount HDD partitions — kernel only auto-mounts D: (title dir).
+    // C/E/F/G need explicit symlinks; returns 0xC0000035 if already mounted
+    // which is fine — always safe to call.
+    {
+        static const struct { const char* lnk; const char* dev; } k[] =
+        {
+            { "\\??\\C:", "\\Device\\Harddisk0\\Partition2" },
+            { "\\??\\E:", "\\Device\\Harddisk0\\Partition1" },
+            { "\\??\\F:", "\\Device\\Harddisk0\\Partition6" },
+            { "\\??\\G:", "\\Device\\Harddisk0\\Partition7" },
+        };
+        char lnkBuf[8];
+        for (int i = 0; i < 4; ++i)
+        {
+            const char* l = k[i].lnk;
+            int ll = 0; while (l[ll]) ll++;
+            for (int j = 0; j < ll; ++j) lnkBuf[j] = l[j];
+            const char* dev = k[i].dev;
+            int dl = 0; while (dev[dl]) dl++;
+            XBIOS_STRING sLnk = { (USHORT)ll, (USHORT)(ll + 1), lnkBuf };
+            XBIOS_STRING sDev = { (USHORT)dl, (USHORT)(dl + 1), (char*)dev };
+            IoCreateSymbolicLink(&sLnk, &sDev);
+        }
+    }
 
     // Start the network stack here, before the loading frame renders.
     // DHCP needs time to complete; starting early and polling later in
@@ -1294,6 +1570,114 @@ void SysInfo_OnEnter()
 
 // ============================================================================
 // Render helpers
+// ============================================================================
+// Flash chip popup card
+// ============================================================================
+
+static void DrawFlashPopup()
+{
+    const FlashInfo& fi = s_flashInfo;
+
+    // Card dimensions (design space 640x480)
+    const float CW = 360.f;
+    const float CH = 142.f;
+    const float CX = (SW - CW) * 0.5f;
+    const float CY = (480.f - CH) * 0.5f;
+    const float CX1 = CX + CW;
+    const float CY1 = CY + CH;
+    const float PAD = 12.f;
+    const float LH = LINE_H;
+
+    // Shadow
+    FillRect(CX + 4.f, CY + 4.f, CX1 + 4.f, CY1 + 4.f,
+        D3DCOLOR_ARGB(140, 0, 0, 0));
+
+    // Background
+    FillRectGrad(CX, CY, CX1, CY1,
+        D3DCOLOR_XRGB(14, 22, 52),
+        D3DCOLOR_XRGB(8, 14, 36));
+
+    // Border
+    HLine(CY, CX, CX1, COL_BORDER);
+    HLine(CY1, CX, CX1, COL_BORDER);
+    VLine(CX, CY, CY1, COL_BORDER);
+    VLine(CX1, CY, CY1, COL_BORDER);
+
+    // Title bar
+    FillRect(CX + 1.f, CY + 1.f, CX1 - 1.f, CY + LH + 6.f,
+        D3DCOLOR_XRGB(20, 40, 90));
+    HLine(CY + LH + 6.f, CX + 1.f, CX1 - 1.f, COL_BORDER);
+    DrawText(CX + PAD, CY + 3.f, "FLASH CHIP INFO", 1.2f, COL_YELLOW);
+
+    float y = CY + LH + 10.f;
+    const float VX = CX + PAD + 76.f;   // value column
+
+    if (fi.modchipGuard)
+    {
+        DrawText(CX + PAD, y, "CHIP   :", 1.2f, COL_GRAY);
+        DrawText(VX, y, "TSOP unavailable  (modchip active)", 1.2f, COL_DIM);
+        y += LH;
+    }
+    else if (fi.rev16Guard)
+    {
+        DrawText(CX + PAD, y, "CHIP   :", 1.2f, COL_GRAY);
+        DrawText(VX, y, "No TSOP  (rev 1.6 - Xcalibur only)", 1.2f, COL_DIM);
+        y += LH;
+    }
+    else if (!fi.probed)
+    {
+        DrawText(CX + PAD, y, "CHIP   :", 1.2f, COL_GRAY);
+        DrawText(VX, y, "Probe failed  (map error)", 1.2f, COL_DIM);
+        y += LH;
+    }
+    else
+    {
+        // CHIP name
+        DrawText(CX + PAD, y, "CHIP   :", 1.2f, COL_GRAY);
+        DrawText(VX, y, fi.chipName, 1.2f,
+            fi.found ? COL_CYAN : COL_DIM);
+        y += LH;
+
+        // MFR / DEV / SIZE on one line
+        if (fi.mfrId != 0xFF || fi.devId != 0xFF)
+        {
+            // "MFR: 0xDA   DEV: 0x0B   SIZE: 256KB"
+            static char s_ids[48];
+            StrCopy(s_ids, sizeof(s_ids), "MFR: ");
+            StrCat2(s_ids, sizeof(s_ids), s_ids, fi.mfrHex);
+            StrCat2(s_ids, sizeof(s_ids), s_ids, "   DEV: ");
+            StrCat2(s_ids, sizeof(s_ids), s_ids, fi.devHex);
+            if (fi.sizeStr[0])
+            {
+                StrCat2(s_ids, sizeof(s_ids), s_ids, "   SIZE: ");
+                StrCat2(s_ids, sizeof(s_ids), s_ids, fi.sizeStr);
+            }
+            DrawText(CX + PAD, y, "       :", 1.2f, COL_GRAY);
+            DrawText(VX, y, s_ids, 1.1f, COL_WHITE);
+            y += LH;
+        }
+
+        // Flashable status line
+        y += 4.f;
+        if (fi.flashable)
+        {
+            DrawText(CX + PAD, y, "Flashable  (WE# bridged)", 1.2f, COL_GREEN);
+        }
+        else if (fi.found)
+        {
+            DrawText(CX + PAD, y, "Flashable  (check WE# bridge)", 1.2f, COL_YELLOW);
+        }
+        else
+        {
+            DrawText(CX + PAD, y, "Not flashable  (WE# not bridged)", 1.2f, COL_DIM);
+        }
+        y += LH;
+    }
+
+    // Close hint
+    DrawText(CX + PAD, CY1 - LH - 2.f, "[B] Close", 1.2f, COL_YELLOW);
+}
+
 // ============================================================================
 
 static void DrawSection(float x, float y, float ruleW, const char* title)
@@ -1318,14 +1702,31 @@ static void Render(const DiagLogo& logo)
     g_pDevice->BeginScene();
 
     const char* hint;
-    if (s_data.biosDumpDone)
-        hint = s_data.biosDumpOK ? "[A] Export  [Y] BIOS dumped OK  [B] Back"
-        : "[A] Export  [Y] BIOS dump FAIL  [B] Back";
+    if (s_flashPopupOpen)
+        hint = "[B] Close flash info";
+    else if (s_data.biosDumpDone)
+        if (s_data.biosDumpOK)
+            hint = "[A] Export  [X] Flash  [Y] BIOS dumped OK  [B] Back";
+        else if (s_data.biosDumpError == 1)
+            hint = "[A] Export  [X] Flash  [Y] FAIL: map err  [B] Back";
+        else if (s_data.biosDumpError == 2)
+        {
+            static char s_fileErrHint[64];
+            StrCopy(s_fileErrHint, sizeof(s_fileErrHint), "[A] Export  [X] Flash  [Y] FAIL:file ");
+            char tmp[12]; IntToStr((int)s_data.biosDumpLastErr, tmp, sizeof(tmp));
+            StrCat2(s_fileErrHint, sizeof(s_fileErrHint), s_fileErrHint, tmp);
+            StrCat2(s_fileErrHint, sizeof(s_fileErrHint), s_fileErrHint, "  [B] Back");
+            hint = s_fileErrHint;
+        }
+        else if (s_data.biosDumpError == 3)
+            hint = "[A] Export  [X] Flash  [Y] FAIL: write err  [B] Back";
+        else
+            hint = "[A] Export  [X] Flash  [Y] BIOS dump FAIL  [B] Back";
     else if (s_data.exportDone)
-        hint = s_data.exportOK ? "[A] Exported OK  [Y] Dump BIOS  [B] Back"
-        : "[A] Export fail  [Y] Dump BIOS  [B] Back";
+        hint = s_data.exportOK ? "[A] Exported OK  [X] Flash  [Y] Dump BIOS  [B] Back"
+        : "[A] Export fail  [X] Flash  [Y] Dump BIOS  [B] Back";
     else
-        hint = "[A] Export    [Y] Dump BIOS    [B] Back";
+        hint = "[A] Export    [X] Flash    [Y] Dump BIOS    [B] Back";
 
     DrawPageChrome(logo, "SYSTEM INFO", hint);
 
@@ -1358,7 +1759,8 @@ static void Render(const DiagLogo& logo)
     DrawRow(C1, y1, V1, "CPU    :", d.cpuIC, COL_CYAN);  y1 += LH;
     DrawRow(C1, y1, V1, "SPEED  :", d.cpuSpeedMHz, COL_WHITE); y1 += LH;
     DrawRow(C1, y1, V1, "BRAND  :", d.cpuBrand,
-        d.isXemu ? COL_YELLOW : COL_DIM);                       y1 += LH + GAP;
+        d.isXemu ? COL_YELLOW : COL_DIM);                       y1 += LH;
+    DrawRow(C1, y1, V1, "CPUID  :", d.cpuLeaf1, COL_DIM);      y1 += LH + GAP;
 
     // ---- LEFT: Memory ----
     DrawSection(C1, y1, RULEW, "MEMORY");                       y1 += LH + 4.f;
@@ -1470,6 +1872,9 @@ static void Render(const DiagLogo& logo)
         DrawText(gpuX + 34.f, sy, d.gpuSpeedMHz, 1.2f, COL_CYAN);
     }
 
+    if (s_flashPopupOpen)
+        DrawFlashPopup();
+
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
@@ -1491,6 +1896,16 @@ void SysInfo_Tick(const DiagLogo& logo)
 
     WORD cur = GetButtons();
 
+    if (s_flashPopupOpen)
+    {
+        // While popup is open only B closes it; all other buttons absorbed
+        if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
+            s_flashPopupOpen = false;
+        s_prevBtns = cur;
+        Render(logo);
+        return;
+    }
+
     if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
     {
         RequestState(MSTATE_MENU);
@@ -1499,6 +1914,8 @@ void SysInfo_Tick(const DiagLogo& logo)
     }
     if (EdgeDown(cur, s_prevBtns, BTN_A))
         ExportSysInfo();
+    if (EdgeDown(cur, s_prevBtns, BTN_X))
+        s_flashPopupOpen = true;
     if (EdgeDown(cur, s_prevBtns, BTN_Y))
         DumpBios();
 
@@ -1517,4 +1934,38 @@ const char* SysInfo_GetBoardRev()
 {
     if (!s_dataLoaded) return "";
     return s_data.boardRevFinal;
+}
+// ============================================================================
+// AutoRun — headless data gather + report write for XbSet automation
+// ============================================================================
+
+// Reuses WriteLine which is defined earlier in this file
+void SysInfo_AutoRun(HANDLE hReport)
+{
+    // Trigger a full data read
+    ReadSysData();
+    s_dataLoaded = true;
+
+    const SysData& d = s_data;
+
+    WriteLine(hReport, "CPU IC:        ", d.cpuIC);
+    WriteLine(hReport, "CPU Speed:     ", d.cpuSpeedMHz);
+    WriteLine(hReport, "GPU Speed:     ", d.gpuSpeedMHz);
+    WriteLine(hReport, "CPU Brand:     ", d.cpuBrand);
+    WriteLine(hReport, "Mem Total:     ", d.memTotal);
+    WriteLine(hReport, "Mem Config:    ", d.memConfig);
+    WriteLine(hReport, "Board Rev:     ", d.boardRevFinal);
+    WriteLine(hReport, "Serial:        ", d.serialNum);
+    WriteLine(hReport, "Modchip:       ", d.modchipName);
+    WriteLine(hReport, "HD Mod:        ", d.hdModVer);
+    WriteLine(hReport, "Encoder:       ", d.encName);
+    WriteLine(hReport, "AV Pack:       ", d.avPack);
+    WriteLine(hReport, "Temp CPU:      ", d.tempCPU);
+    WriteLine(hReport, "Temp Ambient:  ", d.tempAmbient);
+    WriteLine(hReport, "HDD Model:     ", d.hddModel);
+    WriteLine(hReport, "HDD Size:      ", d.hddSizeGB);
+    WriteLine(hReport, "HDD UDMA:      ", d.hddUDMA);
+    WriteLine(hReport, "DVD:           ", d.dvdStatus);
+    WriteLine(hReport, "MAC:           ", d.macAddr);
+    WriteLine(hReport, "IP:            ", d.ipAddr);
 }

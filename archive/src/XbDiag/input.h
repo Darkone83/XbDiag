@@ -55,7 +55,8 @@ void GetSticks(int& lx, int& ly, int& rx, int& ry);
 void GetTriggers(int& lt, int& rt, int& black, int& white,
     int& btnA, int& btnB, int& btnX, int& btnY);
 
-// Sets rumble motors on the first connected pad.
+// Returns true if a controller is connected on the given port (0..3).
+bool IsPortConnected(int port);
 //   left  = left  (low-frequency) motor  0..65535
 //   right = right (high-frequency) motor 0..65535
 //   Pass 0,0 to stop rumble.

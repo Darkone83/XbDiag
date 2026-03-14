@@ -1,4 +1,4 @@
-#include "font.h"
+ï»¿#include "font.h"
 #include <xtl.h>
 
 // This matches the VERTEX layout used in renderer, but is local to this TU.
@@ -20,9 +20,9 @@ struct Glyph
 };
 
 // NOTE:
-//  - a–z are mapped to A–Z in FindGlyph() so we only store uppercase.
+//  - aï¿½z are mapped to Aï¿½Z in FindGlyph() so we only store uppercase.
 //  - Unknown characters fall back to space.
-//  - This is a tweaked “Option B” style: slightly more geometric/sci-fi,
+//  - This is a tweaked ï¿½Option Bï¿½ style: slightly more geometric/sci-fi,
 //    but still 5x7 and compatible with the rest of the project.
 
 static Glyph g_font[] =
@@ -30,7 +30,7 @@ static Glyph g_font[] =
     // Space
     { ' ',{0x00,0x00,0x00,0x00,0x00,0x00,0x00} },
 
-    // A–Z (updated shapes)
+    // Aï¿½Z (updated shapes)
     { 'A',{0x0E,0x11,0x11,0x1F,0x11,0x11,0x11} }, // A
     { 'B',{0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E} }, // B
     { 'C',{0x0E,0x11,0x10,0x10,0x10,0x11,0x0E} }, // C
@@ -102,6 +102,7 @@ static Glyph g_font[] =
     { '@',{0x0E,0x11,0x17,0x15,0x17,0x10,0x0E} },
     { '<',{0x02,0x04,0x08,0x10,0x08,0x04,0x02} },
     { '>',{0x08,0x04,0x02,0x01,0x02,0x04,0x08} },
+    { '*',{0x00,0x15,0x0E,0x1F,0x0E,0x15,0x00} },
 };
 
 static const int g_fontCount = sizeof(g_font) / sizeof(g_font[0]);
@@ -125,7 +126,7 @@ static const Glyph* FindGlyph(char c)
 }
 
 // -----------------------------------------------------------------------------
-// Low-level “raw” char draw: single pass, no effects
+// Low-level ï¿½rawï¿½ char draw: single pass, no effects
 // -----------------------------------------------------------------------------
 static void DrawCharRaw(float x, float y, char c, float scale, DWORD color)
 {

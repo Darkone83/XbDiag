@@ -82,18 +82,79 @@ struct VideoData
 
     // NV2A registers (MMIO 0xFD000000)
     bool nv2aOK;
-    char memClkStr[12];  // "200 MHz"
-    char pixClkStr[12];  // "74 MHz"
+    char gpuClkStr[16];  // "233 MHz" (NVPLL)
+    char memClkStr[16];  // "200 MHz" (MPLL x2 DDR)
+    char pixClkStr[12];  // "74 MHz" (VPLL)
     char fbBaseStr[12];  // "0x00FC0000"
     char vramStr[8];     // "64 MB" / "128 MB"
+    // Raw register values for field diagnosis
+    char nvpllRaw[12];   // "0x00011C01"
+    char mpllRaw[12];    // "0x0001...."
 };
 
 static VideoData s_data;
 static WORD      s_prevBtns;
 static bool      s_loaded = false;
 
-enum VideoSubState { VSS_INFO, VSS_NTSC_BARS, VSS_PAL_BARS };
+enum VideoSubState { VSS_INFO, VSS_NTSC_BARS, VSS_PAL_BARS, VSS_MODE_TEST };
 static VideoSubState s_subState = VSS_INFO;
+
+// ============================================================================
+// Mode test — state and mode table
+// ============================================================================
+//
+// ModeEntry mirrors main.cpp's VideoMode but is local to VideoInfo.
+// needPack: 0 = any AV pack,  1 = 480p-capable (HDTV or VGA),  2 = HDTV-only
+//
+// AV pack byte (PIC reg 0x04 bits [2:0]):
+//   0=SCART  1=HDTV  2=VGA  4=S-Video  5=Composite  6=None  0xFF=unknown
+//
+// After a mode switch g_sx, g_sy, g_videoModeStr and g_isHD are updated so
+// all DiagCommon drawing primitives (FillRect, DrawText etc.) remain correct.
+// On exit, RestoreMode() resets back to the original presentation parameters
+// and re-syncs those same globals.
+//
+// Render states are explicitly re-applied after every Reset() because the
+// device loses all state — the four lines mirror InitD3D() in main.cpp.
+//
+// NOTE: Xbox D3D8 Reset() does not invalidate CPU-side texture allocations
+// (unified memory — no "default pool" eviction as on PC D3D8).  The logo
+// texture (g_logo.tex) and font (pure DrawPrimitiveUP, no texture) survive.
+
+struct ModeEntry
+{
+    const char* label;        // "480i", "480p", "576i PAL", "720p", "1080i"
+    DWORD       width;
+    DWORD       height;
+    DWORD       presentFlags; // D3DPRESENTFLAG_* combination
+    DWORD       refreshHz;
+    bool        isPAL;        // true → DrawColorBars uses EBU pattern
+    BYTE        needPack;     // 0=any  1=480p-capable  2=HDTV-only
+};
+
+static const ModeEntry s_allModes[] =
+{
+    { "480i",     640,  480, D3DPRESENTFLAG_INTERLACED,                             60, false, 0 },
+    { "480p",     640,  480, D3DPRESENTFLAG_PROGRESSIVE,                            60, false, 1 },
+    { "576i PAL", 720,  576, D3DPRESENTFLAG_INTERLACED,                             50, true,  0 },
+    { "720p",    1280,  720, D3DPRESENTFLAG_PROGRESSIVE | D3DPRESENTFLAG_WIDESCREEN, 60, false, 2 },
+    { "1080i",   1920, 1080, D3DPRESENTFLAG_INTERLACED | D3DPRESENTFLAG_WIDESCREEN, 30, false, 2 },
+};
+static const int ALL_MODE_COUNT = sizeof(s_allModes) / sizeof(s_allModes[0]);
+
+// Filtered list (populated in EnterModeTest based on AV pack)
+static ModeEntry s_modeList[ALL_MODE_COUNT];
+static int       s_modeCount = 0;
+static int       s_modeIdx = 0;
+static BYTE      s_avPackTest = 0xFF;  // raw AV pack byte cached at OnEnter
+static int       s_settleFrames = 0;    // counts down after a mode switch before HW verify runs
+
+// Original mode — captured at OnEnter so RestoreMode can undo any switches
+static char  s_origLabel[16] = "480i";  // exact label from g_videoModeStr at OnEnter
+static DWORD s_origWidth = 640;
+static DWORD s_origHeight = 480;
+static DWORD s_origFlags = D3DPRESENTFLAG_INTERLACED;
+static DWORD s_origRefresh = 60;
 
 // ============================================================================
 // Helpers
@@ -161,53 +222,83 @@ static DWORD NvPllToMHz(DWORD reg)
 static void LoadNV2A(VideoData& d)
 {
     d.nv2aOK = false;
+    StrCopy(d.gpuClkStr, sizeof(d.gpuClkStr), "N/A");
     StrCopy(d.memClkStr, sizeof(d.memClkStr), "N/A");
     StrCopy(d.pixClkStr, sizeof(d.pixClkStr), "N/A");
     StrCopy(d.fbBaseStr, sizeof(d.fbBaseStr), "N/A");
     StrCopy(d.vramStr, sizeof(d.vramStr), "N/A");
-
-    // Guard: confirm NV2A vendor via PCI before touching MMIO
-    // NV2A: PCI vendor 0x10DE, device 0x02A0
-    DWORD pciId = ViPciRead32(0, 0, 0, 0x00);
-    if ((pciId & 0xFFFF) != 0x10DE)
-        return;
+    StrCopy(d.nvpllRaw, sizeof(d.nvpllRaw), "0x00000000");
+    StrCopy(d.mpllRaw, sizeof(d.mpllRaw), "0x00000000");
 
     d.nv2aOK = true;
 
-    // MPLL (memory clock) at PRAMDAC 0x680504
+    // ---- Helper: decode PLL register and format as MHz string ----------
+    // NVPLL / MPLL format: M[7:0], N[15:8], P[19:16]
+    // F_out = (16666 KHz * N) / (M * 2^P)
+    // Returns 0 if register reads as zero (MMIO not mapped / not clocked).
+
+    // ---- NVPLL: GPU core clock at PRAMDAC+0x500 (0xFD680500) -----------
     {
-        volatile DWORD* pMpll = (volatile DWORD*)(NV2A_BASE + 0x680504UL);
-        DWORD mhz = NvPllToMHz(*pMpll);
-        if (mhz > 0 && mhz < 600)
+        volatile DWORD* pNvpll = (volatile DWORD*)(NV2A_BASE + 0x680500UL);
+        DWORD reg = *pNvpll;
+        // Store raw for diagnostic display
+        char rh[10]; IntToHex(reg, 8, rh, sizeof(rh));
+        StrCat2(d.nvpllRaw, sizeof(d.nvpllRaw), "0x", rh);
+
+        DWORD mhz = NvPllToMHz(reg);
+        if (mhz > 100 && mhz < 600)
         {
-            char t[8];
-            IntToStr((int)mhz, t, sizeof(t));
-            StrCat2(d.memClkStr, sizeof(d.memClkStr), t, " MHz");
+            char t[8]; IntToStr((int)mhz, t, sizeof(t));
+            StrCat2(d.gpuClkStr, sizeof(d.gpuClkStr), t, " MHz");
+        }
+        else
+        {
+            // MMIO returned 0 or unexpected value — use known Xbox default
+            StrCopy(d.gpuClkStr, sizeof(d.gpuClkStr), "233 MHz*");
         }
     }
 
-    // VPLL1 (pixel clock) at PRAMDAC 0x680508
+    // ---- MPLL: memory clock at PRAMDAC+0x504 (0xFD680504) ---------------
+    // MPLL gives the SDRAM clock; Xbox uses DDR so effective rate = 2x.
+    {
+        volatile DWORD* pMpll = (volatile DWORD*)(NV2A_BASE + 0x680504UL);
+        DWORD reg = *pMpll;
+        char rh[10]; IntToHex(reg, 8, rh, sizeof(rh));
+        StrCat2(d.mpllRaw, sizeof(d.mpllRaw), "0x", rh);
+
+        DWORD mhz = NvPllToMHz(reg);
+        if (mhz > 50 && mhz < 600)
+        {
+            // Display effective DDR rate (2x MPLL)
+            char t[8]; IntToStr((int)(mhz * 2), t, sizeof(t));
+            StrCat2(d.memClkStr, sizeof(d.memClkStr), t, " MHz DDR");
+        }
+        else
+        {
+            StrCopy(d.memClkStr, sizeof(d.memClkStr), "200 MHz DDR*");
+        }
+    }
+
+    // ---- VPLL1: pixel clock at PRAMDAC+0x508 (0xFD680508) ---------------
     {
         volatile DWORD* pVpll = (volatile DWORD*)(NV2A_BASE + 0x680508UL);
         DWORD mhz = NvPllToMHz(*pVpll);
         if (mhz > 0 && mhz < 600)
         {
-            char t[8];
-            IntToStr((int)mhz, t, sizeof(t));
+            char t[8]; IntToStr((int)mhz, t, sizeof(t));
             StrCat2(d.pixClkStr, sizeof(d.pixClkStr), t, " MHz");
         }
     }
 
-    // PCRTC_START (framebuffer scanout base) at 0x600810
+    // ---- PCRTC_START: framebuffer scanout base at 0x600810 ---------------
     {
         volatile DWORD* pFbBase = (volatile DWORD*)(NV2A_BASE + 0x600810UL);
         DWORD addr = *pFbBase;
-        char t[10];
-        IntToHex(addr, 8, t, sizeof(t));
+        char t[10]; IntToHex(addr, 8, t, sizeof(t));
         StrCat2(d.fbBaseStr, sizeof(d.fbBaseStr), "0x", t);
     }
 
-    // PFB_BOOT_0 (VRAM size strap) at 0x100200, bit 2: 0=64MB 1=128MB
+    // ---- PFB_BOOT_0: VRAM size strap at 0x100200, bit 2 -----------------
     {
         volatile DWORD* pPfb = (volatile DWORD*)(NV2A_BASE + 0x100200UL);
         DWORD boot0 = *pPfb;
@@ -470,38 +561,325 @@ static void LoadData()
 //
 // All coordinates in 640x480 design space; FillRect scales to backbuffer.
 
-static void DrawColorBars(bool isPAL)
+// ============================================================================
+// Mode test helpers
+// ============================================================================
+
+// Forward decls
+static void DrawColorBarsContent(bool isPAL);  // pure drawing, no scene mgmt
+
+// ---- AV pack display name -------------------------------------------------
+static const char* AvPackName(BYTE av)
 {
+    switch (av)
+    {
+    case 0:    return "SCART";
+    case 1:    return "HDTV";
+    case 2:    return "VGA";
+    case 4:    return "S-VIDEO";
+    case 5:    return "COMPOSITE";
+    case 6:    return "NONE";
+    default:   return "UNKNOWN";
+    }
+}
+
+// Populate s_modeList[] from s_allModes[] filtered by AV pack capability.
+static void BuildModeList()
+{
+    bool can480p = (s_avPackTest == 1 || s_avPackTest == 2);   // HDTV or VGA
+    bool canHD = (s_avPackTest == 1);                        // HDTV only
+
+    s_modeCount = 0;
+    for (int i = 0; i < ALL_MODE_COUNT; ++i)
+    {
+        BYTE need = s_allModes[i].needPack;
+        if (need == 1 && !can480p) continue;
+        if (need == 2 && !canHD)   continue;
+        s_modeList[s_modeCount++] = s_allModes[i];
+    }
+    if (s_modeCount == 0)
+        s_modeList[s_modeCount++] = s_allModes[0];
+}
+
+// Return index into s_modeList for a given s_allModes entry, or -1 if not available.
+static int AllModeToListIdx(int allIdx)
+{
+    const ModeEntry& a = s_allModes[allIdx];
+    for (int i = 0; i < s_modeCount; ++i)
+    {
+        if (s_modeList[i].width == a.width &&
+            s_modeList[i].height == a.height &&
+            s_modeList[i].presentFlags == a.presentFlags)
+            return i;
+    }
+    return -1;
+}
+
+// Switch D3D device + video encoder to the mode at s_modeList[idx].
+// Returns false if Reset() failed (device remains in previous state).
+static bool SwitchMode(int idx)
+{
+    if (idx < 0 || idx >= s_modeCount) return false;
+    const ModeEntry& m = s_modeList[idx];
+
+    D3DPRESENT_PARAMETERS pp;
+    ZeroMemory(&pp, sizeof(pp));
+    pp.BackBufferWidth = m.width;
+    pp.BackBufferHeight = m.height;
+    pp.BackBufferFormat = D3DFMT_A8R8G8B8;
+    pp.BackBufferCount = 1;
+    pp.EnableAutoDepthStencil = TRUE;    // must match InitD3D exactly
+    pp.AutoDepthStencilFormat = D3DFMT_D24S8;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.Flags = m.presentFlags;
+    pp.FullScreen_RefreshRateInHz = m.refreshHz;
+    pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_ONE;
+
+    if (FAILED(g_pDevice->Reset(&pp))) return false;
+
+    g_sx = (float)m.width / SW;
+    g_sy = (float)m.height / SH;
+    StrCopy(g_videoModeStr, sizeof(g_videoModeStr), m.label);
+    g_isHD = (m.width > 800);
+
+    g_pDevice->SetRenderState(D3DRS_LIGHTING, FALSE);
+    g_pDevice->SetRenderState(D3DRS_ZENABLE, FALSE);
+    g_pDevice->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    g_pDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+
+    s_settleFrames = 2;   // wait 2 frames before trusting GetBackBuffer result
+    return true;
+}
+
+// Restore D3D device to the original mode captured in VideoInfo_OnEnter().
+static void RestoreMode()
+{
+    D3DPRESENT_PARAMETERS pp;
+    ZeroMemory(&pp, sizeof(pp));
+    pp.BackBufferWidth = s_origWidth;
+    pp.BackBufferHeight = s_origHeight;
+    pp.BackBufferFormat = D3DFMT_A8R8G8B8;
+    pp.BackBufferCount = 1;
+    pp.EnableAutoDepthStencil = TRUE;    // must match InitD3D / SwitchMode exactly
+    pp.AutoDepthStencilFormat = D3DFMT_D24S8;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.Flags = s_origFlags;
+    pp.FullScreen_RefreshRateInHz = s_origRefresh;
+    pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_ONE;
+
+    g_pDevice->Reset(&pp);
+
+    g_sx = (float)s_origWidth / SW;
+    g_sy = (float)s_origHeight / SH;
+    g_isHD = (s_origWidth > 800);
+
+    // Restore original mode string — use s_origLabel captured at OnEnter
+    // so we never confuse 480i and 480p (both 640x480 at 60Hz).
+    StrCopy(g_videoModeStr, sizeof(g_videoModeStr), s_origLabel);
+
+    g_pDevice->SetRenderState(D3DRS_LIGHTING, FALSE);
+    g_pDevice->SetRenderState(D3DRS_ZENABLE, FALSE);
+    g_pDevice->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    g_pDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+
+}
+
+// ============================================================================
+// DrawModeTest
+//
+// Owns the full frame: BeginScene -> bars -> overlay -> EndScene -> Present.
+// Previously the overlay was drawn outside DrawColorBars' EndScene/Present,
+// which meant it was submitted in an invalid state and never displayed.
+//
+// Overlay (bottom 120px of design space):
+//   Row 0:  current mode details + mode counter
+//   Row 1:  video flags (PROGRESSIVE/INTERLACED, WIDESCREEN)
+//   Row 2:  separator + AV pack context
+//   Rows 3+: all five modes listed — available highlighted, unavailable dimmed
+//   Last:   [WHITE]/[BLACK]/[B] navigation hint
+// ============================================================================
+
+static void DrawModeTest()
+{
+    const ModeEntry& m = s_modeList[s_modeIdx];
+
     g_pDevice->BeginScene();
 
-    // Full black background first
+    // Color bars occupy the top portion; bars are clipped to [0..OY)
+    DrawColorBarsContent(m.isPAL);
+
+    // ---- Overlay -----------------------------------------------------------
+    const float OVH = 120.f;
+    const float OY = SH - OVH;   // 360
+
+    FillRect(0.f, OY, SW, SH, D3DCOLOR_ARGB(220, 0, 0, 0));
+    HLine(OY, 0.f, SW, COL_BORDER);
+
+    char tbuf[10];
+
+    // -- Row 0: mode label + resolution + refresh  (left) | counter (right) --
+    static char s_info[48];
+    StrCopy(s_info, sizeof(s_info), m.label);
+    StrCat2(s_info, sizeof(s_info), s_info, "   ");
+    IntToStr((int)m.width, tbuf, sizeof(tbuf)); StrCat2(s_info, sizeof(s_info), s_info, tbuf);
+    StrCat2(s_info, sizeof(s_info), s_info, "x");
+    IntToStr((int)m.height, tbuf, sizeof(tbuf)); StrCat2(s_info, sizeof(s_info), s_info, tbuf);
+    StrCat2(s_info, sizeof(s_info), s_info, " @ ");
+    IntToStr((int)m.refreshHz, tbuf, sizeof(tbuf)); StrCat2(s_info, sizeof(s_info), s_info, tbuf);
+    StrCat2(s_info, sizeof(s_info), s_info, "Hz");
+    DrawText(LM, OY + 5.f, s_info, 1.2f, COL_CYAN);
+
+    // Counter "3 / 4" right-aligned
+    static char s_idx[12];
+    IntToStr(s_modeIdx + 1, tbuf, sizeof(tbuf)); StrCopy(s_idx, sizeof(s_idx), tbuf);
+    StrCat2(s_idx, sizeof(s_idx), s_idx, " / ");
+    IntToStr(s_modeCount, tbuf, sizeof(tbuf)); StrCat2(s_idx, sizeof(s_idx), s_idx, tbuf);
+    DrawText(SW - LM - TW(s_idx, 1.15f), OY + 5.f, s_idx, 1.15f, COL_WHITE);
+
+    // -- Row 1: video flags --------------------------------------------------
+    static char s_flags[48];
+    StrCopy(s_flags, sizeof(s_flags),
+        (m.presentFlags & D3DPRESENTFLAG_PROGRESSIVE) ? "PROGRESSIVE" : "INTERLACED");
+    if (m.presentFlags & D3DPRESENTFLAG_WIDESCREEN)
+        StrCat2(s_flags, sizeof(s_flags), s_flags, "  WIDESCREEN");
+    if (m.isPAL)
+        StrCat2(s_flags, sizeof(s_flags), s_flags, "  PAL");
+    DrawText(LM, OY + 21.f, s_flags, 1.0f, D3DCOLOR_XRGB(140, 200, 140));
+
+    // -- Row 2: separator + AV pack context ----------------------------------
+    HLine(OY + 34.f, 0.f, SW, D3DCOLOR_XRGB(40, 40, 55));
+
+    static char s_avLine[40];
+    StrCopy(s_avLine, sizeof(s_avLine), "ALL MODES   AV PACK: ");
+    StrCat2(s_avLine, sizeof(s_avLine), s_avLine, AvPackName(s_avPackTest));
+    DrawText(LM, OY + 38.f, s_avLine, 1.0f, D3DCOLOR_XRGB(100, 100, 120));
+
+    // -- Rows 3+: mode list --------------------------------------------------
+    // Show all five modes in s_allModes. Available modes are bright; the
+    // currently active mode gets a ► marker. Unavailable modes are dimmed
+    // with a note explaining the AV pack requirement.
+    const float LIST_Y0 = OY + 52.f;
+    const float LIST_DY = 12.f;
+    const float COL_AVAIL_X = LM + 12.f;   // label X for available
+    const float COL_LABEL_X = LM + 12.f;
+    const float COL_RES_X = LM + 80.f;
+    const float COL_HZ_X = LM + 168.f;
+    const float COL_FLAGS_X = LM + 210.f;
+    const float COL_NOTE_X = LM + 292.f;
+
+    for (int ai = 0; ai < ALL_MODE_COUNT; ++ai)
+    {
+        const ModeEntry& e = s_allModes[ai];
+        int              li = AllModeToListIdx(ai);   // -1 if not available
+        bool             isCurrent = (li == s_modeIdx);
+        float            ry = LIST_Y0 + (float)ai * LIST_DY;
+
+        // Arrow marker for current
+        if (isCurrent)
+            DrawText(LM, ry, ">", 1.0f, COL_CYAN);
+
+        // Label
+        DWORD labelCol = isCurrent ? COL_WHITE
+            : (li >= 0) ? D3DCOLOR_XRGB(160, 160, 160)
+            : D3DCOLOR_XRGB(60, 60, 70);
+        DrawText(COL_LABEL_X, ry, e.label, 1.0f, labelCol);
+
+        // Resolution  e.g. "1280x720"
+        static char s_res[20];
+        IntToStr((int)e.width, tbuf, sizeof(tbuf)); StrCopy(s_res, sizeof(s_res), tbuf);
+        StrCat2(s_res, sizeof(s_res), s_res, "x");
+        IntToStr((int)e.height, tbuf, sizeof(tbuf)); StrCat2(s_res, sizeof(s_res), s_res, tbuf);
+        DrawText(COL_RES_X, ry, s_res, 1.0f, labelCol);
+
+        // Refresh  e.g. "60Hz"
+        static char s_hz[10];
+        IntToStr((int)e.refreshHz, tbuf, sizeof(tbuf));
+        StrCopy(s_hz, sizeof(s_hz), tbuf);
+        StrCat2(s_hz, sizeof(s_hz), s_hz, "Hz");
+        DrawText(COL_HZ_X, ry, s_hz, 1.0f, labelCol);
+
+        // Flags
+        if (e.presentFlags & D3DPRESENTFLAG_WIDESCREEN)
+            DrawText(COL_FLAGS_X, ry, "WIDE", 1.0f, labelCol);
+        if (e.isPAL)
+            DrawText(COL_FLAGS_X + (e.presentFlags & D3DPRESENTFLAG_WIDESCREEN ? 36.f : 0.f),
+                ry, "PAL", 1.0f, labelCol);
+
+        // Unavailability note
+        if (li < 0)
+        {
+            const char* note = (e.needPack == 2) ? "[HDTV ONLY]" : "[HDTV/VGA]";
+            DrawText(COL_NOTE_X, ry, note, 1.0f, D3DCOLOR_XRGB(100, 60, 60));
+        }
+    }
+
+    // -- Hardware verify row: deferred by 2 frames so NV2A scanout settles --
+    if (s_settleFrames > 0)
+    {
+        DrawText(SW - LM - TW("HW: settling...", 1.0f), OY + OVH - 26.f,
+            "HW: settling...", 1.0f, COL_DIM);
+        --s_settleFrames;
+    }
+    else
+    {
+        DWORD bbW = 0, bbH = 0;
+        LPDIRECT3DSURFACE8 pBB = NULL;
+        if (SUCCEEDED(g_pDevice->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &pBB)) && pBB)
+        {
+            D3DSURFACE_DESC desc;
+            if (SUCCEEDED(pBB->GetDesc(&desc))) { bbW = desc.Width; bbH = desc.Height; }
+            pBB->Release();
+        }
+        bool match = (bbW == m.width && bbH == m.height);
+        static char s_hw[48];
+        StrCopy(s_hw, sizeof(s_hw), "HW: ");
+        if (bbW > 0)
+        {
+            char wa[8], ha[8];
+            IntToStr((int)bbW, wa, sizeof(wa)); IntToStr((int)bbH, ha, sizeof(ha));
+            StrCat2(s_hw, sizeof(s_hw), s_hw, wa);
+            StrCat2(s_hw, sizeof(s_hw), s_hw, "x"); StrCat2(s_hw, sizeof(s_hw), s_hw, ha);
+            StrCat2(s_hw, sizeof(s_hw), s_hw, match ? "  OK" : "  MISMATCH");
+        }
+        else StrCat2(s_hw, sizeof(s_hw), s_hw, "query failed");
+        DrawText(SW - LM - TW(s_hw, 1.0f), OY + OVH - 26.f, s_hw, 1.0f,
+            (bbW == 0) ? COL_RED : (match ? COL_GREEN : COL_ORANGE));
+    }
+
+    // -- Last row: navigation hint -------------------------------------------
+    DrawText(LM, OY + OVH - 13.f,
+        "[WHITE] Next    [BLACK] Prev    [B] Restore & Exit",
+        1.05f, COL_YELLOW);
+
+    g_pDevice->EndScene();
+    g_pDevice->Present(NULL, NULL, NULL, NULL);
+}
+
+// ============================================================================
+// DrawColorBarsContent — pure drawing, no scene management.
+// Called by both DrawColorBars (standalone) and DrawModeTest (embedded).
+// ============================================================================
+
+static void DrawColorBarsContent(bool isPAL)
+{
     FillRect(0.f, 0.f, SW, SH, D3DCOLOR_XRGB(0, 0, 0));
 
     if (!isPAL)
     {
-        // ----------------------------------------------------------------
-        // NTSC SMPTE 75% color bars
-        // ----------------------------------------------------------------
-        // Top region: y = 0 .. topH
-        // Mid stripe:  topH .. midH
-        // Bot region:  midH .. SH
-
-        const float topH = SH * 0.667f;   // 2/3 height
-        const float midH = SH * 0.750f;   // thin stripe bottom
+        const float topH = SH * 0.667f;
+        const float midH = SH * 0.750f;
         const float barW = SW / 7.f;
 
-        // 75% SMPTE colors (ITU-R BT.601 75% bars)
         static const DWORD ntscTop[7] =
         {
-            D3DCOLOR_XRGB(191, 191, 191), // 75% White
-            D3DCOLOR_XRGB(191, 191,   0), // Yellow
-            D3DCOLOR_XRGB(0, 191, 191), // Cyan
-            D3DCOLOR_XRGB(0, 191,   0), // Green
-            D3DCOLOR_XRGB(191,   0, 191), // Magenta
-            D3DCOLOR_XRGB(191,   0,   0), // Red
-            D3DCOLOR_XRGB(0,   0, 191), // Blue
+            D3DCOLOR_XRGB(191, 191, 191),
+            D3DCOLOR_XRGB(191, 191,   0),
+            D3DCOLOR_XRGB(0, 191, 191),
+            D3DCOLOR_XRGB(0, 191,   0),
+            D3DCOLOR_XRGB(191,   0, 191),
+            D3DCOLOR_XRGB(191,   0,   0),
+            D3DCOLOR_XRGB(0,   0, 191),
         };
-
         for (int i = 0; i < 7; ++i)
         {
             float x0 = barW * (float)i;
@@ -509,17 +887,15 @@ static void DrawColorBars(bool isPAL)
             FillRect(x0, 0.f, x1, topH, ntscTop[i]);
         }
 
-        // Mid stripe: reverse blue bars (Blue / Black / Magenta / Black /
-        //             Cyan / Black / White) then PLUGE at far right
         static const DWORD ntscMid[7] =
         {
-            D3DCOLOR_XRGB(0,   0, 191), // Blue
-            D3DCOLOR_XRGB(0,   0,   0), // Black
-            D3DCOLOR_XRGB(191,   0, 191), // Magenta
-            D3DCOLOR_XRGB(0,   0,   0), // Black
-            D3DCOLOR_XRGB(0, 191, 191), // Cyan
-            D3DCOLOR_XRGB(0,   0,   0), // Black
-            D3DCOLOR_XRGB(191, 191, 191), // 75% White
+            D3DCOLOR_XRGB(0,   0, 191),
+            D3DCOLOR_XRGB(0,   0,   0),
+            D3DCOLOR_XRGB(191,   0, 191),
+            D3DCOLOR_XRGB(0,   0,   0),
+            D3DCOLOR_XRGB(0, 191, 191),
+            D3DCOLOR_XRGB(0,   0,   0),
+            D3DCOLOR_XRGB(191, 191, 191),
         };
         for (int i = 0; i < 7; ++i)
         {
@@ -528,17 +904,15 @@ static void DrawColorBars(bool isPAL)
             FillRect(x0, topH, x1, midH, ntscMid[i]);
         }
 
-        // Bottom row: -I / White / +Q / Black / sub-black / Black / super-white
-        // Subdivide 7 bars into same columns
         static const DWORD ntscBot[7] =
         {
-            D3DCOLOR_XRGB(0,  33,  76), // -I
-            D3DCOLOR_XRGB(255, 255, 255), // 100% White
-            D3DCOLOR_XRGB(50,   0,  71), // +Q
-            D3DCOLOR_XRGB(7,   7,   7), // PLUGE sub-black
-            D3DCOLOR_XRGB(0,   0,   0), // Black
-            D3DCOLOR_XRGB(18,  18,  18), // PLUGE super-black
-            D3DCOLOR_XRGB(0,   0,   0), // Black
+            D3DCOLOR_XRGB(0,  33,  76),
+            D3DCOLOR_XRGB(255, 255, 255),
+            D3DCOLOR_XRGB(50,   0,  71),
+            D3DCOLOR_XRGB(7,   7,   7),
+            D3DCOLOR_XRGB(0,   0,   0),
+            D3DCOLOR_XRGB(18,  18,  18),
+            D3DCOLOR_XRGB(0,   0,   0),
         };
         for (int i = 0; i < 7; ++i)
         {
@@ -549,28 +923,20 @@ static void DrawColorBars(bool isPAL)
     }
     else
     {
-        // ----------------------------------------------------------------
-        // PAL EBU 8-bar pattern
-        // ----------------------------------------------------------------
-        // Top 3/4 - 8 full-saturation bars
-        // Bottom 1/4 - grey/black reference pairs per column
-
         const float topH = SH * 0.75f;
         const float barW = SW / 8.f;
 
-        // EBU 100% full-field bars
         static const DWORD palTop[8] =
         {
-            D3DCOLOR_XRGB(255, 255, 255), // White
-            D3DCOLOR_XRGB(255, 255,   0), // Yellow
-            D3DCOLOR_XRGB(0, 255, 255), // Cyan
-            D3DCOLOR_XRGB(0, 255,   0), // Green
-            D3DCOLOR_XRGB(255,   0, 255), // Magenta
-            D3DCOLOR_XRGB(255,   0,   0), // Red
-            D3DCOLOR_XRGB(0,   0, 255), // Blue
-            D3DCOLOR_XRGB(0,   0,   0), // Black
+            D3DCOLOR_XRGB(255, 255, 255),
+            D3DCOLOR_XRGB(255, 255,   0),
+            D3DCOLOR_XRGB(0, 255, 255),
+            D3DCOLOR_XRGB(0, 255,   0),
+            D3DCOLOR_XRGB(255,   0, 255),
+            D3DCOLOR_XRGB(255,   0,   0),
+            D3DCOLOR_XRGB(0,   0, 255),
+            D3DCOLOR_XRGB(0,   0,   0),
         };
-
         for (int i = 0; i < 8; ++i)
         {
             float x0 = barW * (float)i;
@@ -578,19 +944,17 @@ static void DrawColorBars(bool isPAL)
             FillRect(x0, 0.f, x1, topH, palTop[i]);
         }
 
-        // Bottom reference row: alternating grey (IRE 40) / black per column
         static const DWORD palBot[8] =
         {
-            D3DCOLOR_XRGB(104, 104, 104), // Grey
-            D3DCOLOR_XRGB(0,   0,   0), // Black
-            D3DCOLOR_XRGB(104, 104, 104), // Grey
-            D3DCOLOR_XRGB(0,   0,   0), // Black
-            D3DCOLOR_XRGB(104, 104, 104), // Grey
-            D3DCOLOR_XRGB(0,   0,   0), // Black
-            D3DCOLOR_XRGB(104, 104, 104), // Grey
-            D3DCOLOR_XRGB(0,   0,   0), // Black
+            D3DCOLOR_XRGB(104, 104, 104),
+            D3DCOLOR_XRGB(0,   0,   0),
+            D3DCOLOR_XRGB(104, 104, 104),
+            D3DCOLOR_XRGB(0,   0,   0),
+            D3DCOLOR_XRGB(104, 104, 104),
+            D3DCOLOR_XRGB(0,   0,   0),
+            D3DCOLOR_XRGB(104, 104, 104),
+            D3DCOLOR_XRGB(0,   0,   0),
         };
-
         for (int i = 0; i < 8; ++i)
         {
             float x0 = barW * (float)i;
@@ -599,20 +963,81 @@ static void DrawColorBars(bool isPAL)
         }
     }
 
-    // Small exit label bottom-left so user knows how to escape
+    // Exit hint (only shown in standalone bar modes, visible below bars)
     DrawText(6.f, SH - 14.f, "[B] Back", 1.1f, D3DCOLOR_ARGB(160, 255, 255, 255));
+}
 
+// Standalone color bar frame — used by VSS_NTSC_BARS and VSS_PAL_BARS.
+static void DrawColorBars(bool isPAL)
+{
+    g_pDevice->BeginScene();
+    DrawColorBarsContent(isPAL);
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
-
-
 
 void VideoInfo_OnEnter()
 {
     s_prevBtns = 0;
     s_loaded = false;
     s_subState = VSS_INFO;
+    // ---- Capture original presentation parameters for mode test restoration ----
+    // Read backbuffer dimensions from D3D; infer present flags by matching
+    // width+height against s_allModes[] (avoids exporting VideoMode from main.cpp).
+    s_origWidth = 640;
+    s_origHeight = 480;
+    s_origRefresh = 60;
+    s_origFlags = D3DPRESENTFLAG_INTERLACED;  // safe default
+
+    if (g_pDevice)
+    {
+        // Backbuffer size
+        LPDIRECT3DSURFACE8 pBB = NULL;
+        if (SUCCEEDED(g_pDevice->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &pBB)) && pBB)
+        {
+            D3DSURFACE_DESC desc;
+            if (SUCCEEDED(pBB->GetDesc(&desc)))
+            {
+                s_origWidth = desc.Width;
+                s_origHeight = desc.Height;
+            }
+            pBB->Release();
+        }
+        // Refresh rate
+        D3DDISPLAYMODE dm;
+        ZeroMemory(&dm, sizeof(dm));
+        if (SUCCEEDED(g_pDevice->GetDisplayMode(&dm)) && dm.RefreshRate > 0)
+            s_origRefresh = dm.RefreshRate;
+    }
+
+    // Capture the original mode label first — g_videoModeStr is the only
+    // unambiguous source since 480i and 480p are both 640x480 at 60Hz.
+    StrCopy(s_origLabel, sizeof(s_origLabel), g_videoModeStr);
+
+    // Look up the rest of the parameters from the mode table.
+    for (int i = 0; i < ALL_MODE_COUNT; ++i)
+    {
+        const char* a = s_allModes[i].label;
+        const char* b = s_origLabel;
+        int j = 0;
+        while (a[j] && b[j] && a[j] == b[j]) ++j;
+        if (!a[j] && !b[j])
+        {
+            s_origFlags = s_allModes[i].presentFlags;
+            s_origWidth = s_allModes[i].width;
+            s_origHeight = s_allModes[i].height;
+            s_origRefresh = s_allModes[i].refreshHz;
+            break;
+        }
+    }
+
+    // ---- Probe AV pack now so BuildModeList has it ready when mode test opens ----
+    s_avPackTest = 0xFF;
+    {
+        BYTE av = 0;
+        if (SMBusRead(SMBADDR_PIC, 0x04, av))
+            s_avPackTest = av & 0x07;
+    }
 }
 
 // ============================================================================
@@ -629,7 +1054,7 @@ static void DrawRow(float lx, float vx, float y,
 static void Render(const DiagLogo& logo)
 {
     g_pDevice->BeginScene();
-    DrawPageChrome(logo, "VIDEO INFO", "[X] NTSC Bars  [Y] PAL Bars  [B] Back");
+    DrawPageChrome(logo, "VIDEO INFO", "[X] NTSC Bars  [Y] PAL Bars  [WHITE] Mode Test  [B] Back");
 
     const VideoData& d = s_data;
 
@@ -678,8 +1103,15 @@ static void Render(const DiagLogo& logo)
     HLine(y1 + LH + 1.f, COL_L, COL_R - 12.f, COL_BORDER);
     y1 += LH + 6.f;
 
-    DrawRow(COL_L, COL_VL, y1, "MEM CLK :", d.memClkStr);    y1 += LH;
-    DrawRow(COL_L, COL_VL, y1, "PIX CLK :", d.pixClkStr);    y1 += LH;
+    DrawRow(COL_L, COL_VL, y1, "GPU CLK :", d.gpuClkStr,
+        COL_GREEN);                                           y1 += LH;
+    // Raw NVPLL hex — shows what the MMIO actually returned for diagnosis.
+    // Value ending in * means MMIO returned 0/invalid; default was used.
+    DrawText(COL_VL, y1, d.nvpllRaw, 0.95f, COL_DIM);      y1 += LH - 4.f;
+    DrawRow(COL_L, COL_VL, y1, "MEM CLK :", d.memClkStr,
+        COL_CYAN);                                            y1 += LH;
+    DrawText(COL_VL, y1, d.mpllRaw, 0.95f, COL_DIM);        y1 += LH - 4.f;
+    DrawRow(COL_L, COL_VL, y1, "PIX CLK :", d.pixClkStr);   y1 += LH;
     DrawRow(COL_L, COL_VL, y1, "FB BASE :", d.fbBaseStr,
         COL_CYAN);                                            y1 += LH;
 
@@ -786,9 +1218,9 @@ void VideoInfo_Tick(const DiagLogo& logo)
 
     WORD cur = GetButtons();
 
+    // ---- VSS_NTSC_BARS / VSS_PAL_BARS ----
     if (s_subState == VSS_NTSC_BARS || s_subState == VSS_PAL_BARS)
     {
-        // Any [B] or [Back] exits the color bar test back to info page
         if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
         {
             s_subState = VSS_INFO;
@@ -800,7 +1232,45 @@ void VideoInfo_Tick(const DiagLogo& logo)
         return;
     }
 
-    // VSS_INFO
+    // ---- VSS_MODE_TEST ----
+    if (s_subState == VSS_MODE_TEST)
+    {
+        if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
+        {
+            RestoreMode();
+            s_subState = VSS_INFO;
+            s_loaded = false;
+            // Present one blank frame immediately after Reset so NV2A has
+            // a valid frame in the pipeline before the next Tick runs.
+            g_pDevice->BeginScene();
+            g_pDevice->Clear(0, NULL, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 0, 0), 1.f, 0);
+            g_pDevice->EndScene();
+            g_pDevice->Present(NULL, NULL, NULL, NULL);
+            s_prevBtns = cur;
+            return;
+        }
+        if (EdgeDown(cur, s_prevBtns, BTN_WHITE))
+        {
+            int next = (s_modeIdx + 1) % s_modeCount;
+            if (SwitchMode(next)) s_modeIdx = next;
+            s_prevBtns = cur;
+            DrawModeTest();
+            return;
+        }
+        if (EdgeDown(cur, s_prevBtns, BTN_BLACK))
+        {
+            int prev = (s_modeIdx - 1 + s_modeCount) % s_modeCount;
+            if (SwitchMode(prev)) s_modeIdx = prev;
+            s_prevBtns = cur;
+            DrawModeTest();
+            return;
+        }
+        s_prevBtns = cur;
+        DrawModeTest();
+        return;
+    }
+
+    // ---- VSS_INFO ----
     if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
     {
         RequestState(MSTATE_MENU);
@@ -819,7 +1289,49 @@ void VideoInfo_Tick(const DiagLogo& logo)
         s_prevBtns = cur;
         return;
     }
+    if (EdgeDown(cur, s_prevBtns, BTN_WHITE))
+    {
+        // Build filtered mode list and switch to first mode on entry
+        BuildModeList();
+        s_modeIdx = 0;
+        s_settleFrames = 0;
+        s_subState = VSS_MODE_TEST;
+        SwitchMode(0);
+        s_prevBtns = cur;
+        return;
+    }
 
     s_prevBtns = cur;
     Render(logo);
+}
+// ============================================================================
+// AutoRun — headless data gather for XbSet automation
+// ============================================================================
+
+// Helper: write label+value line to report handle
+static void VIWriteLine(HANDLE hf, const char* label, const char* val)
+{
+    char line[128]; DWORD w;
+    StrCopy(line, sizeof(line), label);
+    StrCat2(line, sizeof(line), line, val);
+    StrCat2(line, sizeof(line), line, "\r\n");
+    WriteFile(hf, line, StrLen(line), &w, NULL);
+}
+
+void VideoInfo_AutoRun(HANDLE hReport)
+{
+    LoadData();
+    s_loaded = true;
+
+    const VideoData& d = s_data;
+    VIWriteLine(hReport, "Mode:       ", d.modeStr);
+    VIWriteLine(hReport, "Resolution: ", d.resStr);
+    VIWriteLine(hReport, "Refresh:    ", d.refreshStr);
+    VIWriteLine(hReport, "HD Mode:    ", d.isHDStr);
+    VIWriteLine(hReport, "GPU CLK:    ", d.gpuClkStr);
+    VIWriteLine(hReport, "Mem CLK:    ", d.memClkStr);
+    VIWriteLine(hReport, "VRAM:       ", d.vramStr);
+    VIWriteLine(hReport, "Encoder:    ", d.encName);
+    VIWriteLine(hReport, "AV Pack:    ", d.avPack);
+    VIWriteLine(hReport, "NVPLL Raw:  ", d.nvpllRaw);
 }

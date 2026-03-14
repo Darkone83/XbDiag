@@ -66,6 +66,12 @@
     <ClCompile Include="FileExplorer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="StressMath.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="XbSet.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Text Include="Media\Copy Assets Here.txt">
@@ -116,6 +122,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="FileExplorer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="StressMath.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="XbSet.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

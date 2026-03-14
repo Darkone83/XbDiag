@@ -127,7 +127,7 @@ static const float ABORT_BAR_H = 6.f;
 // State
 // ============================================================================
 
-enum StressState { SSTATE_IDLE = 0, SSTATE_CONFIRM, SSTATE_RUNNING };
+enum StressState { SSTATE_IDLE = 0, SSTATE_THRESHOLD, SSTATE_CONFIRM, SSTATE_RUNNING };
 enum StressCard { CARD_CPU = 0, CARD_RAM = 1 };
 
 static StressState s_state = SSTATE_IDLE;
@@ -163,6 +163,10 @@ static DWORD s_testStartMs = 0;
 // Abort hold
 static bool  s_abortHolding = false;
 static DWORD s_abortHoldStart = 0;
+
+// Thermal abort threshold (degrees C) — user-adjustable before test start
+static int s_tempThreshold = 75;
+static bool s_thermalAbort = false;  // set true if test stopped by over-temp
 
 // FPU stress working array — static so it's never on the stack
 // Initialised to non-zero in OnEnter so the FPU doesn't short-circuit on 0.0f
@@ -276,6 +280,13 @@ static void TakeSample()
         s_fanOK = true;
     }
 
+    // Thermal auto-abort
+    if (s_state == SSTATE_RUNNING && ok && (int)cpu >= s_tempThreshold)
+    {
+        s_state = SSTATE_IDLE;
+        s_thermalAbort = true;
+    }
+
     BYTE load = (s_state == SSTATE_RUNNING) ? 100 : 0;
     BYTE fanPct = s_fanOK ? (BYTE)((int)s_curFan * 2) : 0;
     PushHistory(cpu, load, fanPct);
@@ -335,6 +346,8 @@ void StressTest_OnEnter()
     s_avg_count = 0;
     s_abortHolding = false;
     s_abortHoldStart = 0;
+    s_thermalAbort = false;
+    // Note: s_tempThreshold intentionally NOT reset — persists across visits
     s_lastSample = GetTickCount() - SAMPLE_INTERVAL_MS;
 
     // Seed FPU work array with non-trivial values so first pass is real work
@@ -563,6 +576,47 @@ static void DrawGraph()
 }
 
 // ============================================================================
+// DrawThresholdOverlay — temp limit picker, shown before confirm
+// ============================================================================
+
+static void DrawThresholdOverlay()
+{
+    float ow = 320.f;
+    float oh = 120.f;
+    float ox = SW * 0.5f - ow * 0.5f;
+    float oy = SH * 0.5f - oh * 0.5f;
+
+    FillRectGrad(ox, oy, ox + ow, oy + oh,
+        D3DCOLOR_XRGB(20, 28, 70), D3DCOLOR_XRGB(12, 16, 46));
+    HLine(oy, ox, ox + ow, COL_CYAN);
+    HLine(oy + oh, ox, ox + ow, COL_CYAN);
+    VLine(ox, oy, oy + oh, COL_BORDER);
+    VLine(ox + ow, oy, oy + oh, COL_BORDER);
+
+    const char* t1 = "SET THERMAL ABORT LIMIT";
+    DrawText(ox + (ow - TW(t1, 1.25f)) * 0.5f, oy + 8.f, t1, 1.25f, COL_YELLOW);
+
+    // Big temperature value
+    char tStr[12];  IntToStr(s_tempThreshold, tStr, sizeof(tStr));
+    char tDisp[16]; StrCopy(tDisp, sizeof(tDisp), tStr);
+    StrCat2(tDisp, sizeof(tDisp), tDisp, "C");
+
+    DWORD tCol = (s_tempThreshold >= 85) ? COL_RED
+        : (s_tempThreshold >= 75) ? COL_ORANGE
+        : COL_GREEN;
+
+    float valW = TW(tDisp, 2.6f);
+    DrawText(ox + (ow - valW) * 0.5f, oy + 30.f, tDisp, 2.6f, tCol);
+
+    // Up/Down arrows hint flanking the value
+    DrawText(ox + (ow - valW) * 0.5f - 22.f, oy + 38.f, "<", 2.0f, COL_GRAY);
+    DrawText(ox + (ow + valW) * 0.5f + 6.f, oy + 38.f, ">", 2.0f, COL_GRAY);
+
+    const char* t2 = "[LT] Decrease    [RT] Increase    [A] Continue    [B] Cancel";
+    DrawText(ox + (ow - TW(t2, 1.0f)) * 0.5f, oy + oh - 18.f, t2, 1.0f, COL_GRAY);
+}
+
+// ============================================================================
 // DrawConfirmOverlay — modal prompt, drawn on top of everything
 // ============================================================================
 
@@ -668,12 +722,27 @@ static void DrawTabStrip(StressCard active)
 static void RenderCPUCard(const DiagLogo& logo)
 {
     const char* hint =
-        (s_state == SSTATE_IDLE) ? "[A] Start Test    [B] Back    [Right] RAM Card" :
+        (s_state == SSTATE_IDLE) ? (s_thermalAbort
+            ? "[A] Start Test    [B] Back    [Right] RAM Card"
+            : "[A] Start Test    [B] Back    [Right] RAM Card") :
+        (s_state == SSTATE_THRESHOLD) ? "[LT] Lower    [RT] Raise    [A] Continue    [B] Cancel" :
         (s_state == SSTATE_CONFIRM) ? "[LT+RT] Confirm    [B] Cancel" :
         "[Right] RAM Card    Hold [Back+A] 5s to Abort";
 
     DrawPageChrome(logo, "STRESS TEST  -  CPU", hint);
     DrawTabStrip(CARD_CPU);
+
+    // Thermal abort notice (shows after auto-abort)
+    if (s_state == SSTATE_IDLE && s_thermalAbort)
+    {
+        DrawTextR(SW - LM, PANEL_TOP + 2.f, "! THERMAL ABORT !", 1.25f, COL_RED);
+        char thrBuf[24];
+        StrCopy(thrBuf, sizeof(thrBuf), "LIMIT: ");
+        char thrVal[8]; IntToStr(s_tempThreshold, thrVal, sizeof(thrVal));
+        StrCat2(thrBuf, sizeof(thrBuf), thrBuf, thrVal);
+        StrCat2(thrBuf, sizeof(thrBuf), thrBuf, "C reached");
+        DrawTextR(SW - LM, PANEL_TOP + 16.f, thrBuf, 1.1f, COL_ORANGE);
+    }
 
     // Running badge + elapsed (top-right, inside content area)
     if (s_state == SSTATE_RUNNING)
@@ -687,6 +756,12 @@ static void RenderCPUCard(const DiagLogo& logo)
 
         DrawTextR(SW - LM, PANEL_TOP + 2.f, "* RUNNING *", 1.25f, COL_RED);
         DrawTextR(SW - LM, PANEL_TOP + 16.f, elBuf, 1.1f, COL_GRAY);
+        char thrLine[20];
+        StrCopy(thrLine, sizeof(thrLine), "ABORT @ ");
+        char thrV[8]; IntToStr(s_tempThreshold, thrV, sizeof(thrV));
+        StrCat2(thrLine, sizeof(thrLine), thrLine, thrV);
+        StrCat2(thrLine, sizeof(thrLine), thrLine, "C");
+        DrawTextR(SW - LM, PANEL_TOP + 30.f, thrLine, 1.0f, COL_ORANGE);
     }
 
     // ---- Info panels ----
@@ -766,8 +841,10 @@ static void RenderCPUCard(const DiagLogo& logo)
                 1.0f, COL_DIM);
     }
 
-    // ---- Confirm overlay drawn last (on top of everything) ----
-    if (s_state == SSTATE_CONFIRM)
+    // ---- Threshold picker, then confirm overlay (drawn last, on top) ----
+    if (s_state == SSTATE_THRESHOLD)
+        DrawThresholdOverlay();
+    else if (s_state == SSTATE_CONFIRM)
         DrawConfirmOverlay();
 }
 
@@ -1494,7 +1571,31 @@ static void HandleInput()
         {
         case SSTATE_IDLE:
             if (EdgeDown(cur, s_prevBtns, BTN_A))
+            {
+                s_thermalAbort = false;
+                s_state = SSTATE_THRESHOLD;
+            }
+            break;
+
+        case SSTATE_THRESHOLD:
+            if (EdgeDown(cur, s_prevBtns, BTN_B))
+            {
+                s_state = SSTATE_IDLE; break;
+            }
+            if (EdgeDown(cur, s_prevBtns, BTN_LTRIG))
+            {
+                if (s_tempThreshold > 60) s_tempThreshold -= 5;
+                break;
+            }
+            if (EdgeDown(cur, s_prevBtns, BTN_RTRIG))
+            {
+                if (s_tempThreshold < 90) s_tempThreshold += 5;
+                break;
+            }
+            if (EdgeDown(cur, s_prevBtns, BTN_A))
+            {
                 s_state = SSTATE_CONFIRM;
+            }
             break;
 
         case SSTATE_CONFIRM:

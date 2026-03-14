@@ -23,10 +23,12 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="RamTest.cpp" />
     <ClCompile Include="SmBusScan.cpp" />
+    <ClCompile Include="StressMath.cpp" />
     <ClCompile Include="StressTest.cpp" />
     <ClCompile Include="SysInfo.cpp" />
     <ClCompile Include="TempMonitor.cpp" />
     <ClCompile Include="VideoInfo.cpp" />
+    <ClCompile Include="XbSet.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Text Include="Media\Copy Assets Here.txt" />
@@ -43,10 +45,12 @@
     <ClInclude Include="input.h" />
     <ClInclude Include="RamTest.h" />
     <ClInclude Include="SmBusScan.h" />
+    <ClInclude Include="StressMath.h" />
     <ClInclude Include="StressTest.h" />
     <ClInclude Include="SysInfo.h" />
     <ClInclude Include="TempMonitor.h" />
     <ClInclude Include="VideoInfo.h" />
+    <ClInclude Include="XbSet.h" />
   </ItemGroup>
   <ItemGroup>
     <Image Include="Media\tex\DC.dds" />
@@ -182,6 +186,7 @@ MKDIR "$(OutDir)XISO"
       <LanguageStandard>stdcpp17</LanguageStandard>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions</EnableEnhancedInstructionSet>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <AssemblerOutput>All</AssemblerOutput>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>

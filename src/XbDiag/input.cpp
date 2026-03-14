@@ -14,6 +14,10 @@ static WORD         s_rumbleRight = 0;
 static DWORD        s_rumbleLastMs = 0;        // GetTickCount() of last XInputSetState call
 static int          s_rumblePort = -1;        // port whose handle we call XInputSetState on
 
+// Memory Unit presence — slot 0 = top (A), slot 1 = bottom (B) per port.
+// Tracked via XGetDeviceChanges bit flags — no handles opened, no data read.
+static bool g_muPresent[MAX_PORTS][2];
+
 // -----------------------------------------------------------------------------
 // InitInput
 // -----------------------------------------------------------------------------
@@ -24,6 +28,7 @@ void InitInput()
     memset(g_padLastPacket, 0, sizeof(g_padLastPacket));
     memset(g_padStates, 0, sizeof(g_padStates));
     memset(g_padButtons, 0, sizeof(g_padButtons));
+    memset(g_muPresent, 0, sizeof(g_muPresent));
     s_rumbleLeft = 0;  // motors start off — no need to send a stop packet
     s_rumbleRight = 0;
     s_rumblePort = -1;
@@ -70,6 +75,23 @@ void PumpInput()
 
             ins >>= 1;
             rem >>= 1;
+        }
+    }
+
+    // Memory Unit hotplug — presence only, no mounting.
+    // Bit layout from XGetDeviceChanges for MEMORY_UNIT:
+    //   bits  0-3:  slot A (top)    ports 0-3
+    //   bits 16-19: slot B (bottom) ports 0-3
+    if (XGetDeviceChanges(XDEVICE_TYPE_MEMORY_UNIT, &ins, &rem))
+    {
+        for (int i = 0; i < MAX_PORTS; ++i)
+        {
+            DWORD maskA = 1u << i;          // slot A bit
+            DWORD maskB = 1u << (i + 16);   // slot B bit
+            if (ins & maskA) g_muPresent[i][0] = true;
+            if (rem & maskA) g_muPresent[i][0] = false;
+            if (ins & maskB) g_muPresent[i][1] = true;
+            if (rem & maskB) g_muPresent[i][1] = false;
         }
     }
 
@@ -205,6 +227,17 @@ bool IsPortConnected(int port)
 {
     if (port < 0 || port >= MAX_PORTS) return false;
     return g_padHandles[port] != NULL;
+}
+
+// -----------------------------------------------------------------------------
+// IsMUPresent – returns true if a Memory Unit handle is open on port/slot.
+//   slot 0 = top slot (A), slot 1 = bottom slot (B)
+// -----------------------------------------------------------------------------
+bool IsMUPresent(int port, int slot)
+{
+    if (port < 0 || port >= MAX_PORTS) return false;
+    if (slot < 0 || slot > 1) return false;
+    return g_muPresent[port][slot];
 }
 
 // -----------------------------------------------------------------------------

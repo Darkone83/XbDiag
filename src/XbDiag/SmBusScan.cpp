@@ -1204,3 +1204,47 @@ void SmBusScan_Tick(const DiagLogo& logo)
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
+// ============================================================================
+// AutoRun — run full scan, report responding addresses to report handle
+// ============================================================================
+
+void SmBusScan_AutoRun(HANDLE hReport)
+{
+    // Run a complete synchronous scan of all addresses
+    ResetScan();
+    for (int addr = 0; addr < ADDR_COUNT; ++addr)
+    {
+        if (s_results[addr].scanned) continue;
+        BYTE dummy = 0;
+        bool ack = SMBusRead((BYTE)(addr << 1), 0x00, dummy);
+        s_results[addr].scanned = true;
+        s_results[addr].ack = ack;
+    }
+
+    // Write responding addresses
+    char line[128]; DWORD w;
+    for (int addr = 0; addr < ADDR_COUNT; ++addr)
+    {
+        if (!s_results[addr].scanned || !s_results[addr].ack) continue;
+
+        char addrHex[6];
+        IntToHex((DWORD)(addr << 1), 2, addrHex, sizeof(addrHex));
+
+        StrCopy(line, sizeof(line), "0x");
+        StrCat2(line, sizeof(line), line, addrHex);
+        StrCat2(line, sizeof(line), line, " (7-bit 0x");
+        char aHex[4]; IntToHex((DWORD)addr, 2, aHex, sizeof(aHex));
+        StrCat2(line, sizeof(line), line, aHex);
+        StrCat2(line, sizeof(line), line, ")");
+
+        const KnownDevice* kd = FindKnown(addr);
+        if (kd)
+        {
+            StrCat2(line, sizeof(line), line, "  -> ");
+            StrCat2(line, sizeof(line), line, kd->name);
+        }
+
+        StrCat2(line, sizeof(line), line, "\r\n");
+        WriteFile(hReport, line, StrLen(line), &w, NULL);
+    }
+}

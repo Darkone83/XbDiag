@@ -6,3 +6,5 @@
 
 void StressTest_OnEnter();
 void StressTest_Tick(const DiagLogo& logo);
+void StressTest_AutoRun(HANDLE hReport, DWORD durationMs);
+void RamStress_AutoRun(HANDLE hReport, DWORD durationMs);

@@ -595,3 +595,83 @@ void TempMonitor_Tick(const DiagLogo& logo)
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
+// ============================================================================
+// AutoRun — headless temperature sampling for XbSet automation
+// Uses the same TakeSample() path as the interactive module.
+// Waits up to 2s for path detection to settle, then takes 5 samples.
+// ============================================================================
+
+void TempMonitor_AutoRun(HANDLE hReport)
+{
+    // Reset so TakeSample() re-detects the path fresh
+    s_path = PATH_UNKNOWN;
+    s_sensorOK = false;
+    s_fanDetected = false;
+    s_curCPU = 0; s_curAmb = 0; s_curFan = 0;
+
+    char line[128]; DWORD w;
+    auto WL = [&](const char* lbl, const char* val)
+        {
+            StrCopy(line, sizeof(line), lbl);
+            StrCat2(line, sizeof(line), line, val);
+            StrCat2(line, sizeof(line), line, "\r\n");
+            WriteFile(hReport, line, StrLen(line), &w, NULL);
+        };
+
+    // Warmup: call TakeSample() until path is detected (up to 10 x 200ms = 2s)
+    for (int i = 0; i < 10 && s_path == PATH_UNKNOWN; ++i)
+    {
+        TakeSample();
+        Sleep(200);
+    }
+
+    if (s_path == PATH_UNKNOWN)
+    {
+        WL("Sensor:       ", "No response - path not detected after 2s");
+        return;
+    }
+
+    WL("Sensor path:  ", s_path == PATH_ADM1032
+        ? "ADM1032 (rev 1.0-1.5)" : "PIC proxy (rev 1.6)");
+
+    // Take 5 measurement samples at 500ms intervals
+    int sumCPU = 0, sumAmb = 0, sumFan = 0;
+    int goodSamples = 0, fanSamples = 0;
+
+    for (int i = 0; i < 5; ++i)
+    {
+        TakeSample();
+        if (s_sensorOK)
+        {
+            sumCPU += (int)s_curCPU;
+            sumAmb += (int)s_curAmb;
+            if (s_fanDetected) { sumFan += (int)s_curFan * 2; ++fanSamples; }
+            ++goodSamples;
+        }
+        Sleep(500);
+    }
+
+    if (goodSamples > 0)
+    {
+        char t[12];
+        IntToStr(sumCPU / goodSamples, t, sizeof(t));
+        StrCat2(t, sizeof(t), t, " C");  WL("CPU Die avg:  ", t);
+
+        IntToStr(sumAmb / goodSamples, t, sizeof(t));
+        StrCat2(t, sizeof(t), t, " C");  WL("Ambient avg:  ", t);
+
+        if (fanSamples > 0)
+        {
+            IntToStr(sumFan / fanSamples, t, sizeof(t));
+            StrCat2(t, sizeof(t), t, "%"); WL("Fan Speed avg:", t);
+        }
+        else
+        {
+            WL("Fan Speed:    ", "Not detected");
+        }
+    }
+    else
+    {
+        WL("Sensor:       ", "Path found but no valid readings");
+    }
+}

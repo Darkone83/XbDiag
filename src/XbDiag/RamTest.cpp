@@ -1532,3 +1532,62 @@ void RamTest_Tick(const DiagLogo& logo)
     else
         Render(logo);
 }
+// ============================================================================
+// AutoRun — run one full quick test sweep, report results
+// ============================================================================
+
+void RamTest_AutoRun(HANDLE hReport)
+{
+    // Reset and start quick test
+    ResetTest();
+    s_testState = STATE_QUICK;
+    s_curBank = 0;
+    s_curChunk = 0;
+
+    // Drive the quick test to completion synchronously
+    while (s_testState == STATE_QUICK)
+        QuickTestStep();
+
+    char line[128]; DWORD w;
+    if (!hReport || hReport == INVALID_HANDLE_VALUE) return;
+    auto WL = [&](const char* lbl, const char* val)
+        {
+            StrCopy(line, sizeof(line), lbl);
+            StrCat2(line, sizeof(line), line, val);
+            StrCat2(line, sizeof(line), line, "\r\n");
+            WriteFile(hReport, line, StrLen(line), &w, NULL);
+        };
+
+    char t[12];
+    IntToStr((int)s_totalPhysMB, t, sizeof(t));
+    StrCat2(t, sizeof(t), t, " MB"); WL("Total RAM:    ", t);
+    WL("Config:       ", s_is128MB ? "128MB (4x32MB)" : "64MB (4x16MB)");
+
+    IntToStr(s_passCount, t, sizeof(t)); WL("Chunks PASS:  ", t);
+    IntToStr(s_failCount, t, sizeof(t)); WL("Chunks FAIL:  ", t);
+    IntToStr((int)s_totalErrors, t, sizeof(t)); WL("Total errors: ", t);
+
+    // Per-bank detail
+    for (int b = 0; b < NUM_BANKS; ++b)
+    {
+        char bankLine[64];
+        char bIdx[4]; IntToStr(b, bIdx, sizeof(bIdx));
+        StrCopy(bankLine, sizeof(bankLine), "Bank ");
+        StrCat2(bankLine, sizeof(bankLine), bankLine, bIdx);
+        StrCat2(bankLine, sizeof(bankLine), bankLine, ":        ");
+
+        bool anyFail = false;
+        for (int c = 0; c < s_chunksPerBank; ++c)
+            if (s_chunks[b][c].state == CHUNK_FAIL) anyFail = true;
+
+        StrCat2(bankLine, sizeof(bankLine), bankLine,
+            anyFail ? "FAIL" : "PASS");
+        StrCat2(bankLine, sizeof(bankLine), bankLine, "\r\n");
+        WriteFile(hReport, bankLine, StrLen(bankLine), &w, NULL);
+    }
+
+    WL("Result:       ", s_failCount == 0 ? "PASS" : "FAIL - errors detected");
+}
+
+// Accessor for XbSet stress loop
+int RamStress_GetFailCount() { return s_failCount; }

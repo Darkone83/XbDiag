@@ -75,6 +75,41 @@ static bool s_rumbleMode = false;
 static bool s_rumbleSkip = false;  // skip first tick on rumble entry — flush held buttons
 
 // ============================================================================
+// Stick Test card  (START+DPAD_UP to enter, B to exit)
+// Three sub-tests cycled with LEFT/RIGHT dpad:
+//   0 = Dead-zone   — raw XY + dead-zone radius ring visualised on stick plot
+//   1 = Circularity — traces stick path, shows gate shape vs ideal circle
+//   2 = Drift       — samples at-rest position, reports average XY offset
+// ============================================================================
+static bool s_stickMode = false;
+static int  s_stickTest = 0;    // 0/1/2
+
+// Circularity: 36 angular buckets (10° each), max normalised radius per bucket
+static const int CIRC_BUCKETS = 36;
+static float     s_circMaxR[CIRC_BUCKETS];   // left stick
+static float     s_circMaxRR[CIRC_BUCKETS];  // right stick
+static bool      s_circHasData = false;
+static bool      s_circHasDataR = false;
+
+// Drift: ring buffer of raw at-rest samples
+static const int DRIFT_SAMPLES = 180;   // ~3s at 60fps
+static int  s_driftLX[DRIFT_SAMPLES];
+static int  s_driftLY[DRIFT_SAMPLES];
+static int  s_driftRX[DRIFT_SAMPLES];
+static int  s_driftRY[DRIFT_SAMPLES];
+static int  s_driftHead = 0;
+static int  s_driftCount = 0;
+static int  s_driftWarmup = 0;   // frames to discard before sampling (settle delay)
+static int  s_driftAvgLX = 0, s_driftAvgLY = 0;
+static int  s_driftAvgRX = 0, s_driftAvgRY = 0;
+
+// Per-port disconnect tracking.
+// s_wasConn:    connection state from the previous tick (for edge detection).
+// s_discCount:  running count of disconnect events seen this session.
+static bool s_wasConn[4] = { false, false, false, false };
+static int  s_discCount[4] = { 0, 0, 0, 0 };
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -187,6 +222,19 @@ void ControllerTest_OnEnter()
     s_prev = 0;
     s_rumbleMode = false;
     s_rumbleSkip = false;
+    s_stickMode = false;
+    s_stickTest = 0;
+    s_circHasData = false;
+    s_circHasDataR = false;
+    for (int i = 0; i < CIRC_BUCKETS; ++i) { s_circMaxR[i] = 0.f; s_circMaxRR[i] = 0.f; }
+    s_driftHead = 0; s_driftCount = 0; s_driftWarmup = 60;
+    s_driftAvgLX = 0; s_driftAvgLY = 0;
+    s_driftAvgRX = 0; s_driftAvgRY = 0;
+    for (int p = 0; p < 4; ++p)
+    {
+        s_wasConn[p] = IsPortConnected(p);
+        s_discCount[p] = 0;
+    }
 }
 
 // ============================================================================
@@ -302,6 +350,496 @@ static void RenderRumble(const DiagLogo& logo, int lt, int rt)
 }
 
 // ============================================================================
+// ============================================================================
+// Stick test helpers
+// ============================================================================
+
+// Integer square root (no __ftol2_sse — x87 inline)
+static int ISqrt(int v)
+{
+    if (v <= 0) return 0;
+    float fv = (float)v;
+    float r;
+    __asm { fld fv }
+    __asm { fsqrt }
+    __asm { fstp r }
+    int ri;
+    __asm { fld r }
+    __asm { fistp ri }
+    return ri;
+}
+
+// Normalised radius 0.0-1.0 from raw 16-bit stick axes
+static float StickRadius(int x, int y)
+{
+    // max reach of each axis is 32767
+    float fx = (float)x / 32767.f;
+    float fy = (float)y / 32767.f;
+    float r2 = fx * fx + fy * fy;
+    if (r2 <= 0.f) return 0.f;
+    float r;
+    __asm { fld r2 }
+    __asm { fsqrt }
+    __asm { fstp r }
+    return r > 1.f ? 1.f : r;
+}
+
+// Angle bucket 0-35 from raw axes (0=East, CCW, 10° each).
+// 36 buckets (10° per bucket) — wide enough that a full rotation cleanly
+// fills every bucket even with natural stick wobble. Each sample also smears
+// into ±1 neighbors at the call site to handle boundary edge cases.
+static int AngleBucket(int x, int y)
+{
+    if (x == 0 && y == 0) return 0;
+    float fx = (float)x;
+    float fy = (float)y;
+    float ang;
+    __asm { fld fy }
+    __asm { fld fx }
+    __asm { fpatan }
+    __asm { fstp ang }
+
+    // Convert -pi..pi to 0..2pi
+    if (ang < 0.f)
+    {
+        float twopi = 6.2831853f;
+        ang = ang + twopi;
+    }
+
+    // Scale to 0..36. Subtract a small epsilon before fistp so values sitting
+    // exactly on a boundary (e.g. 18.0000) floor down rather than rounding up.
+    // fistp uses round-to-nearest; subtracting 0.0001 shifts exact boundaries
+    // safely below the integer without affecting any other value.
+    float bucketF = ang * (36.f / 6.2831853f) - 0.0001f;
+    if (bucketF < 0.f) bucketF = 0.f;
+    int bucket;
+    __asm { fld bucketF }
+    __asm { fistp bucket }
+    if (bucket < 0)  bucket = 0;
+    if (bucket >= 36) bucket = 0;   // wrap: 2*pi rounds to exactly 36
+    return bucket;
+}
+
+// Draw a stick plot (square + dot) at cx,cy with radius r
+// Optionally draws a dead-zone ring at dzRadius (0 = skip)
+static void StickPlot(float cx, float cy, float r,
+    int vx, int vy, float dzRadius, DWORD dotCol)
+{
+    float x0 = cx - r;
+    float y0 = cy - r;
+    float x1 = cx + r;
+    float y1 = cy + r;
+
+    FillRect(x0, y0, x1, y1, D3DCOLOR_XRGB(10, 14, 32));
+    HLine(y0, x0, x1, COL_BORDER);
+    HLine(y1, x0, x1, COL_BORDER);
+    VLine(x0, y0, y1, COL_BORDER);
+    VLine(x1, y0, y1, COL_BORDER);
+    HLine(cy, x0 + 1.f, x1 - 1.f, D3DCOLOR_XRGB(25, 35, 65));
+    VLine(cx, y0 + 1.f, y1 - 1.f, D3DCOLOR_XRGB(25, 35, 65));
+
+    // Dead-zone ring — drawn as a simple square inset
+    if (dzRadius > 0.f)
+    {
+        float dz = r * dzRadius;
+        HLine(cy - dz, cx - dz, cx + dz, D3DCOLOR_XRGB(60, 60, 20));
+        HLine(cy + dz, cx - dz, cx + dz, D3DCOLOR_XRGB(60, 60, 20));
+        VLine(cx - dz, cy - dz, cy + dz, D3DCOLOR_XRGB(60, 60, 20));
+        VLine(cx + dz, cy - dz, cy + dz, D3DCOLOR_XRGB(60, 60, 20));
+    }
+
+    // Dot
+    float range = r - 5.f;
+    float dx = ((float)vx / 32767.f) * range;
+    float dy = -((float)vy / 32767.f) * range;
+    float dotX = cx + dx;
+    float dotY = cy + dy;
+    if (dotX < x0 + 4.f) dotX = x0 + 4.f;
+    if (dotX > x1 - 4.f) dotX = x1 - 4.f;
+    if (dotY < y0 + 4.f) dotY = y0 + 4.f;
+    if (dotY > y1 - 4.f) dotY = y1 - 4.f;
+    FillRect(dotX - 4.f, dotY - 4.f, dotX + 4.f, dotY + 4.f, dotCol);
+}
+
+// ============================================================================
+// Stick Test card render
+// ============================================================================
+
+// Draw one circularity plot at (cx,cy) radius PR from a bucket array.
+// Also draws the live stick dot at (vx,vy).
+static void CircPlot(float cx, float cy, float PR,
+    float* maxR, int vx, int vy)
+{
+    // Background square
+    FillRect(cx - PR, cy - PR, cx + PR, cy + PR, D3DCOLOR_XRGB(10, 14, 32));
+
+    // Draw circular boundary using 48-segment approximation (HLines between adjacent points)
+    const int SEGS = 48;
+    float prevX = cx + PR;
+    float prevY = cy;
+    for (int s = 1; s <= SEGS; ++s)
+    {
+        float ang = s * (6.2831853f / (float)SEGS);
+        float cosA, sinA;
+        __asm { fld ang }
+        __asm { fcos }
+        __asm { fstp cosA }
+        __asm { fld ang }
+        __asm { fsin }
+        __asm { fstp sinA }
+        float nx = cx + cosA * PR;
+        float ny = cy - sinA * PR;
+        // Draw a short HLine between adjacent points to approximate the arc
+        if (ny >= prevY - 1.f && ny <= prevY + 1.f)
+            HLine(ny, (prevX < nx ? prevX : nx), (prevX < nx ? nx : prevX), COL_BORDER);
+        else
+            VLine(nx, (prevY < ny ? prevY : ny), (prevY < ny ? ny : prevY), COL_BORDER);
+        prevX = nx;
+        prevY = ny;
+    }
+
+    // Crosshairs
+    HLine(cy, cx - PR + 1.f, cx + PR - 1.f, D3DCOLOR_XRGB(25, 35, 65));
+    VLine(cx, cy - PR + 1.f, cy + PR - 1.f, D3DCOLOR_XRGB(25, 35, 65));
+
+    // Bucket dots — each placed at maxR * PR from centre along its angle
+    for (int b = 0; b < CIRC_BUCKETS; ++b)
+    {
+        if (maxR[b] < 0.01f) continue;
+        float angF = ((float)b + 0.5f) * (6.2831853f / (float)CIRC_BUCKETS);
+        float cosA, sinA;
+        __asm { fld angF }
+        __asm { fcos }
+        __asm { fstp cosA }
+        __asm { fld angF }
+        __asm { fsin }
+        __asm { fstp sinA }
+        // Cap bucket dot at PR-2 so it never clips outside the circle
+        float reach = maxR[b];
+        if (reach > 1.f) reach = 1.f;
+        float px2 = cx + cosA * reach * (PR - 2.f);
+        float py2 = cy - sinA * reach * (PR - 2.f);
+        DWORD dc = reach > 0.65f ? COL_GREEN : D3DCOLOR_XRGB(200, 140, 0);
+        FillRect(px2 - 2.f, py2 - 2.f, px2 + 2.f, py2 + 2.f, dc);
+    }
+
+    // Live dot — map raw axes to circle, clamp to radius so it can't escape
+    float dxf = (float)vx / 32767.f;
+    float dyf = -((float)vy / 32767.f);
+    float dotDist = dxf * dxf + dyf * dyf;
+    if (dotDist > 1.f)
+    {
+        // Normalise to unit circle
+        float inv;
+        __asm { fld dotDist }
+        __asm { fsqrt }
+        __asm { fstp inv }
+        dxf /= inv;
+        dyf /= inv;
+    }
+    float dotX = cx + dxf * (PR - 3.f);
+    float dotY = cy + dyf * (PR - 3.f);
+    FillRect(dotX - 3.f, dotY - 3.f, dotX + 3.f, dotY + 3.f, COL_CYAN);
+}
+
+static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry)
+{
+    g_pDevice->BeginScene();
+
+    const char* testNames[3] = { "DEAD-ZONE", "CIRCULARITY", "DRIFT" };
+    const char* hint = "[Left/Right] Switch test    [B] Exit";
+    DrawPageChrome(logo, "STICK TEST", hint);
+
+    float B = CONTENT_Y;
+
+    // ── Tab strip ──────────────────────────────────────────────────────────
+    {
+        const float TW2 = 100.f;
+        const float TH = 16.f;
+        const float TG = 4.f;
+        float tx = X_MID - (TW2 * 3.f + TG * 2.f) * 0.5f;
+        float ty = B;
+        for (int i = 0; i < 3; ++i)
+        {
+            bool sel = (i == s_stickTest);
+            float x0 = tx + (TW2 + TG) * (float)i;
+            float x1 = x0 + TW2;
+            FillRectGrad(x0, ty, x1, ty + TH,
+                sel ? D3DCOLOR_XRGB(30, 80, 160) : D3DCOLOR_XRGB(18, 25, 55),
+                sel ? D3DCOLOR_XRGB(15, 50, 110) : D3DCOLOR_XRGB(12, 16, 38));
+            HLine(ty, x0, x1, sel ? COL_CYAN : COL_BORDER);
+            float lx2 = x0 + (x1 - x0) * 0.5f - TW(testNames[i], 1.1f) * 0.5f;
+            DrawText(lx2, ty + 3.f, testNames[i], 1.1f, sel ? COL_WHITE : COL_DIM);
+        }
+    }
+
+    float contentY = B + 22.f;
+
+    // ── DEAD-ZONE test ─────────────────────────────────────────────────────
+    if (s_stickTest == 0)
+    {
+        const float PR = 80.f;   // plot radius
+
+        // Left stick
+        float lcx = X_MID - 130.f;
+        float lcy = contentY + 110.f;
+        float lRadius = StickRadius(lx, ly);
+        // Dead-zone: threshold at ~7000/32767 ≈ 0.21 (STICK_DEADZONE from input.cpp)
+        float dzN = 8000.f / 32767.f;
+        StickPlot(lcx, lcy, PR, lx, ly, dzN,
+            lRadius > dzN ? COL_GREEN : D3DCOLOR_XRGB(100, 100, 100));
+
+        DrawText(lcx - TW("LEFT STICK", 1.15f) * 0.5f, lcy - PR - 16.f,
+            "LEFT STICK", 1.15f, COL_YELLOW);
+
+        // Raw readout below
+        char xbuf[10], ybuf[10], rbuf[6];
+        IntToStr(lx, xbuf, sizeof(xbuf));
+        IntToStr(ly, ybuf, sizeof(ybuf));
+        // radius as integer 0-100
+        int lrpct;
+        { float f = lRadius * 100.f; __asm { fld f } __asm { fistp lrpct } }
+        IntToStr(lrpct, rbuf, sizeof(rbuf));
+        float ry2 = lcy + PR + 6.f;
+        DrawText(lcx - 60.f, ry2, "X:", 1.1f, COL_GRAY);
+        DrawText(lcx - 40.f, ry2, xbuf, 1.1f, COL_WHITE);
+        DrawText(lcx - 60.f, ry2 + 14.f, "Y:", 1.1f, COL_GRAY);
+        DrawText(lcx - 40.f, ry2 + 14.f, ybuf, 1.1f, COL_WHITE);
+        DrawText(lcx + 10.f, ry2, "R%:", 1.1f, COL_GRAY);
+        DrawText(lcx + 36.f, ry2, rbuf, 1.1f,
+            lRadius > dzN ? COL_GREEN : COL_DIM);
+
+        // Right stick
+        float rcx = X_MID + 130.f;
+        float rcy = contentY + 110.f;
+        float rRadius = StickRadius(rx, ry);
+        StickPlot(rcx, rcy, PR, rx, ry, dzN,
+            rRadius > dzN ? COL_GREEN : D3DCOLOR_XRGB(100, 100, 100));
+
+        DrawText(rcx - TW("RIGHT STICK", 1.15f) * 0.5f, rcy - PR - 16.f,
+            "RIGHT STICK", 1.15f, COL_YELLOW);
+
+        char rxbuf[10], rybuf[10], rrbuf[6];
+        IntToStr(rx, rxbuf, sizeof(rxbuf));
+        IntToStr(ry, rybuf, sizeof(rybuf));
+        int rrpct;
+        { float f = rRadius * 100.f; __asm { fld f } __asm { fistp rrpct } }
+        IntToStr(rrpct, rrbuf, sizeof(rrbuf));
+        DrawText(rcx - 60.f, ry2, "X:", 1.1f, COL_GRAY);
+        DrawText(rcx - 40.f, ry2, rxbuf, 1.1f, COL_WHITE);
+        DrawText(rcx - 60.f, ry2 + 14.f, "Y:", 1.1f, COL_GRAY);
+        DrawText(rcx - 40.f, ry2 + 14.f, rybuf, 1.1f, COL_WHITE);
+        DrawText(rcx + 10.f, ry2, "R%:", 1.1f, COL_GRAY);
+        DrawText(rcx + 36.f, ry2, rrbuf, 1.1f,
+            rRadius > dzN ? COL_GREEN : COL_DIM);
+
+        // Centre: dead-zone legend
+        DrawText(X_MID - TW("Dead-zone threshold", 1.1f) * 0.5f,
+            contentY + 240.f, "Dead-zone threshold", 1.1f, COL_GRAY);
+        DrawText(X_MID - TW("shown as yellow ring", 1.05f) * 0.5f,
+            contentY + 254.f, "shown as yellow ring", 1.05f, D3DCOLOR_XRGB(60, 60, 20));
+        DrawText(X_MID - TW("Dot turns green outside dead-zone", 1.05f) * 0.5f,
+            contentY + 268.f, "Dot turns green outside dead-zone", 1.05f, COL_DIM);
+    }
+
+    // ── CIRCULARITY test ───────────────────────────────────────────────────
+    else if (s_stickTest == 1)
+    {
+        // Update left stick buckets
+        if (lx != 0 || ly != 0)
+        {
+            float r = StickRadius(lx, ly);
+            if (r > 0.05f)
+            {
+                int b = AngleBucket(lx, ly);
+                // Smear into center bucket and both neighbours so boundary
+                // wobble at cardinals can't leave a gap.
+                if (r > s_circMaxR[b]) s_circMaxR[b] = r;
+                int bm = (b + CIRC_BUCKETS - 1) % CIRC_BUCKETS;
+                int bp = (b + 1) % CIRC_BUCKETS;
+                if (r > s_circMaxR[bm]) s_circMaxR[bm] = r;
+                if (r > s_circMaxR[bp]) s_circMaxR[bp] = r;
+                s_circHasData = true;
+            }
+        }
+        // Update right stick buckets
+        if (rx != 0 || ry != 0)
+        {
+            float r = StickRadius(rx, ry);
+            if (r > 0.05f)
+            {
+                int b = AngleBucket(rx, ry);
+                if (r > s_circMaxRR[b]) s_circMaxRR[b] = r;
+                int bm = (b + CIRC_BUCKETS - 1) % CIRC_BUCKETS;
+                int bp = (b + 1) % CIRC_BUCKETS;
+                if (r > s_circMaxRR[bm]) s_circMaxRR[bm] = r;
+                if (r > s_circMaxRR[bp]) s_circMaxRR[bp] = r;
+                s_circHasDataR = true;
+            }
+        }
+
+        const float PR = 80.f;
+        float lcx = X_MID - 130.f;
+        float rcx = X_MID + 130.f;
+        float cy = contentY + 110.f;
+
+        // Left plot
+        CircPlot(lcx, cy, PR, s_circMaxR, lx, ly);
+        DrawText(lcx - TW("LEFT STICK", 1.15f) * 0.5f, cy - PR - 16.f,
+            "LEFT STICK", 1.15f, COL_YELLOW);
+
+        int lcov = 0;
+        for (int b = 0; b < CIRC_BUCKETS; ++b)
+            if (s_circMaxR[b] > 0.05f) lcov++;
+        char lcovbuf[8]; IntToStr(lcov * 100 / CIRC_BUCKETS, lcovbuf, sizeof(lcovbuf));
+        char lcovstr[16];
+        StrCopy(lcovstr, sizeof(lcovstr), lcovbuf);
+        StrCat2(lcovstr, sizeof(lcovstr), lcovstr, "% covered");
+        DrawText(lcx - TW(lcovstr, 1.1f) * 0.5f, cy + PR + 8.f, lcovstr, 1.1f,
+            lcov >= 65 ? COL_GREEN : COL_ORANGE);
+        if (!s_circHasData)
+            DrawText(lcx - TW("Rotate fully", 1.05f) * 0.5f, cy + PR + 24.f,
+                "Rotate fully", 1.05f, COL_DIM);
+
+        // Right plot
+        CircPlot(rcx, cy, PR, s_circMaxRR, rx, ry);
+        DrawText(rcx - TW("RIGHT STICK", 1.15f) * 0.5f, cy - PR - 16.f,
+            "RIGHT STICK", 1.15f, COL_YELLOW);
+
+        int rcov = 0;
+        for (int b = 0; b < CIRC_BUCKETS; ++b)
+            if (s_circMaxRR[b] > 0.05f) rcov++;
+        char rcovbuf[8]; IntToStr(rcov * 100 / CIRC_BUCKETS, rcovbuf, sizeof(rcovbuf));
+        char rcovstr[16];
+        StrCopy(rcovstr, sizeof(rcovstr), rcovbuf);
+        StrCat2(rcovstr, sizeof(rcovstr), rcovstr, "% covered");
+        DrawText(rcx - TW(rcovstr, 1.1f) * 0.5f, cy + PR + 8.f, rcovstr, 1.1f,
+            rcov >= 65 ? COL_GREEN : COL_ORANGE);
+        if (!s_circHasDataR)
+            DrawText(rcx - TW("Rotate fully", 1.05f) * 0.5f, cy + PR + 24.f,
+                "Rotate fully", 1.05f, COL_DIM);
+
+        // Centre footer
+        DrawText(X_MID - TW("[X] Clear trace", 1.05f) * 0.5f,
+            cy + PR + 42.f, "[X] Clear trace", 1.05f, COL_DIM);
+    }
+
+    // ── DRIFT test ─────────────────────────────────────────────────────────
+    else
+    {
+        // Warmup: discard first 60 frames so the sticks settle before we measure
+        if (s_driftWarmup > 0)
+        {
+            s_driftWarmup--;
+        }
+        else
+        {
+            s_driftLX[s_driftHead] = lx;
+            s_driftLY[s_driftHead] = ly;
+            s_driftRX[s_driftHead] = rx;
+            s_driftRY[s_driftHead] = ry;
+            s_driftHead = (s_driftHead + 1) % DRIFT_SAMPLES;
+            if (s_driftCount < DRIFT_SAMPLES) s_driftCount++;
+        }
+
+        // Recompute averages
+        if (s_driftCount > 0)
+        {
+            int aLX = 0, aLY = 0, aRX = 0, aRY = 0;
+            for (int i = 0; i < s_driftCount; ++i)
+            {
+                aLX += s_driftLX[i]; aLY += s_driftLY[i];
+                aRX += s_driftRX[i]; aRY += s_driftRY[i];
+            }
+            s_driftAvgLX = aLX / s_driftCount;
+            s_driftAvgLY = aLY / s_driftCount;
+            s_driftAvgRX = aRX / s_driftCount;
+            s_driftAvgRY = aRY / s_driftCount;
+        }
+
+        const float PR = 70.f;
+        const int DRIFT_WARN = 1500;   // flag if avg offset > ~4.5% of range
+
+        // Left stick plot — dot shows average position
+        float lcx = X_MID - 130.f;
+        float lcy = contentY + 100.f;
+        StickPlot(lcx, lcy, PR, s_driftAvgLX, s_driftAvgLY, 0.f,
+            ISqrt(s_driftAvgLX * s_driftAvgLX + s_driftAvgLY * s_driftAvgLY) > DRIFT_WARN
+            ? COL_RED : COL_GREEN);
+
+        DrawText(lcx - TW("LEFT STICK", 1.15f) * 0.5f, lcy - PR - 16.f,
+            "LEFT STICK", 1.15f, COL_YELLOW);
+
+        char lxb[10], lyb[10];
+        IntToStr(s_driftAvgLX, lxb, sizeof(lxb));
+        IntToStr(s_driftAvgLY, lyb, sizeof(lyb));
+        float lblY = lcy + PR + 6.f;
+        DrawText(lcx - 50.f, lblY, "avg X:", 1.1f, COL_GRAY);
+        DrawText(lcx + 10.f, lblY, lxb, 1.1f,
+            (s_driftAvgLX > DRIFT_WARN || s_driftAvgLX < -DRIFT_WARN) ? COL_RED : COL_GREEN);
+        DrawText(lcx - 50.f, lblY + 14.f, "avg Y:", 1.1f, COL_GRAY);
+        DrawText(lcx + 10.f, lblY + 14.f, lyb, 1.1f,
+            (s_driftAvgLY > DRIFT_WARN || s_driftAvgLY < -DRIFT_WARN) ? COL_RED : COL_GREEN);
+
+        // Right stick
+        float rcx = X_MID + 130.f;
+        float rcy = contentY + 100.f;
+        StickPlot(rcx, rcy, PR, s_driftAvgRX, s_driftAvgRY, 0.f,
+            ISqrt(s_driftAvgRX * s_driftAvgRX + s_driftAvgRY * s_driftAvgRY) > DRIFT_WARN
+            ? COL_RED : COL_GREEN);
+
+        DrawText(rcx - TW("RIGHT STICK", 1.15f) * 0.5f, rcy - PR - 16.f,
+            "RIGHT STICK", 1.15f, COL_YELLOW);
+
+        char rxb[10], ryb[10];
+        IntToStr(s_driftAvgRX, rxb, sizeof(rxb));
+        IntToStr(s_driftAvgRY, ryb, sizeof(ryb));
+        DrawText(rcx - 50.f, lblY, "avg X:", 1.1f, COL_GRAY);
+        DrawText(rcx + 10.f, lblY, rxb, 1.1f,
+            (s_driftAvgRX > DRIFT_WARN || s_driftAvgRX < -DRIFT_WARN) ? COL_RED : COL_GREEN);
+        DrawText(rcx - 50.f, lblY + 14.f, "avg Y:", 1.1f, COL_GRAY);
+        DrawText(rcx + 10.f, lblY + 14.f, ryb, 1.1f,
+            (s_driftAvgRY > DRIFT_WARN || s_driftAvgRY < -DRIFT_WARN) ? COL_RED : COL_GREEN);
+
+        // Centre status + instruction
+        if (s_driftWarmup > 0)
+        {
+            // Still settling — show countdown
+            char cdBuf[4]; IntToStr(s_driftWarmup, cdBuf, sizeof(cdBuf));
+            char cdStr[24];
+            StrCopy(cdStr, sizeof(cdStr), "Settling... ");
+            StrCat2(cdStr, sizeof(cdStr), cdStr, cdBuf);
+            DrawText(X_MID - TW(cdStr, 1.3f) * 0.5f, contentY + 240.f,
+                cdStr, 1.3f, COL_GRAY);
+        }
+        else
+        {
+            bool drifting =
+                ISqrt(s_driftAvgLX * s_driftAvgLX + s_driftAvgLY * s_driftAvgLY) > DRIFT_WARN ||
+                ISqrt(s_driftAvgRX * s_driftAvgRX + s_driftAvgRY * s_driftAvgRY) > DRIFT_WARN;
+            const char* status = drifting ? "DRIFT DETECTED" : "OK";
+            DWORD statusC = drifting ? COL_RED : COL_GREEN;
+            DrawText(X_MID - TW(status, 1.4f) * 0.5f, contentY + 240.f, status, 1.4f, statusC);
+        }
+
+        char sampbuf[8]; IntToStr(s_driftCount, sampbuf, sizeof(sampbuf));
+        char sampstr[24];
+        StrCopy(sampstr, sizeof(sampstr), "samples: ");
+        StrCat2(sampstr, sizeof(sampstr), sampstr, sampbuf);
+        DrawText(X_MID - TW(sampstr, 1.05f) * 0.5f, contentY + 258.f,
+            sampstr, 1.05f, COL_DIM);
+
+        DrawText(X_MID - TW("Release both sticks and hold still", 1.05f) * 0.5f,
+            contentY + 272.f, "Release both sticks and hold still", 1.05f, COL_DIM);
+        DrawText(X_MID - TW("[X] Reset samples", 1.05f) * 0.5f,
+            contentY + 286.f, "[X] Reset samples", 1.05f, COL_DIM);
+    }
+
+    g_pDevice->EndScene();
+    g_pDevice->Present(NULL, NULL, NULL, NULL);
+}
+
+// ============================================================================
 // Render (main controller view)
 // ============================================================================
 
@@ -315,7 +853,7 @@ static void Render(const DiagLogo& logo, WORD cur,
     g_pDevice->BeginScene();
 
     DrawPageChrome(logo, "CONTROLLER TEST",
-        "[START+A] Rumble   [START+B] Exit");
+        "[START+A] Rumble   [START+Up] Stick Test   [START+B] Exit");
 
     // =========================================================
     // PORT STATUS STRIP  — centered, above trigger bars
@@ -351,6 +889,18 @@ static void Render(const DiagLogo& logo, WORD cur,
             VLine(x1, y0, y1, border);
             DrawText(cx - TW(portLabels[p], 1.2f) * 0.5f, cy - 5.f,
                 portLabels[p], 1.2f, tc);
+        }
+
+        // Disconnects row — label on the left, count centred under each box
+        float discY = py + PBH + 4.f;
+        DrawText(px - 84.f, discY, "Disconnects:", 1.1f, COL_GRAY);
+        for (int p = 0; p < 4; ++p)
+        {
+            float cx = px + (PBW + PGAP) * (float)p + PBW * 0.5f;
+            char buf[8];
+            IntToStr(s_discCount[p], buf, sizeof(buf));
+            DWORD cc = s_discCount[p] > 0 ? COL_RED : COL_DIM;
+            DrawText(cx - TW(buf, 1.2f) * 0.5f, discY, buf, 1.2f, cc);
         }
     }
     // LT left, RT right
@@ -388,6 +938,49 @@ static void Render(const DiagLogo& logo, WORD cur,
         DWORD wc = wht > 30 ? COL_CYAN : COL_DIM;
         DrawText(whtCX - TW(wv, 1.05f) * 0.5f, metaY + WBH * 0.5f + 4.f, wv, 1.05f, wc);
         DrawText(blkCX - TW(bv, 1.05f) * 0.5f, metaY + WBH * 0.5f + 4.f, bv, 1.05f, bc);
+    }
+
+    // =========================================================
+    // MEMORY UNITS — center column, between meta and stick rows
+    // Four ports, each showing slot A (top) and slot B (bottom).
+    // Presence only — no data read.
+    // =========================================================
+    {
+        const char* hdr = "MEMORY UNITS";
+        float muHdrY = B + Y_META + 34.f;
+        DrawText(X_MID - TW(hdr, 1.1f) * 0.5f, muHdrY, hdr, 1.1f, COL_YELLOW);
+
+        // Four port columns, centred at X_MID
+        const float MW = 44.f;   // column width
+        const float MG = 8.f;    // gap between columns
+        const float totalMW = MW * 4.f + MG * 3.f;
+        float mx = X_MID - totalMW * 0.5f;
+        float muY = muHdrY + LINE_H + 4.f;
+
+        // Port number header row
+        const char* pLabels[4] = { "P1", "P2", "P3", "P4" };
+        for (int p = 0; p < 4; ++p)
+        {
+            float cx = mx + (MW + MG) * (float)p + MW * 0.5f;
+            DrawText(cx - TW(pLabels[p], 1.0f) * 0.5f, muY, pLabels[p], 1.0f, COL_GRAY);
+        }
+        muY += LINE_H + 2.f;
+
+        // Slot rows
+        const char* slotNames[2] = { "Slot A", "Slot B" };
+        for (int s = 0; s < 2; ++s)
+        {
+            DrawText(mx - 52.f, muY, slotNames[s], 1.0f, COL_GRAY);
+            for (int p = 0; p < 4; ++p)
+            {
+                float cx = mx + (MW + MG) * (float)p + MW * 0.5f;
+                bool present = IsMUPresent(p, s);
+                const char* state = present ? "PRESENT" : "---";
+                DWORD sc = present ? COL_GREEN : COL_DIM;
+                DrawText(cx - TW(state, 1.0f) * 0.5f, muY, state, 1.0f, sc);
+            }
+            muY += LINE_H + 1.f;
+        }
     }
 
     // =========================================================
@@ -482,6 +1075,51 @@ void ControllerTest_Tick(const DiagLogo& logo)
     int lt, rt, blk, wht, btnA, btnB, btnX, btnY;
     GetTriggers(lt, rt, blk, wht, btnA, btnB, btnX, btnY);
 
+    // ── Per-port disconnect tracking ────────────────────────────────────────
+    // Increment counter each time a connected port goes away.
+    for (int p = 0; p < 4; ++p)
+    {
+        bool conn = IsPortConnected(p);
+        if (s_wasConn[p] && !conn)
+            s_discCount[p]++;
+        s_wasConn[p] = conn;
+    }
+
+    // ── Stick test card ─────────────────────────────────────────────────────
+    if (s_stickMode)
+    {
+        if (Edge(cur, s_prev, BTN_B))
+        {
+            s_stickMode = false;
+            s_prev = cur;
+            return;
+        }
+        if (Edge(cur, s_prev, BTN_DPAD_RIGHT))
+            s_stickTest = (s_stickTest + 1) % 3;
+        if (Edge(cur, s_prev, BTN_DPAD_LEFT))
+            s_stickTest = (s_stickTest + 2) % 3;
+        if (Edge(cur, s_prev, BTN_X))
+        {
+            if (s_stickTest == 1)
+            {
+                // Clear circularity trace
+                for (int i = 0; i < CIRC_BUCKETS; ++i) { s_circMaxR[i] = 0.f; s_circMaxRR[i] = 0.f; }
+                s_circHasData = false;
+                s_circHasDataR = false;
+            }
+            else if (s_stickTest == 2)
+            {
+                // Reset drift samples
+                s_driftHead = 0; s_driftCount = 0; s_driftWarmup = 60;
+                s_driftAvgLX = 0; s_driftAvgLY = 0;
+                s_driftAvgRX = 0; s_driftAvgRY = 0;
+            }
+        }
+        s_prev = cur;
+        RenderStickTest(logo, lx, ly, rx, ry);
+        return;
+    }
+
     // ── Rumble subcard ──────────────────────────────────────────────────────
     if (s_rumbleMode)
     {
@@ -515,6 +1153,21 @@ void ControllerTest_Tick(const DiagLogo& logo)
 
     // ── Main controller view ────────────────────────────────────────────────
 
+    // START+DPAD_UP -> enter stick test card
+    if ((cur & BTN_START) && Edge(cur, s_prev, BTN_DPAD_UP))
+    {
+        s_stickMode = true;
+        s_stickTest = 0;
+        s_circHasData = false;
+        s_circHasDataR = false;
+        for (int i = 0; i < CIRC_BUCKETS; ++i) { s_circMaxR[i] = 0.f; s_circMaxRR[i] = 0.f; }
+        s_driftHead = 0; s_driftCount = 0; s_driftWarmup = 60;
+        s_driftAvgLX = 0; s_driftAvgLY = 0;
+        s_driftAvgRX = 0; s_driftAvgRY = 0;
+        s_prev = cur;
+        return;
+    }
+
     // START+A (edge on A while START held) -> enter rumble subcard
     if ((cur & BTN_START) && Edge(cur, s_prev, BTN_A))
     {
@@ -535,4 +1188,37 @@ void ControllerTest_Tick(const DiagLogo& logo)
 
     s_prev = cur;
     Render(logo, cur, lx, ly, rx, ry, lt, rt, blk, wht, btnA, btnB, btnX, btnY);
+}
+// ============================================================================
+// AutoRun — detect connected controllers, report port status
+// ============================================================================
+
+void ControllerTest_AutoRun(HANDLE hReport)
+{
+    // Pump a few frames to let XGetDeviceChanges settle
+    for (int i = 0; i < 10; ++i) { PumpInput(); Sleep(16); }
+
+    char line[64]; DWORD w;
+    int found = 0;
+
+    for (int port = 0; port < 4; ++port)
+    {
+        char portCh[4]; IntToStr(port + 1, portCh, sizeof(portCh));
+        bool conn = IsPortConnected(port);
+
+        StrCopy(line, sizeof(line), "Port ");
+        StrCat2(line, sizeof(line), line, portCh);
+        StrCat2(line, sizeof(line), line, ":         ");
+        StrCat2(line, sizeof(line), line, conn ? "Controller connected" : "Empty");
+        StrCat2(line, sizeof(line), line, "\r\n");
+        WriteFile(hReport, line, StrLen(line), &w, NULL);
+
+        if (conn) ++found;
+    }
+
+    char tot[4]; IntToStr(found, tot, sizeof(tot));
+    StrCopy(line, sizeof(line), "Total found:  ");
+    StrCat2(line, sizeof(line), line, tot);
+    StrCat2(line, sizeof(line), line, "\r\n");
+    WriteFile(hReport, line, StrLen(line), &w, NULL);
 }

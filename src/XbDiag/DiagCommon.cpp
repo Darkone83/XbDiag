@@ -441,7 +441,10 @@ void DrawPageChrome(const DiagLogo& logo,
         D3DCOLOR_XRGB(10, 10, 22));
 
     // --- Logo (top-left) ---
-    const float LOGO_DISP_W = 120.f;
+    // Source texture is 256x256 (square). Display size must also be square
+    // or the logo gets squashed. Height fits inside the 58px top bar with
+    // comfortable padding; width matches to preserve 1:1 aspect ratio.
+    const float LOGO_DISP_W = 48.f;
     const float LOGO_DISP_H = 48.f;
     const float LOGO_CX = 20.f + LOGO_DISP_W * 0.5f;
     const float LOGO_CY = TOP_BAR_H * 0.5f;
