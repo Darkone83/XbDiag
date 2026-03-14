@@ -288,7 +288,7 @@ Built by **Darkone83** / **Darkone Customs**.
 
 Additional credits:
 
-Team Resurgent x Equinox [PrometheOS] — virtual path architecture, board revision detection, and FTP server reference  
+Team Resurgent x Equinox [PrometheOS] 
 Rocky5 [XBMC4Gamers] — referenced for compatibility
 
 These sources were referenced for various functions throughout XbDiag to ensure hardware compatibility.
