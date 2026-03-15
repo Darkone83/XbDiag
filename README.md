@@ -237,10 +237,6 @@ Displays the full 256-byte EEPROM as a 16-column hex grid with field highlightin
 
 ### Decoded View
 
-<div align=center>
-<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Eepromview_reg.png">
-</div>
-
 Presents all parsed EEPROM fields in a scrollable list: serial number, region, HDD key, LAN MAC, confounder, video standard, video flags, audio flags, DVD region, game region, parental rating, time zone, last boot time, and checksum validity for both the factory and user sections.
 
 | Button | Action |
@@ -319,7 +315,7 @@ Raw NVPLL and MPLL register values are displayed beneath each clock field for ha
 ### Color Bar Test Patterns
 
 <div align=center>
-<img src=https://github.com/Darkone83/XbDiag/blob/main/img/Videoinfo_ntsc.png">
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Videoinfo_ntsc.png">
 </div>
 
 Full-screen color bar patterns for display calibration. Press `[B]` to return to the info view from either pattern.
