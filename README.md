@@ -6,6 +6,10 @@
 
 # XbDiag
 
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/main.png">
+</div>
+
 **A hardware diagnostic suite for the original Xbox console.**
 
 XbDiag is a native RXDK application that runs directly on original Xbox hardware (revisions 1.0 through 1.6, and debug kits). It gives you a deep look at the internal state of the machine — RAM integrity, SMBus devices, temperatures, EEPROM contents, HDD identity, video encoder, controller hardware, and DVD drive — all presented in a clean full-screen UI with no dependencies outside the Xbox kernel.
@@ -32,7 +36,9 @@ XbDiag is a native RXDK application that runs directly on original Xbox hardware
 
 ## System Info
 
-<!-- screenshot: System Info main view -->
+<div align="center">
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Sysinfo.png">
+</div>
 
 Displays a full hardware snapshot captured on entry. The left column covers the CPU, memory, and chipset; the right column covers video, thermal, storage, and network.
 
@@ -67,7 +73,9 @@ Displays a full hardware snapshot captured on entry. The left column covers the 
 
 ### Flash Chip Info Popup
 
-<!-- screenshot: Flash chip info popup -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Sysinfo_flash.png">
+</div>
 
 Opened with `[X]` from the main view. Uses JEDEC autoselect to identify the TSOP flash chip — manufacturer ID, device ID, chip name, and whether the write-enable line is bridged. Two guards prevent accidental probing: the popup is suppressed when a modchip is active (LPC bus intercepted) and on rev 1.6/1.6b hardware (no TSOP present). Press `[B]` to close.
 
@@ -75,7 +83,9 @@ Opened with `[X]` from the main view. Uses JEDEC autoselect to identify the TSOP
 
 ## Memory Test
 
-<!-- screenshot: Memory Test main view with chunk grid -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Ramtest.png">
+</div>
 
 ### Quick Test `[A]`
 
@@ -106,7 +116,9 @@ All adjacent cells are live simultaneously during soak — this catches coupling
 
 ### Chip Help Card `[WHITE]`
 
-<!-- screenshot: Chip Help card -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Ramtest_help.png">
+</div>
 
 Available at any time, including during a running test. Displays bank-to-physical-chip mapping for 64MB and 128MB configurations and a diagnosis guide for interpreting per-bank results. Press `[WHITE]` or `[B]` to return to the main view.
 
@@ -123,7 +135,9 @@ Available at any time, including during a running test. Displays bank-to-physica
 
 ## SMBus Scan
 
-<!-- screenshot: SMBus Scan grid view -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Smbusscan.png">
+</div>
 
 Performs a full scan of all 128 addresses (0x00–0x7F, software-shifted 8-bit convention matching `HalReadSMBusValue`). Results are displayed as a live ACK/NAK grid. The cursor can be moved freely across the grid; the info panel on the right updates to show device details for the selected address.
 
@@ -142,7 +156,9 @@ An ID source badge in the bottom-right of the panel indicates whether the device
 
 ### Register Read Panel `[A]`
 
-<!-- screenshot: Register read panel -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Smbusscan_reg.png">
+</div>
 
 Opens a live register read for the selected ACK address, displaying values for registers 0x00 through the supported range. Updates every frame. Press `[B]` to close and return to the grid.
 
@@ -185,7 +201,9 @@ XbDiag uses software-shifted 8-bit addresses (hardware 7-bit address left-shifte
 
 ## Temp Monitor
 
-<!-- screenshot: Temp Monitor dual gauge and graph -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Tempmonitor.png">
+</div>
 
 Displays live CPU die and board ambient temperatures. Sensor path is auto-detected on entry: ADM1032 at SMBus 0x98 for rev 1.0–1.5 boards, or PIC registers 0x09/0x0A at SMBus 0x20 for rev 1.6.
 
@@ -203,7 +221,9 @@ Rev 1.6 temperature readings are averaged across 10 samples to compensate for th
 
 ## EEPROM Viewer
 
-<!-- screenshot: EEPROM Decoded View -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Eepromview_dec.png">
+</div>
 
 ### Hex View
 
@@ -217,7 +237,9 @@ Displays the full 256-byte EEPROM as a 16-column hex grid with field highlightin
 
 ### Decoded View
 
-<!-- screenshot: EEPROM Decoded View showing fields -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Eepromview_reg.png">
+</div>
 
 Presents all parsed EEPROM fields in a scrollable list: serial number, region, HDD key, LAN MAC, confounder, video standard, video flags, audio flags, DVD region, game region, parental rating, time zone, last boot time, and checksum validity for both the factory and user sections.
 
@@ -232,7 +254,9 @@ Presents all parsed EEPROM fields in a scrollable list: serial number, region, H
 
 ### Edit View `[Y]`
 
-<!-- screenshot: EEPROM Edit View showing VIDEO card -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Eepromview_edit.png">
+</div>
 
 Four tabbed cards navigated with `[Left]` / `[Right]`:
 
@@ -245,13 +269,17 @@ Within each card, `[DPad Up/Down]` moves between fields and `[DPad Left/Right]` 
 
 ### Repair View `[X]`
 
-<!-- screenshot: EEPROM Repair View showing field status -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Eepromview_repair.png">
+</div>
 
 Scans the EEPROM for fields with corrupt or out-of-range values and categorizes each as **Repairable** or **Detect-Only**. Repairable fields can be corrected to known-good defaults; detect-only fields are flagged for information only. Pressing `[A]` shows a confirmation overlay before writing; after repair, `[A]` re-reads the live EEPROM to confirm the changes took effect. Press `[B]` to return to Decoded View without writing.
 
 ### Restore View `[WHITE]`
 
-<!-- screenshot: EEPROM Restore View with validation result -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Eepromview_restore.png">
+</div>
 
 Available when `D:\eeprom.bin` is present. Reads the file, validates both the factory and user section checksums, and displays the result. Pressing `[A]` confirms the restore and writes the file contents back to the EEPROM; after restore, `[A]` re-reads the live EEPROM to confirm. Press `[B]` to cancel without writing.
 
@@ -259,7 +287,9 @@ Available when `D:\eeprom.bin` is present. Reads the file, validates both the fa
 
 ## Video Info
 
-<!-- screenshot: Video Info main view -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Videoinfo.png">
+</div>
 
 ### Info View
 
@@ -288,13 +318,17 @@ Raw NVPLL and MPLL register values are displayed beneath each clock field for ha
 
 ### Color Bar Test Patterns
 
-<!-- screenshot: NTSC color bar test pattern -->
+<div align=center>
+<img src=https://github.com/Darkone83/XbDiag/blob/main/img/Videoinfo_ntsc.png">
+</div>
 
 Full-screen color bar patterns for display calibration. Press `[B]` to return to the info view from either pattern.
 
 ### Mode Switch Test `[WHITE]`
 
-<!-- screenshot: Mode Switch Test view -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Videoinfo_test.png">
+</div>
 
 Cycles through the video modes supported by the connected AV pack, applying each via D3D `Reset()` with the corresponding presentation flags. Full-screen color bars are displayed in the active mode with a live hardware verification readout showing the actual backbuffer dimensions as reported by `GetBackBuffer()`. This confirms whether the GPU framebuffer committed to the requested resolution.
 
@@ -318,7 +352,9 @@ The hardware verify readout (`HW: WxH  OK / MISMATCH`) is deferred by two frames
 
 ## HDD Info
 
-<!-- screenshot: HDD Info main view -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Hddinfo.png">
+</div>
 
 ### Drive Info View
 
@@ -337,7 +373,9 @@ Displays ATA IDENTIFY data for the primary HDD: model, serial number, firmware r
 
 ### SMART View `[Right]`
 
-<!-- screenshot: SMART attribute table -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Hddinfo_smart.png">
+</div>
 
 Live SMART attribute table — attribute ID, name, value, worst, threshold, and raw data for all reported attributes.
 
@@ -349,7 +387,9 @@ Live SMART attribute table — attribute ID, name, value, worst, threshold, and 
 
 ### HDD Benchmark `[RT]`
 
-<!-- screenshot: HDD Benchmark results view -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Hddinfo_bench.png">
+</div>
 
 Sequential write, sequential read, buffer read, and random seek test against a temporary file on `E:\` (falls back to `D:\`). On drives identified as SSDs, the sequential seek test is replaced with a 4K random read test reporting both MB/s and IOPS. Results are displayed as MB/s bars with numeric readouts.
 
@@ -363,7 +403,9 @@ Sequential write, sequential read, buffer read, and random seek test against a t
 
 ## Controller Test
 
-<!-- screenshot: Controller Test main view showing all inputs -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Controllertest.png">
+</div>
 
 ### Port Status Strip
 
@@ -381,7 +423,9 @@ Displays all digital buttons (A, B, X, Y, Black, White, Start, Back, D-pad, thum
 
 ### Stick Test `[START+DPad Up]`
 
-<!-- screenshot: Stick Test circularity sub-test -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Controllertest_dead.png">
+</div>
 
 Three sub-tests selectable with `[DPad Left]` / `[DPad Right]`:
 
@@ -393,7 +437,9 @@ Press `[B]` to exit back to the main visualizer.
 
 ### Rumble Subcard `[START+A]`
 
-<!-- screenshot: Rumble subcard -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Controllertest_rumble.png">
+</div>
 
 Dedicated subcard for testing the left (low-frequency) and right (high-frequency) rumble motors independently.
 
@@ -407,7 +453,9 @@ Dedicated subcard for testing the left (low-frequency) and right (high-frequency
 
 ## Stress Test
 
-<!-- screenshot: Stress Test CPU card running -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Stress_CPU.png">
+</div>
 
 Two test cards — CPU and RAM — navigated with `[DPad Left]` / `[DPad Right]`. Each card shares the same thermal threshold and abort controls.
 
@@ -417,13 +465,13 @@ Before the test begins, a threshold picker allows adjusting the thermal abort li
 
 ### CPU Stress `[A]`
 
-<!-- screenshot: CPU Stress card with live graph -->
-
 Sustained FPU/integer burn using a Prime95-derived eight-real FFT kernel. Live CPU and board temperatures are shown throughout with a scrolling history graph, min/max statistics, and fan speed readback (where PIC register 0x10 responds). A CPU load bar shows core utilization.
 
 ### RAM Stress `[Right]`
 
-<!-- screenshot: RAM Stress card showing chunk grid and phase label -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Stress_RAM.png">
+</div>
 
 Allocates the largest available contiguous block per bank and runs 11-phase moving-inversions and pattern passes across the entire live allocation simultaneously. The current phase label is shown above the chunk grid. Phases include moving inversions, checkerboard (0xAAAAAAAA/0x55555555) forward and inverted, and stride-31 address XOR patterns. Temperatures and fan speed are monitored throughout.
 
@@ -453,7 +501,9 @@ Hold `[Back+A]` simultaneously for 5 seconds to abort while a test is in progres
 
 ## File Explorer
 
-<!-- screenshot: File Explorer browsing E:\ -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Fileexplorer.png">
+</div>
 
 A full single-pane file manager for navigating and managing files on your Xbox HDD partitions.
 
@@ -470,7 +520,9 @@ A full single-pane file manager for navigating and managing files on your Xbox H
 
 ### File Operations
 
-<!-- screenshot: File Explorer with marked files -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Fileexplorer_ops.png">
+</div>
 
 | Button | Action |
 |--------|--------|
@@ -486,7 +538,9 @@ Copy and move operations run as a tick-driven background task so large transfers
 
 ### FTP Server
 
-<!-- screenshot: File Explorer with FTP server active -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Fileexplorer_FTP.png">
+</div>
 
 - **Credentials:** xbox / xbox
 - **Port:** 21
@@ -499,7 +553,9 @@ Copy and move operations run as a tick-driven background task so large transfers
 
 ## About
 
-<!-- screenshot: About screen with credit cards and fact ticker -->
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/About.png">
+</div>
 
 Displays version information and two credit logo cards. A rotating Xbox hardware trivia ticker is shown above the bottom bar, fading between facts automatically. Press `[X]` or `[Y]` to cycle through facts manually.
 
@@ -580,5 +636,6 @@ Additional credits:
 
 Team Resurgent x Equinox [PrometheOS]  
 Rocky5 [XBMC4Gamers] — referenced for compatibility
+Ernegien [XboxEepromEditor] - referenced for EEPROM repair utility and validation
 
 These sources were referenced for various functions throughout XbDiag to ensure hardware compatibility.
