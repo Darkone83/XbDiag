@@ -66,9 +66,9 @@ Displays a full hardware snapshot captured on entry. The left column covers the 
 
 | Button | Action |
 |--------|--------|
-| `[A]` | Export snapshot to `D:\sysinfo.txt` |
+| `[A]` | Export snapshot to `sysinfo.txt` |
 | `[X]` | Open flash chip info popup |
-| `[Y]` | Dump BIOS to `D:\bios.bin` (256KB or 1MB) |
+| `[Y]` | Dump BIOS to `bios.bin` (256KB or 1MB) |
 | `[B]` | Back to menu |
 
 ### Flash Chip Info Popup
@@ -127,7 +127,7 @@ Available at any time, including during a running test. Displays bank-to-physica
 | `[A]` | Start quick test |
 | `[X]` | Start 15-minute stress soak |
 | `[Y]` | Start 30-minute stress soak |
-| `[BLACK]` | Export results to `D:\ramresult.csv` (available after test completes) |
+| `[BLACK]` | Export results to `ramresult.csv` (available after test completes) |
 | `[WHITE]` | Toggle chip help card |
 | `[B]` | Abort running test / back to menu |
 
@@ -164,7 +164,7 @@ Opens a live register read for the selected ACK address, displaying values for r
 
 ### User Device Database (`smbid.id`)
 
-XbDiag loads `D:\smbid.id` on entry to supplement the built-in known-device table with up to 32 user-defined entries. If the file is not present it is created automatically with a commented template. Entries follow the format:
+XbDiag loads `smbid.id` on entry to supplement the built-in known-device table with up to 32 user-defined entries. If the file is not present it is created automatically with a commented template. Entries follow the format:
 
 ```
 0xAD | NAME | description | notes
@@ -231,7 +231,7 @@ Displays the full 256-byte EEPROM as a 16-column hex grid with field highlightin
 
 | Button | Action |
 |--------|--------|
-| `[A]` | Save raw 256-byte dump to `D:\eeprom.bin` |
+| `[A]` | Save raw 256-byte dump to `eeprom.bin` |
 | `[Right]` | Switch to Decoded View |
 | `[B]` | Back to menu |
 
@@ -245,11 +245,11 @@ Presents all parsed EEPROM fields in a scrollable list: serial number, region, H
 
 | Button | Action |
 |--------|--------|
-| `[A]` | Save `D:\eeprom.bin` |
+| `[A]` | Save `eeprom.bin` |
 | `[Left]` | Switch to Hex View |
 | `[Y]` | Enter Edit View |
 | `[X]` | Enter Repair View |
-| `[WHITE]` | Enter Restore View (only shown in hint if `D:\eeprom.bin` exists) |
+| `[WHITE]` | Enter Restore View (only shown in hint if `eeprom.bin` exists) |
 | `[B]` | Back to menu |
 
 ### Edit View `[Y]`
@@ -281,7 +281,7 @@ Scans the EEPROM for fields with corrupt or out-of-range values and categorizes 
 <img src="https://github.com/Darkone83/XbDiag/blob/main/img/Eepromview_restore.png">
 </div>
 
-Available when `D:\eeprom.bin` is present. Reads the file, validates both the factory and user section checksums, and displays the result. Pressing `[A]` confirms the restore and writes the file contents back to the EEPROM; after restore, `[A]` re-reads the live EEPROM to confirm. Press `[B]` to cancel without writing.
+Available when `eeprom.bin` is present. Reads the file, validates both the factory and user section checksums, and displays the result. Pressing `[A]` confirms the restore and writes the file contents back to the EEPROM; after restore, `[A]` re-reads the live EEPROM to confirm. Press `[B]` to cancel without writing.
 
 ---
 
@@ -366,7 +366,7 @@ Displays ATA IDENTIFY data for the primary HDD: model, serial number, firmware r
 
 | Button | Action |
 |--------|--------|
-| `[A]` | Export info to `D:\hddinfo.txt` |
+| `[A]` | Export info to `hddinfo.txt` |
 | `[Right]` | Switch to SMART view |
 | `[RT]` | Switch to Benchmark view |
 | `[B]` | Back to menu |
@@ -381,7 +381,7 @@ Live SMART attribute table — attribute ID, name, value, worst, threshold, and 
 
 | Button | Action |
 |--------|--------|
-| `[A]` | Export to `D:\smart.txt` |
+| `[A]` | Export to `smart.txt` |
 | `[Left]` | Return to Drive Info view |
 | `[B]` | Back to menu |
 
@@ -391,11 +391,11 @@ Live SMART attribute table — attribute ID, name, value, worst, threshold, and 
 <img src="https://github.com/Darkone83/XbDiag/blob/main/img/Hddinfo_bench.png">
 </div>
 
-Sequential write, sequential read, buffer read, and random seek test against a temporary file on `E:\` (falls back to `D:\`). On drives identified as SSDs, the sequential seek test is replaced with a 4K random read test reporting both MB/s and IOPS. Results are displayed as MB/s bars with numeric readouts.
+Sequential write, sequential read, buffer read, and random seek test against a temporary file on `E:\` (falls back to ``). On drives identified as SSDs, the sequential seek test is replaced with a 4K random read test reporting both MB/s and IOPS. Results are displayed as MB/s bars with numeric readouts.
 
 | Button | Action |
 |--------|--------|
-| `[A]` | Confirm and start benchmark / export results to `D:\hddbench.txt` when done |
+| `[A]` | Confirm and start benchmark / export results to `hddbench.txt` when done |
 | `[B]` | Cancel in-progress benchmark / return to Drive Info |
 | `[Left]` | Return to Drive Info view |
 
@@ -603,14 +603,14 @@ Place the built `default.xbe` and the `tex\` folder together in the same directo
 Diagnostic output files written by the tool:
 
 ```
-D:\eeprom.bin     (written by EEPROM Viewer export / restore)
-D:\hddinfo.txt    (written by HDD Info export)
-D:\sysinfo.txt    (written by System Info export)
-D:\smart.txt      (written by HDD Info SMART export)
-D:\hddbench.txt   (written by HDD Info benchmark export)
-D:\bios.bin       (written by System Info BIOS dump)
-D:\ramresult.csv  (written by Memory Test export)
-D:\smbid.id       (created automatically if not present; user-editable SMBus device database)
+eeprom.bin     (written by EEPROM Viewer export / restore)
+hddinfo.txt    (written by HDD Info export)
+sysinfo.txt    (written by System Info export)
+smart.txt      (written by HDD Info SMART export)
+hddbench.txt   (written by HDD Info benchmark export)
+bios.bin       (written by System Info BIOS dump)
+ramresult.csv  (written by Memory Test export)
+smbid.id       (created automatically if not present; user-editable SMBus device database)
 ```
 
 ---
@@ -618,7 +618,7 @@ D:\smbid.id       (created automatically if not present; user-editable SMBus dev
 ## Known Limitations
 
 - **Rev 1.6 temperatures** are read via PIC registers (0x09/0x0A). Xcalibur readings are noisier than ADM1032 — values are averaged across 10 samples to compensate.
-- **EEPROM export** writes to the title directory (`D:\`). If the directory is read-only the export will silently fail and the status indicator on screen will show `FAIL`.
+- **EEPROM export** writes to the title directory. If the directory is read-only the export will silently fail and the status indicator on screen will show `FAIL`.
 - **Flash chip detection** is suppressed when a modchip is active (LPC bus intercepted) and on rev 1.6/1.6b hardware (no TSOP present).
 - **xemu compatibility**: The PIC SMBus device (0x20) may not respond in xemu. Video Info and Temp Monitor handle this gracefully. NV2A MMIO reads in Video Info are guarded by a PCI vendor ID check and will show `N/A` if the guard fails. CPU detection uses the hypervisor present bit (CPUID leaf 1, ECX bit 31) to distinguish xemu from real hardware. All other modules work normally.
 - **LBA48 capacity** is displayed correctly for drives over 137GB. Drives over 2TB will display a `+` suffix indicating the upper 32 address bits are non-zero.
