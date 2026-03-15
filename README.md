@@ -315,7 +315,7 @@ Raw NVPLL and MPLL register values are displayed beneath each clock field for ha
 ### Color Bar Test Patterns
 
 <div align=center>
-<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Videoinfo_ntsc.png">
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Videoinfo_colorbars.png">
 </div>
 
 Full-screen color bar patterns for display calibration. Press `[B]` to return to the info view from either pattern.
