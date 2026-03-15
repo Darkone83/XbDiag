@@ -624,7 +624,6 @@ smbid.id       (created automatically if not present; user-editable SMBus device
 - **LBA48 capacity** is displayed correctly for drives over 137GB. Drives over 2TB will display a `+` suffix indicating the upper 32 address bits are non-zero.
 - **Video mode switching** (`[WHITE]` in Video Info) switches the D3D device via `Reset()`. Modes unsupported by the connected AV pack will be rejected silently by the NV2A encoder — the hardware verify readout will show `MISMATCH` in that case. The original mode is always restored cleanly on exit.
 - **FTP passive mode only** — active mode (PORT) is not supported. Configure your FTP client to use passive mode.
-- **DVD drive detection** on the secondary ATA channel is noted as not fully implemented under CerbIOS.
 
 ---
 
