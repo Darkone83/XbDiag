@@ -3,7 +3,7 @@
 //
 // Layout:
 //   Chrome:  DrawPageChrome (top bar, bottom bar, logo)
-//   Content: Vertically centered list of 8 menu entries.
+//   Content: Vertically centered list of 11 menu entries.
 //            Selected row = full-width FillRectGrad highlight bar (COL_SEL_BAR).
 //            Each row: index number  |  label  |  one-line description  |  status badge
 //
@@ -11,6 +11,7 @@
 //   D-pad up/down  = move cursor
 //   A              = enter selected module
 //   Start          = exit to dashboard
+//   Back+White     = open automation settings (hidden)
 //
 // Status badges:
 //   "READY"     COL_GREEN  - module available
@@ -67,7 +68,7 @@ static const MenuItem k_items[] =
     { "07", "HDD INFO",         "ATA IDENTIFY - model, serial, capacity, UDMA mode",            MSTATE_HDD     },
     { "08", "CONTROLLER TEST",  "Buttons, analog sticks, triggers, and rumble motor test",      MSTATE_CTRL    },
     { "09", "STRESS TEST",      "Sustained CPU and RAM load test with thermal monitoring",      MSTATE_STRESS  },
-    { "10", "FILE EXPLORER",    "Browse Xbox partitions - C: D: E: F: G: directory listings",   MSTATE_FILES   },
+    { "10", "FILE EXPLORER",    "Browse Xbox partitions - C: E: F: G: and MU slots",            MSTATE_FILES   },
     { "11", "ABOUT",            "Version info, credits, and hardware compatibility notes",       MSTATE_ABOUT   },
 };
 
@@ -91,7 +92,7 @@ static const float IDX_X = 12.f;   // index number X
 static const float LABEL_X = 52.f;   // label text X
 static const float BADGE_RX = SW - 12.f; // READY badge right edge
 static const float TS = 1.4f;   // row text scale
-static const float INFO_Y = LIST_TOP + (float)8 * ROW_H + 10.f; // info panel Y
+static const float INFO_Y = LIST_TOP + (float)11 * ROW_H + 10.f; // info panel Y
 
 // ============================================================================
 // OnEnter
@@ -160,7 +161,7 @@ static void Render(const DiagLogo& logo)
     g_pDevice->BeginScene();
 
     DrawPageChrome(logo,
-        "XbDiag v1.0  -  Hardware Diagnostic Suite",
+        "XbDiag v1.0 Beta -  Hardware Diagnostic Suite",
         "[Up/Down] Navigate    [A] Select    [Start] Exit to Dashboard");
 
     // -------------------------------------------------------------------------

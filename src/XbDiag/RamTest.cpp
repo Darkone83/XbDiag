@@ -16,8 +16,9 @@
 // TWO TEST MODES:
 //
 // Quick test  [A] - chunk-by-chunk sanity check:
-//   Each 2MB chunk allocated, tested with 4 static patterns, freed.
-//   Fast, catches obvious stuck-bit and address decoder faults.
+//   Each 2MB chunk allocated, tested with 4 patterns, freed:
+//     0xAA55AA55, 0x55AA55AA, walking 1s, addr XOR 0xDEADBEEF
+//   Fast, catches stuck-bit and address decoder faults.
 //   One chunk per tick — display stays live throughout.
 //
 // Stress soak [X]/[Y] - large-block moving inversions (memtest86-style):

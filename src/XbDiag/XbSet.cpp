@@ -2,18 +2,22 @@
 // XbDiag automation settings editor and autorun engine.
 //
 // Settings file format (D:\XbDiag.set):
-//   KEY=0 or KEY=1 per line, STRESS_DUR=<index>
-//   Unrecognised keys ignored. CRLF or LF.
+//   Module enables (0/1): SYSINFO  VIDEOINFO  SMBUS  HDDINFO  RAMTEST
+//                         TEMPMON  EEPROM  CTRLTEST  CPUSTRESS  RAMSTRESS
+//   CPU_HRS=N  CPU_MIN=N  RAM_HRS=N  RAM_MIN=N  LOOPS=N
+//   ALT_STRESS=0/1  SHUTDOWN=0/1
+//   Unrecognised keys are ignored. CRLF or LF accepted.
 //
 // Autorun sequence:
 //   SysInfo -> VideoInfo -> SmBusScan -> HddInfo -> RamTest -> TempMon
-//   -> EepromView -> ControllerTest (60s wait) -> CPU Stress -> RAM Stress
+//   -> EepromView -> ControllerTest (60s wait) -> Stress loop(s)
 //
-// Controller test waits up to 60 seconds for [A] to confirm presence.
-// If no input arrives, it is skipped and the report notes "No input / skipped".
+// Stress loop modes:
+//   Each loop runs: CPU stress (if enabled) then RAM stress (if enabled).
+//   Repeat stressLoops times. ALT_STRESS changes the report label only.
+//   Per-test durations: cpuStress / ramStress (independent).
 //
-// Stress tests run for stressDuration seconds (30/60/120/300).
-// Peak CPU temp, min/max load, and fan speed are logged.
+// Shutdown: PIC16L power-off command (matches PrometheOS utils::shutdown).
 
 #include "XbSet.h"
 #include "font.h"
@@ -29,14 +33,31 @@
 #include "ControllerTest.h"
 #include "StressTest.h"
 #include "StressMath.h"
-// StressTest_AutoRun declared in StressTest.h
 extern void StressTest_AutoRun(HANDLE hReport, DWORD durationMs);
+extern void RamStress_AutoRun(HANDLE hReport, DWORD durationMs);
+
+// Per-loop result accessors (implemented in StressTest.cpp)
+extern BYTE  StressAutoRun_GetMinCPU();
+extern BYTE  StressAutoRun_GetMaxCPU();
+extern BYTE  StressAutoRun_GetMinFan();
+extern BYTE  StressAutoRun_GetMaxFan();
+extern BYTE  StressAutoRun_GetMeasuredLoad();
+extern bool  StressAutoRun_GetThermalAbort();
+extern DWORD RamAutoRun_GetSweeps();
+extern DWORD RamAutoRun_GetErrors();
+extern int   RamAutoRun_GetFailed();
 #include <xtl.h>
 #include <winsockx.h>
 
 extern void RequestState(int newState);
-
 static const int MSTATE_MENU = 0;
+
+// Xbox shutdown via PIC16L power command — matches PrometheOS utils::shutdown()
+// PIC16L at SMBus 0x20, command 0x02 (power), value 0x80 (power off subcmd)
+static void XbShutdown()
+{
+    SMBusWrite(SMBADDR_PIC, 0x02, 0x80);
+}
 
 // ============================================================================
 // Globals
@@ -58,12 +79,20 @@ static bool StrEq(const char* a, const char* b)
     return *a == '\0' && *b == '\0';
 }
 
+static int ParseInt(const char* val, int lo, int hi, int fallback)
+{
+    int v = 0;
+    for (int i = 0; val[i] >= '0' && val[i] <= '9'; ++i) v = v * 10 + (val[i] - '0');
+    return (v >= lo && v <= hi) ? v : fallback;
+}
+
 // ============================================================================
 // Settings I/O
 // ============================================================================
 
 bool XbSet_LoadSettings()
 {
+    // Defaults
     g_autoSettings.runSysInfo = false;
     g_autoSettings.runVideoInfo = false;
     g_autoSettings.runSmBus = false;
@@ -74,8 +103,13 @@ bool XbSet_LoadSettings()
     g_autoSettings.runCtrlTest = false;
     g_autoSettings.runCpuStress = false;
     g_autoSettings.runRamStress = false;
-    g_autoSettings.stressHours = 0;
-    g_autoSettings.stressMins = 30;  // default 30 minutes
+    g_autoSettings.cpuStressHours = 0;
+    g_autoSettings.cpuStressMins = 30;
+    g_autoSettings.ramStressHours = 0;
+    g_autoSettings.ramStressMins = 30;
+    g_autoSettings.stressLoops = 1;
+    g_autoSettings.altStressMode = false;
+    g_autoSettings.shutdownAfter = false;
 
     HANDLE hf = CreateFileA(SETTINGS_PATH, GENERIC_READ, FILE_SHARE_READ,
         NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -103,28 +137,23 @@ bool XbSet_LoadSettings()
         const char* val = eq + 1;
         bool on = (val[0] == '1');
 
-        if (StrEq(key, "SYSINFO"))    g_autoSettings.runSysInfo = on;
-        if (StrEq(key, "VIDEOINFO"))  g_autoSettings.runVideoInfo = on;
-        if (StrEq(key, "SMBUS"))      g_autoSettings.runSmBus = on;
-        if (StrEq(key, "HDDINFO"))    g_autoSettings.runHddInfo = on;
-        if (StrEq(key, "RAMTEST"))    g_autoSettings.runRamTest = on;
-        if (StrEq(key, "TEMPMON"))    g_autoSettings.runTempMon = on;
-        if (StrEq(key, "EEPROM"))     g_autoSettings.runEeprom = on;
-        if (StrEq(key, "CTRLTEST"))   g_autoSettings.runCtrlTest = on;
-        if (StrEq(key, "CPUSTRESS"))  g_autoSettings.runCpuStress = on;
-        if (StrEq(key, "RAMSTRESS"))  g_autoSettings.runRamStress = on;
-        if (StrEq(key, "STRESS_HRS"))
-        {
-            int v = 0;
-            for (int i = 0; val[i] >= '0' && val[i] <= '9'; ++i) v = v * 10 + (val[i] - '0');
-            if (v >= 0 && v <= 99) g_autoSettings.stressHours = v;
-        }
-        if (StrEq(key, "STRESS_MIN"))
-        {
-            int v = 0;
-            for (int i = 0; val[i] >= '0' && val[i] <= '9'; ++i) v = v * 10 + (val[i] - '0');
-            if (v >= 0 && v <= 59) g_autoSettings.stressMins = v;
-        }
+        if (StrEq(key, "SYSINFO"))      g_autoSettings.runSysInfo = on;
+        if (StrEq(key, "VIDEOINFO"))    g_autoSettings.runVideoInfo = on;
+        if (StrEq(key, "SMBUS"))        g_autoSettings.runSmBus = on;
+        if (StrEq(key, "HDDINFO"))      g_autoSettings.runHddInfo = on;
+        if (StrEq(key, "RAMTEST"))      g_autoSettings.runRamTest = on;
+        if (StrEq(key, "TEMPMON"))      g_autoSettings.runTempMon = on;
+        if (StrEq(key, "EEPROM"))       g_autoSettings.runEeprom = on;
+        if (StrEq(key, "CTRLTEST"))     g_autoSettings.runCtrlTest = on;
+        if (StrEq(key, "CPUSTRESS"))    g_autoSettings.runCpuStress = on;
+        if (StrEq(key, "RAMSTRESS"))    g_autoSettings.runRamStress = on;
+        if (StrEq(key, "CPU_HRS"))      g_autoSettings.cpuStressHours = ParseInt(val, 0, 99, 0);
+        if (StrEq(key, "CPU_MIN"))      g_autoSettings.cpuStressMins = ParseInt(val, 0, 59, 30);
+        if (StrEq(key, "RAM_HRS"))      g_autoSettings.ramStressHours = ParseInt(val, 0, 99, 0);
+        if (StrEq(key, "RAM_MIN"))      g_autoSettings.ramStressMins = ParseInt(val, 0, 59, 30);
+        if (StrEq(key, "LOOPS"))        g_autoSettings.stressLoops = ParseInt(val, 1, 99, 1);
+        if (StrEq(key, "ALT_STRESS"))   g_autoSettings.altStressMode = on;
+        if (StrEq(key, "SHUTDOWN"))     g_autoSettings.shutdownAfter = on;
     }
     return true;
 }
@@ -145,6 +174,15 @@ bool XbSet_SaveSettings()
             StrCat2(line, sizeof(line), line, val ? "=1\r\n" : "=0\r\n");
             WriteFile(hf, line, StrLen(line), &w, NULL);
         };
+    auto WN = [&](const char* key, int val)
+        {
+            StrCopy(line, sizeof(line), key);
+            StrCat2(line, sizeof(line), line, "=");
+            char v[8]; IntToStr(val, v, sizeof(v));
+            StrCat2(line, sizeof(line), line, v);
+            StrCat2(line, sizeof(line), line, "\r\n");
+            WriteFile(hf, line, StrLen(line), &w, NULL);
+        };
 
     WL("SYSINFO", g_autoSettings.runSysInfo);
     WL("VIDEOINFO", g_autoSettings.runVideoInfo);
@@ -156,20 +194,13 @@ bool XbSet_SaveSettings()
     WL("CTRLTEST", g_autoSettings.runCtrlTest);
     WL("CPUSTRESS", g_autoSettings.runCpuStress);
     WL("RAMSTRESS", g_autoSettings.runRamStress);
-
-    // Stress duration index
-    StrCopy(line, sizeof(line), "STRESS_HRS=");
-    {
-        char v[8]; IntToStr(g_autoSettings.stressHours, v, sizeof(v));
-        StrCat2(line, sizeof(line), line, v); StrCat2(line, sizeof(line), line, "\r\n");
-    }
-    WriteFile(hf, line, StrLen(line), &w, NULL);
-    StrCopy(line, sizeof(line), "STRESS_MIN=");
-    {
-        char v[8]; IntToStr(g_autoSettings.stressMins, v, sizeof(v));
-        StrCat2(line, sizeof(line), line, v); StrCat2(line, sizeof(line), line, "\r\n");
-    }
-    WriteFile(hf, line, StrLen(line), &w, NULL);
+    WN("CPU_HRS", g_autoSettings.cpuStressHours);
+    WN("CPU_MIN", g_autoSettings.cpuStressMins);
+    WN("RAM_HRS", g_autoSettings.ramStressHours);
+    WN("RAM_MIN", g_autoSettings.ramStressMins);
+    WN("LOOPS", g_autoSettings.stressLoops);
+    WL("ALT_STRESS", g_autoSettings.altStressMode);
+    WL("SHUTDOWN", g_autoSettings.shutdownAfter);
 
     FlushFileBuffers(hf);
     CloseHandle(hf);
@@ -225,6 +256,37 @@ extern void EepromView_AutoRun(HANDLE hReport);
 extern void ControllerTest_AutoRun(HANDLE hReport);
 
 // ============================================================================
+// Duration label helper
+// ============================================================================
+
+static void FmtDurLabel(int hours, int mins, char* buf, int bufLen)
+{
+    if (hours > 0)
+    {
+        char hh[8], mm[8];
+        IntToStr(hours, hh, sizeof(hh));
+        IntToStr(mins, mm, sizeof(mm));
+        StrCopy(buf, bufLen, hh);
+        StrCat2(buf, bufLen, buf, "h ");
+        StrCat2(buf, bufLen, buf, mm);
+        StrCat2(buf, bufLen, buf, "m");
+    }
+    else
+    {
+        char mm[8]; IntToStr(mins, mm, sizeof(mm));
+        StrCopy(buf, bufLen, mm);
+        StrCat2(buf, bufLen, buf, "m");
+    }
+}
+
+static DWORD DurToMs(int hours, int mins)
+{
+    DWORD secs = (DWORD)(hours * 3600 + mins * 60);
+    if (secs < 60) secs = 60;  // enforce 1 minute minimum
+    return secs * 1000;
+}
+
+// ============================================================================
 // Status overlay helpers
 // ============================================================================
 
@@ -273,7 +335,7 @@ static void DrawAutoStatus(const DiagLogo& logo,
     g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
 
-static void DrawAutoComplete(const DiagLogo& logo, bool ok)
+static void DrawAutoComplete(const DiagLogo& logo, bool ok, bool willShutdown)
 {
     g_pDevice->BeginScene();
     DrawPageChrome(logo, "AUTO DIAGNOSTIC", "[A] Return to menu");
@@ -281,23 +343,21 @@ static void DrawAutoComplete(const DiagLogo& logo, bool ok)
     if (ok)
     {
         DrawText(LM, py, "DIAGNOSTICS COMPLETE", 1.6f, COL_GREEN); py += LINE_H + 8.f;
-        DrawText(LM, py, "Results saved to XbDiag.txt", 1.2f, COL_CYAN);
+        DrawText(LM, py, "Results saved to D:\\XbDiag.txt", 1.2f, COL_CYAN);
     }
     else
     {
         DrawText(LM, py, "DIAGNOSTICS COMPLETE", 1.6f, COL_ORANGE); py += LINE_H + 8.f;
-        DrawText(LM, py, "Could not write XbDiag.txt", 1.2f, COL_RED);
+        DrawText(LM, py, "Could not write D:\\XbDiag.txt", 1.2f, COL_RED);
     }
     py += LINE_H * 2.f;
-    DrawText(LM, py, "Press [A] or [B] to return to the main menu.", 1.2f, COL_GRAY);
+    DrawText(LM, py, "Press [A] or [B] to continue.", 1.2f, COL_GRAY);
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
 
 // ============================================================================
 // Controller test with 60-second user-input wait
-// Displays a prompt, counts down. [A] = proceed, countdown expiry = skip.
-// Returns true if the test ran, false if skipped.
 // ============================================================================
 
 static bool CtrlTest_WithTimeout(const DiagLogo& logo,
@@ -312,7 +372,6 @@ static bool CtrlTest_WithTimeout(const DiagLogo& logo,
         DWORD elapsed = GetTickCount() - waitStart;
         DWORD remain = (elapsed < 60000) ? (60000 - elapsed) / 1000 + 1 : 0;
 
-        // Render wait prompt
         g_pDevice->BeginScene();
         DrawPageChrome(logo, "AUTO DIAGNOSTIC", "[A] Confirm    [B] Skip");
 
@@ -348,7 +407,6 @@ static bool CtrlTest_WithTimeout(const DiagLogo& logo,
 
         if (edgeA)
         {
-            // User confirmed — run test
             ControllerTest_OnEnter();
             RSection(hReport, "CONTROLLER TEST");
             ControllerTest_AutoRun(hReport);
@@ -364,44 +422,18 @@ static bool CtrlTest_WithTimeout(const DiagLogo& logo,
 }
 
 // ============================================================================
-// Stress test AutoRun — timed CPU or RAM stress
-// ============================================================================
-
-// Access StressTest internals via extern
-extern BYTE  StressAutoRun_GetCurCPU();
-extern BYTE  StressAutoRun_GetMinCPU();
-extern BYTE  StressAutoRun_GetMaxCPU();
-extern BYTE  StressAutoRun_GetMeasuredLoad();
-extern BYTE  StressAutoRun_GetMinFan();
-extern BYTE  StressAutoRun_GetMaxFan();
-extern bool  StressAutoRun_GetThermalAbort();
-
-static void RunCpuStressAuto(const DiagLogo& logo,
-    int step, int total, DWORD durationMs, HANDLE hReport)
-{
-    // Delegates to StressTest_AutoRun — uses the real StressTest.cpp
-    // burn loop (same CPUStress kernels, same sensor path, same
-    // edge-aligned measurement windows as the interactive stress test).
-    StressTest_AutoRun(hReport, durationMs);
-}
-
-static void RunRamStressAuto(const DiagLogo& logo,
-    int step, int total, DWORD durationMs, HANDLE hReport)
-{
-    // Delegates to RamStress_AutoRun in StressTest.cpp —
-    // uses the real StressTest RAM stress engine (RamOnStart /
-    // RamStressStep / RamStop) running for the configured duration.
-    extern void RamStress_AutoRun(HANDLE hReport, DWORD durationMs);
-    RamStress_AutoRun(hReport, durationMs);
-}
-
-// ============================================================================
 // AutoRun engine
 // ============================================================================
 
 void XbSet_AutoRun(const DiagLogo& logo)
 {
-    // Count enabled modules
+    const int loops = (g_autoSettings.stressLoops > 0) ? g_autoSettings.stressLoops : 1;
+    const bool doAlt = g_autoSettings.altStressMode;
+    const bool doCpu = g_autoSettings.runCpuStress;
+    const bool doRam = g_autoSettings.runRamStress;
+
+    // Total steps: non-stress modules run once, stress modules run once per loop
+    int stressStepsPerLoop = (doCpu ? 1 : 0) + (doRam ? 1 : 0);
     int total = 0;
     if (g_autoSettings.runSysInfo)   ++total;
     if (g_autoSettings.runVideoInfo) ++total;
@@ -411,34 +443,17 @@ void XbSet_AutoRun(const DiagLogo& logo)
     if (g_autoSettings.runTempMon)   ++total;
     if (g_autoSettings.runEeprom)    ++total;
     if (g_autoSettings.runCtrlTest)  ++total;
-    if (g_autoSettings.runCpuStress) ++total;
-    if (g_autoSettings.runRamStress) ++total;
+    total += stressStepsPerLoop * loops;
 
     if (total == 0) { RequestState(MSTATE_MENU); return; }
 
+    // Per-stress duration in ms
+    DWORD cpuMs = DurToMs(g_autoSettings.cpuStressHours, g_autoSettings.cpuStressMins);
+    DWORD ramMs = DurToMs(g_autoSettings.ramStressHours, g_autoSettings.ramStressMins);
 
-    DWORD stressTotalSecs = (DWORD)(g_autoSettings.stressHours * 3600
-        + g_autoSettings.stressMins * 60);
-    if (stressTotalSecs < 60) stressTotalSecs = 60;
-    DWORD stressMs = stressTotalSecs * 1000;
-
-    static char s_durLabel[16];
-    if (g_autoSettings.stressHours > 0)
-    {
-        char hh[8], mm[8];
-        IntToStr(g_autoSettings.stressHours, hh, sizeof(hh));
-        IntToStr(g_autoSettings.stressMins, mm, sizeof(mm));
-        StrCopy(s_durLabel, sizeof(s_durLabel), hh);
-        StrCat2(s_durLabel, sizeof(s_durLabel), s_durLabel, "h ");
-        StrCat2(s_durLabel, sizeof(s_durLabel), s_durLabel, mm);
-        StrCat2(s_durLabel, sizeof(s_durLabel), s_durLabel, "m");
-    }
-    else
-    {
-        char mm[8]; IntToStr(g_autoSettings.stressMins, mm, sizeof(mm));
-        StrCopy(s_durLabel, sizeof(s_durLabel), mm);
-        StrCat2(s_durLabel, sizeof(s_durLabel), s_durLabel, "m");
-    }
+    char cpuLabel[16], ramLabel[16];
+    FmtDurLabel(g_autoSettings.cpuStressHours, g_autoSettings.cpuStressMins, cpuLabel, sizeof(cpuLabel));
+    FmtDurLabel(g_autoSettings.ramStressHours, g_autoSettings.ramStressMins, ramLabel, sizeof(ramLabel));
 
     HANDLE hf = CreateFileA(REPORT_PATH, GENERIC_WRITE, 0,
         NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -452,113 +467,256 @@ void XbSet_AutoRun(const DiagLogo& logo)
             "====================================\r\n\r\n";
         WriteFile(hf, hdr, StrLen(hdr), &w, NULL);
 
-        // Log stress duration setting
-        char durLine[48];
-        StrCopy(durLine, sizeof(durLine), "Stress duration: ");
-        StrCat2(durLine, sizeof(durLine), durLine,
-            s_durLabel);
-        StrCat2(durLine, sizeof(durLine), durLine, "\r\n\r\n");
-        WriteFile(hf, durLine, StrLen(durLine), &w, NULL);
+        // Log stress configuration
+        char line[80];
+        StrCopy(line, sizeof(line), "CPU stress duration: ");
+        StrCat2(line, sizeof(line), line, cpuLabel);
+        StrCat2(line, sizeof(line), line, "\r\n");
+        WriteFile(hf, line, StrLen(line), &w, NULL);
+
+        StrCopy(line, sizeof(line), "RAM stress duration: ");
+        StrCat2(line, sizeof(line), line, ramLabel);
+        StrCat2(line, sizeof(line), line, "\r\n");
+        WriteFile(hf, line, StrLen(line), &w, NULL);
+
+        char lb[8]; IntToStr(loops, lb, sizeof(lb));
+        StrCopy(line, sizeof(line), "Stress loops:        ");
+        StrCat2(line, sizeof(line), line, lb);
+        StrCat2(line, sizeof(line), line, "\r\n");
+        WriteFile(hf, line, StrLen(line), &w, NULL);
+
+        StrCopy(line, sizeof(line), "Stress mode:         ");
+        StrCat2(line, sizeof(line), line, doAlt ? "Alternate (CPU/RAM interleaved)\r\n" : "Normal (CPU then RAM)\r\n");
+        WriteFile(hf, line, StrLen(line), &w, NULL);
+
+        WriteFile(hf, "\r\n", 2, &w, NULL);
     }
 
     int step = 1;
+
+    // ---- Non-stress modules (run once) ----
 
     if (g_autoSettings.runSysInfo)
     {
         DrawAutoStatus(logo, "SYSTEM INFO", step++, total);
         SysInfo_OnEnter();
-        if (reportOK) {
-            RSection(hf, "SYSTEM INFO"); SysInfo_AutoRun(hf);
-            DWORD _w1; WriteFile(hf, "\r\n", 2, &_w1, NULL);
-        }
+        if (reportOK) { RSection(hf, "SYSTEM INFO"); SysInfo_AutoRun(hf); DWORD _w; WriteFile(hf, "\r\n", 2, &_w, NULL); }
     }
     if (g_autoSettings.runVideoInfo)
     {
         DrawAutoStatus(logo, "VIDEO INFO", step++, total);
         VideoInfo_OnEnter();
-        if (reportOK) {
-            RSection(hf, "VIDEO INFO"); VideoInfo_AutoRun(hf);
-            DWORD _w2; WriteFile(hf, "\r\n", 2, &_w2, NULL);
-        }
+        if (reportOK) { RSection(hf, "VIDEO INFO"); VideoInfo_AutoRun(hf); DWORD _w; WriteFile(hf, "\r\n", 2, &_w, NULL); }
     }
     if (g_autoSettings.runSmBus)
     {
         DrawAutoStatus(logo, "SMBUS SCAN", step++, total);
         SmBusScan_OnEnter();
-        if (reportOK) {
-            RSection(hf, "SMBUS SCAN"); SmBusScan_AutoRun(hf);
-            DWORD _w3; WriteFile(hf, "\r\n", 2, &_w3, NULL);
-        }
+        if (reportOK) { RSection(hf, "SMBUS SCAN"); SmBusScan_AutoRun(hf); DWORD _w; WriteFile(hf, "\r\n", 2, &_w, NULL); }
     }
     if (g_autoSettings.runHddInfo)
     {
         DrawAutoStatus(logo, "HDD INFO + BENCHMARK", step++, total);
         HddInfo_OnEnter();
-        if (reportOK) {
-            RSection(hf, "HDD INFO"); HddInfo_AutoRun(hf);
-            DWORD _w4; WriteFile(hf, "\r\n", 2, &_w4, NULL);
-        }
+        if (reportOK) { RSection(hf, "HDD INFO"); HddInfo_AutoRun(hf); DWORD _w; WriteFile(hf, "\r\n", 2, &_w, NULL); }
     }
     if (g_autoSettings.runRamTest)
     {
         DrawAutoStatus(logo, "RAM TEST", step++, total);
         RamTest_OnEnter();
-        if (reportOK) {
-            RSection(hf, "RAM TEST"); RamTest_AutoRun(hf);
-            DWORD _w5; WriteFile(hf, "\r\n", 2, &_w5, NULL);
-        }
+        if (reportOK) { RSection(hf, "RAM TEST"); RamTest_AutoRun(hf); DWORD _w; WriteFile(hf, "\r\n", 2, &_w, NULL); }
     }
     if (g_autoSettings.runTempMon)
     {
         DrawAutoStatus(logo, "TEMP MONITOR", step++, total);
         TempMonitor_OnEnter();
-        if (reportOK) {
-            RSection(hf, "TEMP MONITOR"); TempMonitor_AutoRun(hf);
-            DWORD _w6; WriteFile(hf, "\r\n", 2, &_w6, NULL);
-        }
+        if (reportOK) { RSection(hf, "TEMP MONITOR"); TempMonitor_AutoRun(hf); DWORD _w; WriteFile(hf, "\r\n", 2, &_w, NULL); }
     }
     if (g_autoSettings.runEeprom)
     {
         DrawAutoStatus(logo, "EEPROM", step++, total);
         EepromView_OnEnter();
-        if (reportOK) {
-            RSection(hf, "EEPROM"); EepromView_AutoRun(hf);
-            DWORD _w7; WriteFile(hf, "\r\n", 2, &_w7, NULL);
-        }
+        if (reportOK) { RSection(hf, "EEPROM"); EepromView_AutoRun(hf); DWORD _w; WriteFile(hf, "\r\n", 2, &_w, NULL); }
     }
     if (g_autoSettings.runCtrlTest)
     {
-        // Interactive — shows 60s countdown, skips with note if no input
-        if (reportOK)
-            CtrlTest_WithTimeout(logo, step, total, hf);
-        else
-            CtrlTest_WithTimeout(logo, step, total, INVALID_HANDLE_VALUE);
+        if (reportOK) CtrlTest_WithTimeout(logo, step, total, hf);
+        else          CtrlTest_WithTimeout(logo, step, total, INVALID_HANDLE_VALUE);
         ++step;
     }
-    if (g_autoSettings.runCpuStress)
+
+    // ---- Stress loops ----
+
+    // Accumulators for cross-loop summary (only used when loops > 1)
+    BYTE  acc_cpuMin = 255, acc_cpuMax = 0;
+    BYTE  acc_fanMin = 255, acc_fanMax = 0;
+    DWORD acc_cpuPeakSum = 0;   // sum of per-loop peak temps for avg
+    int   acc_cpuLoops = 0;
+    bool  acc_thermalAny = false;
+    DWORD acc_ramSweeps = 0;
+    DWORD acc_ramErrors = 0;
+    bool  acc_ramFailed = false;
+    int   acc_ramLoops = 0;
+
+    for (int loop = 0; loop < loops; ++loop)
     {
-        DrawAutoStatus(logo, "CPU STRESS TEST", step, total, s_durLabel);
-        if (reportOK)
+        // Build loop label for report and status
+        char loopLabel[32];
+        if (loops > 1)
         {
-            RSection(hf, "CPU STRESS TEST");
-            RunCpuStressAuto(logo, step, total, stressMs, hf);
-            DWORD w; const char* nl = "\r\n";
-            WriteFile(hf, nl, 2, &w, NULL);
+            char la[8], lb[8];
+            IntToStr(loop + 1, la, sizeof(la));
+            IntToStr(loops, lb, sizeof(lb));
+            StrCopy(loopLabel, sizeof(loopLabel), "Loop ");
+            StrCat2(loopLabel, sizeof(loopLabel), loopLabel, la);
+            StrCat2(loopLabel, sizeof(loopLabel), loopLabel, " / ");
+            StrCat2(loopLabel, sizeof(loopLabel), loopLabel, lb);
         }
-        ++step;
+        else loopLabel[0] = '\0';
+
+        if (doCpu)
+        {
+            char statusLabel[48];
+            StrCopy(statusLabel, sizeof(statusLabel), "CPU STRESS");
+            if (loopLabel[0]) { StrCat2(statusLabel, sizeof(statusLabel), statusLabel, "  "); StrCat2(statusLabel, sizeof(statusLabel), statusLabel, loopLabel); }
+
+            char subMsg[32];
+            StrCopy(subMsg, sizeof(subMsg), cpuLabel);
+            if (loops > 1) { StrCat2(subMsg, sizeof(subMsg), subMsg, "  "); StrCat2(subMsg, sizeof(subMsg), subMsg, loopLabel); }
+
+            DrawAutoStatus(logo, statusLabel, step, total, subMsg);
+
+            if (reportOK)
+            {
+                char secName[48];
+                StrCopy(secName, sizeof(secName), "CPU STRESS TEST");
+                if (loopLabel[0]) { StrCat2(secName, sizeof(secName), secName, " - "); StrCat2(secName, sizeof(secName), secName, loopLabel); }
+                RSection(hf, secName);
+                StressTest_AutoRun(hf, cpuMs);
+                DWORD _w; WriteFile(hf, "\r\n", 2, &_w, NULL);
+            }
+            else
+            {
+                StressTest_AutoRun(INVALID_HANDLE_VALUE, cpuMs);
+            }
+
+            // Accumulate per-loop CPU results
+            BYTE loopMin = StressAutoRun_GetMinCPU();
+            BYTE loopMax = StressAutoRun_GetMaxCPU();
+            BYTE loopFanMin = StressAutoRun_GetMinFan();
+            BYTE loopFanMax = StressAutoRun_GetMaxFan();
+            if (loopMin < acc_cpuMin) acc_cpuMin = loopMin;
+            if (loopMax > acc_cpuMax) acc_cpuMax = loopMax;
+            if (loopFanMin < acc_fanMin) acc_fanMin = loopFanMin;
+            if (loopFanMax > acc_fanMax) acc_fanMax = loopFanMax;
+            acc_cpuPeakSum += loopMax;
+            ++acc_cpuLoops;
+            if (StressAutoRun_GetThermalAbort()) acc_thermalAny = true;
+
+            ++step;
+        }
+
+        if (doRam)
+        {
+            char statusLabel[48];
+            StrCopy(statusLabel, sizeof(statusLabel), "RAM STRESS");
+            if (loopLabel[0]) { StrCat2(statusLabel, sizeof(statusLabel), statusLabel, "  "); StrCat2(statusLabel, sizeof(statusLabel), statusLabel, loopLabel); }
+
+            char subMsg[32];
+            StrCopy(subMsg, sizeof(subMsg), ramLabel);
+            if (loops > 1) { StrCat2(subMsg, sizeof(subMsg), subMsg, "  "); StrCat2(subMsg, sizeof(subMsg), subMsg, loopLabel); }
+
+            DrawAutoStatus(logo, statusLabel, step, total, subMsg);
+
+            if (reportOK)
+            {
+                char secName[48];
+                StrCopy(secName, sizeof(secName), "RAM STRESS TEST");
+                if (loopLabel[0]) { StrCat2(secName, sizeof(secName), secName, " - "); StrCat2(secName, sizeof(secName), secName, loopLabel); }
+                RSection(hf, secName);
+                RamStress_AutoRun(hf, ramMs);
+                DWORD _w; WriteFile(hf, "\r\n", 2, &_w, NULL);
+            }
+            else
+            {
+                RamStress_AutoRun(INVALID_HANDLE_VALUE, ramMs);
+            }
+
+            // Accumulate per-loop RAM results
+            acc_ramSweeps += RamAutoRun_GetSweeps();
+            acc_ramErrors += RamAutoRun_GetErrors();
+            if (RamAutoRun_GetFailed() > 0) acc_ramFailed = true;
+            ++acc_ramLoops;
+
+            ++step;
+        }
     }
-    if (g_autoSettings.runRamStress)
+
+    // ---- Multi-loop summary (only written when loops > 1) ----
+
+    if (loops > 1 && reportOK && (doCpu || doRam))
     {
-        DrawAutoStatus(logo, "RAM STRESS TEST", step, total, s_durLabel);
-        if (reportOK)
+        DWORD w;
+        RSection(hf, "STRESS SUMMARY");
+        char line[128];
+
+        auto WS = [&](const char* lbl, const char* val)
+            {
+                StrCopy(line, sizeof(line), lbl);
+                StrCat2(line, sizeof(line), line, val);
+                StrCat2(line, sizeof(line), line, "\r\n");
+                WriteFile(hf, line, StrLen(line), &w, NULL);
+            };
+
+        char t[32];
+        IntToStr(loops, t, sizeof(t)); WS("Total loops:         ", t);
+
+        if (doCpu && acc_cpuLoops > 0)
         {
-            RSection(hf, "RAM STRESS TEST");
-            RunRamStressAuto(logo, step, total, stressMs, hf);
-            DWORD w; const char* nl = "\r\n";
-            WriteFile(hf, nl, 2, &w, NULL);
+            // CPU temp range across all loops
+            char mn[8], mx[8];
+            IntToStr((int)acc_cpuMin, mn, sizeof(mn));
+            IntToStr((int)acc_cpuMax, mx, sizeof(mx));
+            StrCopy(t, sizeof(t), mn); StrCat2(t, sizeof(t), t, " C  ->  ");
+            StrCat2(t, sizeof(t), t, mx); StrCat2(t, sizeof(t), t, " C");
+            WS("CPU temp range:      ", t);
+
+            // Average peak CPU temp across loops
+            char av[8];
+            IntToStr((int)(acc_cpuPeakSum / (DWORD)acc_cpuLoops), av, sizeof(av));
+            StrCopy(t, sizeof(t), av); StrCat2(t, sizeof(t), t, " C");
+            WS("CPU avg peak temp:   ", t);
+
+            // Fan range across all loops
+            if (acc_fanMin != 255)
+            {
+                char fnMin[8], fnMax[8];
+                IntToStr((int)acc_fanMin * 2, fnMin, sizeof(fnMin));
+                IntToStr((int)acc_fanMax * 2, fnMax, sizeof(fnMax));
+                StrCopy(t, sizeof(t), fnMin); StrCat2(t, sizeof(t), t, "%  ->  ");
+                StrCat2(t, sizeof(t), t, fnMax); StrCat2(t, sizeof(t), t, "%");
+                WS("Fan speed range:     ", t);
+            }
+            WS("Thermal abort (any): ", acc_thermalAny ? "YES" : "No");
+            WS("CPU stress result:   ",
+                acc_thermalAny ? "ABORTED" :
+                (acc_cpuMax >= 85 ? "WARNING - peak above 85C" : "PASS"));
         }
-        ++step;
+
+        if (doRam && acc_ramLoops > 0)
+        {
+            char sw[12], er[12];
+            IntToStr((int)acc_ramSweeps, sw, sizeof(sw));
+            IntToStr((int)acc_ramErrors, er, sizeof(er));
+            WS("RAM total sweeps:    ", sw);
+            WS("RAM total errors:    ", er);
+            WS("RAM stress result:   ", acc_ramFailed ? "FAIL - errors detected" : "PASS");
+        }
+
+        WriteFile(hf, "\r\n", 2, &w, NULL);
     }
+
+    // ---- Close report ----
 
     if (reportOK)
     {
@@ -569,8 +727,65 @@ void XbSet_AutoRun(const DiagLogo& logo)
         CloseHandle(hf);
     }
 
-    DrawAutoComplete(logo, reportOK);
+    // ---- Completion screen with optional shutdown countdown ----
+
+    const bool willShutdown = g_autoSettings.shutdownAfter;
+    DrawAutoComplete(logo, reportOK, willShutdown);
+
+    if (willShutdown)
     {
+        // 30-second countdown before shutdown — [B] aborts
+        DWORD shutStart = GetTickCount();
+        WORD  prev = GetButtons();
+        bool  aborted = false;
+
+        while (!aborted)
+        {
+            PumpInput();
+            DWORD elapsed = GetTickCount() - shutStart;
+            if (elapsed >= 30000) break;  // countdown expired — shut down
+
+            DWORD remain = (30000 - elapsed) / 1000 + 1;
+
+            g_pDevice->BeginScene();
+            DrawPageChrome(logo, "AUTO DIAGNOSTIC", "[B] Cancel shutdown");
+            float py = CONTENT_Y + 40.f;
+            if (reportOK)
+            {
+                DrawText(LM, py, "DIAGNOSTICS COMPLETE", 1.6f, COL_GREEN);
+                py += LINE_H + 8.f;
+                DrawText(LM, py, "Results saved to D:\\XbDiag.txt", 1.2f, COL_CYAN);
+            }
+            else
+            {
+                DrawText(LM, py, "DIAGNOSTICS COMPLETE", 1.6f, COL_ORANGE);
+                py += LINE_H + 8.f;
+                DrawText(LM, py, "Could not write D:\\XbDiag.txt", 1.2f, COL_RED);
+            }
+            py += LINE_H * 2.f;
+            DrawText(LM, py, "Shutting down in:", 1.3f, COL_YELLOW);
+            py += LINE_H + 4.f;
+            char secBuf[8]; IntToStr((int)remain, secBuf, sizeof(secBuf));
+            DrawText(LM, py, secBuf, 3.5f, COL_CYAN);
+            py += LINE_H * 3.5f;
+            DrawText(LM, py, "Press [B] to cancel and return to the menu.", 1.2f, COL_DIM);
+            g_pDevice->EndScene();
+            g_pDevice->Present(NULL, NULL, NULL, NULL);
+
+            WORD cur = GetButtons();
+            if ((cur & BTN_B) && !(prev & BTN_B)) aborted = true;
+            prev = cur;
+        }
+
+        if (!aborted)
+            XbShutdown();
+        else
+            RequestState(MSTATE_MENU);
+    }
+    else
+    {
+        // No shutdown — simple A/B wait
+        DrawAutoComplete(logo, reportOK, false);
         WORD prev = GetButtons();
         while (true)
         {
@@ -579,40 +794,49 @@ void XbSet_AutoRun(const DiagLogo& logo)
             if (((cur & BTN_A) && !(prev & BTN_A)) ||
                 ((cur & BTN_B) && !(prev & BTN_B))) break;
             prev = cur;
-            DrawAutoComplete(logo, reportOK);
+            DrawAutoComplete(logo, reportOK, false);
         }
+        RequestState(MSTATE_MENU);
     }
-    RequestState(MSTATE_MENU);
 }
 
 // ============================================================================
 // Settings editor UI
 // ============================================================================
 
+// Row types
+enum RowType {
+    RT_BOOL, RT_CPU_HRS, RT_CPU_MIN, RT_RAM_HRS, RT_RAM_MIN,
+    RT_LOOPS, RT_ALT, RT_SHUTDOWN
+};
+
 struct SettingRow
 {
     const char* label;
     const char* desc;
-    bool* pVal;
-    bool        isDur;   // unused, kept for compat
-    bool        isHrs;
-    bool        isMins;
+    bool* pVal;   // non-null for RT_BOOL / RT_ALT / RT_SHUTDOWN
+    RowType     type;
 };
 
 static SettingRow s_rows[] =
 {
-    { "SYSTEM INFO",    "Full hardware snapshot",                    &g_autoSettings.runSysInfo,   false , false, false },
-    { "VIDEO INFO",     "Encoder, AV pack, resolution",              &g_autoSettings.runVideoInfo, false , false, false },
-    { "SMBUS SCAN",     "Scan all SMBus addresses",                  &g_autoSettings.runSmBus,     false , false, false },
-    { "HDD INFO",       "ATA identify + sequential benchmark",        &g_autoSettings.runHddInfo,   false , false, false },
-    { "RAM TEST",       "One full quick sweep across all banks",     &g_autoSettings.runRamTest,   false , false, false },
-    { "TEMP MONITOR",   "5 temperature samples at 500ms intervals",  &g_autoSettings.runTempMon,   false , false, false },
-    { "EEPROM",         "Read and decode EEPROM contents",           &g_autoSettings.runEeprom,    false , false, false },
-    { "CTRL TEST",      "60s wait for input, skip if none",          &g_autoSettings.runCtrlTest,  false , false, false },
-    { "CPU STRESS",     "Timed CPU FPU burn (see duration below)",   &g_autoSettings.runCpuStress, false , false, false },
-    { "RAM STRESS",     "Repeated RAM sweeps for duration",          &g_autoSettings.runRamStress, false , false, false },
-    { "STRESS HOURS",   "Hours  [Left/Right to adjust]",             NULL, false, true,  false },
-    { "STRESS MINS",    "Minutes 0-59  [Left/Right to adjust]",      NULL, false, false, true  },
+    { "SYSTEM INFO",    "Full hardware snapshot",                   &g_autoSettings.runSysInfo,   RT_BOOL    },
+    { "VIDEO INFO",     "Encoder, AV pack, resolution",             &g_autoSettings.runVideoInfo, RT_BOOL    },
+    { "SMBUS SCAN",     "Scan all SMBus addresses",                 &g_autoSettings.runSmBus,     RT_BOOL    },
+    { "HDD INFO",       "ATA identify + sequential benchmark",      &g_autoSettings.runHddInfo,   RT_BOOL    },
+    { "RAM TEST",       "One full quick sweep across all banks",    &g_autoSettings.runRamTest,   RT_BOOL    },
+    { "TEMP MONITOR",   "5 temperature samples at 500ms intervals", &g_autoSettings.runTempMon,   RT_BOOL    },
+    { "EEPROM",         "Read and decode EEPROM contents",          &g_autoSettings.runEeprom,    RT_BOOL    },
+    { "CTRL TEST",      "60s wait for input, skip if none",         &g_autoSettings.runCtrlTest,  RT_BOOL    },
+    { "CPU STRESS",     "Timed CPU FPU burn",                       &g_autoSettings.runCpuStress, RT_BOOL    },
+    { "  CPU HOURS",    "CPU stress hours  [Left/Right]",           NULL,                         RT_CPU_HRS },
+    { "  CPU MINS",     "CPU stress minutes  [Left/Right]",         NULL,                         RT_CPU_MIN },
+    { "RAM STRESS",     "Repeated RAM sweeps",                      &g_autoSettings.runRamStress, RT_BOOL    },
+    { "  RAM HOURS",    "RAM stress hours  [Left/Right]",           NULL,                         RT_RAM_HRS },
+    { "  RAM MINS",     "RAM stress minutes  [Left/Right]",         NULL,                         RT_RAM_MIN },
+    { "STRESS LOOPS",   "Repeat stress sequence N times  [Left/Right]", NULL,                    RT_LOOPS   },
+    { "ALT STRESS",     "Interleave CPU+RAM loops (OFF=CPU-all-then-RAM-all)", &g_autoSettings.altStressMode, RT_ALT },
+    { "SHUTDOWN AFTER", "Power off Xbox on autorun completion",     &g_autoSettings.shutdownAfter, RT_SHUTDOWN },
 };
 static const int k_rowCount = sizeof(s_rows) / sizeof(s_rows[0]);
 
@@ -642,24 +866,24 @@ static void RenderXbSet(const DiagLogo& logo)
 
     const char* hint;
     if (s_deleted)
-        hint = "[A] Toggle/Cycle    [Y] Save    [X] Settings deleted    [B] Back";
+        hint = "[A] Toggle    [Y] Save    [X] Settings deleted    [B] Back";
     else if (s_saved)
-        hint = "[A] Toggle/Cycle    [Y] Saved OK    [X] Delete file    [B] Back";
+        hint = "[A] Toggle    [Y] Saved OK    [X] Delete file    [B] Back";
     else if (s_saveFail)
-        hint = "[A] Toggle/Cycle    [Y] Save FAILED    [X] Delete file    [B] Back";
+        hint = "[A] Toggle    [Y] Save FAILED    [X] Delete file    [B] Back";
     else
-        hint = "[A] Toggle/Cycle    [Y] Save    [X] Delete XbDiag.set    [B] Back";
+        hint = "[A] Toggle    [Y] Save    [X] Delete XbDiag.set    [B] Back";
 
     DrawPageChrome(logo, "AUTOMATION SETTINGS", hint);
 
-    const float ROW_H = 26.f;
+    const float ROW_H = 22.f;
     const float LBL_X = LM;
-    const float CHK_X = SW - LM - 72.f;
-    const float DESC_X = LM + 190.f;
+    const float CHK_X = SW - LM - 80.f;
+    const float DESC_X = LM + 200.f;
     float y = CONTENT_Y + 4.f;
 
-    DrawText(LBL_X, y, "MODULE", 1.1f, COL_DIM);
-    DrawText(CHK_X, y, "SETTING", 1.1f, COL_DIM);
+    DrawText(LBL_X, y, "MODULE / SETTING", 1.1f, COL_DIM);
+    DrawText(CHK_X, y, "VALUE", 1.1f, COL_DIM);
     HLine(y + LINE_H, LBL_X, SW - LM, COL_BORDER);
     y += LINE_H + 4.f;
 
@@ -668,41 +892,57 @@ static void RenderXbSet(const DiagLogo& logo)
         bool sel = (i == s_sel);
         if (sel)
         {
-            FillRectGrad(0.f, y - 2.f, SW, y + ROW_H - 4.f,
+            FillRectGrad(0.f, y - 2.f, SW, y + ROW_H - 3.f,
                 COL_SEL_BAR, COL_SEL_BAR2);
-            FillRect(0.f, y - 2.f, 4.f, y + ROW_H - 4.f,
+            FillRect(0.f, y - 2.f, 4.f, y + ROW_H - 3.f,
                 D3DCOLOR_XRGB(80, 140, 255));
         }
 
+        RowType rt = s_rows[i].type;
         DWORD lblCol = sel ? COL_WHITE : COL_GRAY;
 
-        if (s_rows[i].isHrs || s_rows[i].isMins)
-        {
-            DWORD lblC = sel ? COL_YELLOW : D3DCOLOR_XRGB(160, 140, 60);
-            DrawText(LBL_X, y, s_rows[i].label, 1.3f, lblC);
-            if (sel) DrawText(DESC_X, y, "[Left] - 1    [Right] + 1", 1.0f, COL_DIM);
-            int numVal = s_rows[i].isHrs ? g_autoSettings.stressHours : g_autoSettings.stressMins;
-            char vb[8]; IntToStr(numVal, vb, sizeof(vb));
-            DrawText(CHK_X, y, vb, 1.4f, COL_CYAN);
-        }
-        else
+        // Indented sub-rows (CPU/RAM duration) get a slightly dimmer base colour
+        if (rt == RT_CPU_HRS || rt == RT_CPU_MIN || rt == RT_RAM_HRS || rt == RT_RAM_MIN)
+            lblCol = sel ? COL_YELLOW : D3DCOLOR_XRGB(140, 130, 80);
+
+        DrawText(LBL_X, y, s_rows[i].label, 1.2f, lblCol);
+        if (sel) DrawText(DESC_X, y, s_rows[i].desc, 1.0f, COL_DIM);
+
+        if (rt == RT_BOOL || rt == RT_ALT || rt == RT_SHUTDOWN)
         {
             bool val = *s_rows[i].pVal;
-            DrawText(LBL_X, y, s_rows[i].label, 1.3f, lblCol);
-            if (sel) DrawText(DESC_X, y, s_rows[i].desc, 1.0f, COL_DIM);
-            DrawText(CHK_X, y, val ? "[ ON ]" : "[ OFF]", 1.3f,
+            DrawText(CHK_X, y, val ? "[ ON ]" : "[ OFF]", 1.25f,
                 val ? COL_GREEN : COL_RED);
         }
+        else if (rt == RT_CPU_HRS)
+        {
+            char vb[8]; IntToStr(g_autoSettings.cpuStressHours, vb, sizeof(vb));
+            DrawText(CHK_X, y, vb, 1.35f, COL_CYAN);
+        }
+        else if (rt == RT_CPU_MIN)
+        {
+            char vb[8]; IntToStr(g_autoSettings.cpuStressMins, vb, sizeof(vb));
+            DrawText(CHK_X, y, vb, 1.35f, COL_CYAN);
+        }
+        else if (rt == RT_RAM_HRS)
+        {
+            char vb[8]; IntToStr(g_autoSettings.ramStressHours, vb, sizeof(vb));
+            DrawText(CHK_X, y, vb, 1.35f, COL_CYAN);
+        }
+        else if (rt == RT_RAM_MIN)
+        {
+            char vb[8]; IntToStr(g_autoSettings.ramStressMins, vb, sizeof(vb));
+            DrawText(CHK_X, y, vb, 1.35f, COL_CYAN);
+        }
+        else if (rt == RT_LOOPS)
+        {
+            char vb[8]; IntToStr(g_autoSettings.stressLoops, vb, sizeof(vb));
+            DrawText(CHK_X, y, vb, 1.35f, COL_CYAN);
+        }
 
-        HLine(y + ROW_H - 4.f, 0.f, SW, D3DCOLOR_XRGB(18, 22, 45));
+        HLine(y + ROW_H - 3.f, 0.f, SW, D3DCOLOR_XRGB(18, 22, 45));
         y += ROW_H;
     }
-
-    float noteY = BOT_BAR_Y - 30.f;
-    HLine(noteY, LM, SW - LM, COL_BORDER);
-    DrawText(LM, noteY + 4.f,
-        "File: XbDiag.set     Report: XbDiag.txt     CtrlTest waits 60s for input",
-        1.0f, COL_DIM);
 
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
@@ -728,36 +968,52 @@ void XbSet_Tick(const DiagLogo& logo)
         if (++s_sel >= k_rowCount) s_sel = 0;
         s_saved = false;
     }
+
+    RowType rt = s_rows[s_sel].type;
+
     if (EdgeDown(cur, s_prevBtns, BTN_A))
     {
-        if (s_rows[s_sel].isHrs || s_rows[s_sel].isMins)
-        {
-            // Use Left/Right dpad to adjust; A does nothing on these rows
-        }
-        else
-        {
+        if (s_rows[s_sel].pVal && (rt == RT_BOOL || rt == RT_ALT || rt == RT_SHUTDOWN))
             *s_rows[s_sel].pVal = !*s_rows[s_sel].pVal;
-        }
         s_saved = false;
     }
-    if (s_rows[s_sel].isHrs)
+
+    if (EdgeDown(cur, s_prevBtns, BTN_DPAD_RIGHT))
     {
-        if (EdgeDown(cur, s_prevBtns, BTN_DPAD_RIGHT)) { if (g_autoSettings.stressHours < 99) { ++g_autoSettings.stressHours; s_saved = false; } }
-        if (EdgeDown(cur, s_prevBtns, BTN_DPAD_LEFT)) { if (g_autoSettings.stressHours > 0) { --g_autoSettings.stressHours; s_saved = false; } }
+        s_saved = false;
+        if (rt == RT_CPU_HRS) { if (g_autoSettings.cpuStressHours < 99) ++g_autoSettings.cpuStressHours; }
+        if (rt == RT_CPU_MIN)
+        {
+            if (g_autoSettings.cpuStressMins < 59) ++g_autoSettings.cpuStressMins;
+            else { g_autoSettings.cpuStressMins = 0; if (g_autoSettings.cpuStressHours < 99) ++g_autoSettings.cpuStressHours; }
+        }
+        if (rt == RT_RAM_HRS) { if (g_autoSettings.ramStressHours < 99) ++g_autoSettings.ramStressHours; }
+        if (rt == RT_RAM_MIN)
+        {
+            if (g_autoSettings.ramStressMins < 59) ++g_autoSettings.ramStressMins;
+            else { g_autoSettings.ramStressMins = 0; if (g_autoSettings.ramStressHours < 99) ++g_autoSettings.ramStressHours; }
+        }
+        if (rt == RT_LOOPS) { if (g_autoSettings.stressLoops < 99) ++g_autoSettings.stressLoops; }
     }
-    if (s_rows[s_sel].isMins)
+
+    if (EdgeDown(cur, s_prevBtns, BTN_DPAD_LEFT))
     {
-        if (EdgeDown(cur, s_prevBtns, BTN_DPAD_RIGHT))
+        s_saved = false;
+        if (rt == RT_CPU_HRS) { if (g_autoSettings.cpuStressHours > 0) --g_autoSettings.cpuStressHours; }
+        if (rt == RT_CPU_MIN)
         {
-            if (g_autoSettings.stressMins < 59) { ++g_autoSettings.stressMins; s_saved = false; }
-            else { g_autoSettings.stressMins = 0; if (g_autoSettings.stressHours < 99) ++g_autoSettings.stressHours; s_saved = false; }
+            if (g_autoSettings.cpuStressMins > 0) --g_autoSettings.cpuStressMins;
+            else if (g_autoSettings.cpuStressHours > 0) { --g_autoSettings.cpuStressHours; g_autoSettings.cpuStressMins = 59; }
         }
-        if (EdgeDown(cur, s_prevBtns, BTN_DPAD_LEFT))
+        if (rt == RT_RAM_HRS) { if (g_autoSettings.ramStressHours > 0) --g_autoSettings.ramStressHours; }
+        if (rt == RT_RAM_MIN)
         {
-            if (g_autoSettings.stressMins > 0) { --g_autoSettings.stressMins; s_saved = false; }
-            else if (g_autoSettings.stressHours > 0) { --g_autoSettings.stressHours; g_autoSettings.stressMins = 59; s_saved = false; }
+            if (g_autoSettings.ramStressMins > 0) --g_autoSettings.ramStressMins;
+            else if (g_autoSettings.ramStressHours > 0) { --g_autoSettings.ramStressHours; g_autoSettings.ramStressMins = 59; }
         }
+        if (rt == RT_LOOPS) { if (g_autoSettings.stressLoops > 1) --g_autoSettings.stressLoops; }
     }
+
     if (EdgeDown(cur, s_prevBtns, BTN_Y))
     {
         s_saved = XbSet_SaveSettings();
@@ -766,7 +1022,6 @@ void XbSet_Tick(const DiagLogo& logo)
     }
     if (EdgeDown(cur, s_prevBtns, BTN_X))
     {
-        // Delete XbDiag.set — disables autorun on next launch
         if (XbSet_DeleteSettings())
         {
             s_saved = false;

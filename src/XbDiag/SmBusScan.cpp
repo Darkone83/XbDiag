@@ -31,6 +31,7 @@
 //   [A]    read registers for selected ACK address  (toggle)
 //   [B]    close register read / back to menu
 //   [X]    re-scan all addresses
+//   [Y]    one-shot probe of reserved address under cursor
 //
 // To add a known device:
 //   1. Add an entry to s_known[]
@@ -109,7 +110,8 @@ struct KnownDevice
 // 0x54 = EEPROM  (sw 0xA8)
 // 0x4C = ADM1032  (sw 0x98)
 // 0x68 = X-RTC DS1307  (sw 0xD0)
-// 0x69 = ICS clock  (sw 0xD2)
+// 0x69 = ICS clock  (sw 0xD2)  -- also X-HD HDMI adapter (Ryzee119/XboxHDMI) when installed
+//        X-HD replaces ICS clock on SMBus; cmd 5 reads mode (1=bootloader 2=application)
 // 0x6A = Focus FS454 video encoder  (sw 0xD4)
 // 0x70 = Xcalibur video encoder  (sw 0xE0)
 static const KnownDevice s_known[] =
@@ -135,9 +137,9 @@ static const KnownDevice s_known[] =
         "Reg 0x00=ambient(local)  0x01=CPU die(remote)  0x10=frac  0x04=status"
     },
     {
-        0x69, "ICS CLK",
-        "ICS clock generator  -  system bus / PCI clock synthesis",
-        "Reg 0x00-0x05=clock config bytes (read-only on most boards)"
+        0x69, "ICS/XHD",
+        "ICS clock generator  OR  X-HD HDMI adapter (Ryzee119/XboxHDMI)  [share 0x69]",
+        "ICS: clock config bytes 0x00-0x05  |  X-HD: cmd 5=mode(1=boot/2=app) cmd 1-3=version"
     },
     {
         0x6A, "FOCUS",
@@ -208,11 +210,17 @@ static const RegDesc s_regs_adm[] =
     { 0x04, "STATUS  " },
     { 0x20, "LIM HI  " },
 };
+// ICS clock config bytes, OR X-HD HDMI adapter command registers at same address.
+// X-HD uses command-response protocol: send cmd byte, read back response.
+//   cmd 1-4 = version bytes (v0.1.3.0),  cmd 5 = mode (1=bootloader 2=application)
 static const RegDesc s_regs_ics[] =
 {
-    { 0x00, "BYTE 0  " },
-    { 0x01, "BYTE 1  " },
-    { 0x02, "BYTE 2  " },
+    { 0x00, "BYTE 0  " },   // ICS: clock config byte 0
+    { 0x01, "BYTE 1  " },   // ICS: clock config byte 1  |  X-HD: version byte 1
+    { 0x02, "BYTE 2  " },   // ICS: clock config byte 2  |  X-HD: version byte 2
+    { 0x03, "BYTE 3  " },   //                               X-HD: version byte 3
+    { 0x04, "BYTE 4  " },   //                               X-HD: version byte 4
+    { 0x05, "MODE/B5 " },   // ICS: clock config byte 5  |  X-HD: mode (1=boot 2=app)
 };
 static const RegDesc s_regs_smc[] =
 {
@@ -246,7 +254,7 @@ static const DeviceRegs s_devRegs[] =
     { 0x45, s_regs_enc,    4 },
     { 0x54, s_regs_eeprom, 5 },
     { 0x4C, s_regs_adm,    4 },
-    { 0x69, s_regs_ics,    3 },
+    { 0x69, s_regs_ics,    6 },
     { 0x6A, s_regs_enc,    4 },   // Focus - same reg layout as Conexant for basics
     { 0x70, s_regs_enc,    4 },   // Xcalibur
     { 0x68, s_regs_rtc,    4 },   // X-RTC DS1307

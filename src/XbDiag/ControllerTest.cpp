@@ -32,10 +32,6 @@ static const int ST_MENU = 0;
 // ============================================================================
 
 // Horizontal anchors
-// LT at 140 clears the logo which occupies ~0-230 in the top bar
-// but content area is below top bar so X=80 is fine for content rows.
-// However TrigBar label draws ABOVE the bar into the top bar region
-// when Y_TRIG is small — fix by using absolute Y for trig labels.
 static const float X_LEFT = 100.f;   // left group center-X
 static const float X_RIGHT = 540.f;   // right group center-X
 static const float X_MID = 320.f;   // screen center
@@ -542,7 +538,8 @@ static void CircPlot(float cx, float cy, float PR,
     FillRect(dotX - 3.f, dotY - 3.f, dotX + 3.f, dotY + 3.f, COL_CYAN);
 }
 
-static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry)
+static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry,
+    int rawLX, int rawLY, int rawRX, int rawRY)
 {
     g_pDevice->BeginScene();
 
@@ -725,6 +722,8 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
     }
 
     // ── DRIFT test ─────────────────────────────────────────────────────────
+    // Uses raw unfiltered stick values — deadzone filtering would mask real
+    // sub-threshold drift and give false OK readings.
     else
     {
         // Warmup: discard first 60 frames so the sticks settle before we measure
@@ -734,10 +733,10 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
         }
         else
         {
-            s_driftLX[s_driftHead] = lx;
-            s_driftLY[s_driftHead] = ly;
-            s_driftRX[s_driftHead] = rx;
-            s_driftRY[s_driftHead] = ry;
+            s_driftLX[s_driftHead] = rawLX;
+            s_driftLY[s_driftHead] = rawLY;
+            s_driftRX[s_driftHead] = rawRX;
+            s_driftRY[s_driftHead] = rawRY;
             s_driftHead = (s_driftHead + 1) % DRIFT_SAMPLES;
             if (s_driftCount < DRIFT_SAMPLES) s_driftCount++;
         }
@@ -758,7 +757,31 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
         }
 
         const float PR = 70.f;
-        const int DRIFT_WARN = 1500;   // flag if avg offset > ~4.5% of range
+        // DRIFT_WARN: 2% of 32767 = ~655. Most tools flag drift above 1-3%.
+        // Xbox dashboard deadzone is ~13% (~4259). We warn at 2% so mild
+        // hardware drift is visible before it becomes a gameplay problem.
+        const int DRIFT_WARN = 655;
+
+        // Helper: format axis value + percentage for display
+        // e.g. "1234 (3.8%)"
+        auto FmtDrift = [](int val, char* buf, int bufLen)
+            {
+                char vb[10], pb[6];
+                IntToStr(val, vb, sizeof(vb));
+                // percentage = |val| * 100 / 32767 — one decimal
+                int absVal = val < 0 ? -val : val;
+                int pct100 = absVal * 1000 / 32767;  // tenths of percent
+                int pctInt = pct100 / 10;
+                int pctDec = pct100 % 10;
+                IntToStr(pctInt, pb, sizeof(pb));
+                StrCopy(buf, bufLen, vb);
+                StrCat2(buf, bufLen, buf, " (");
+                StrCat2(buf, bufLen, buf, pb);
+                StrCat2(buf, bufLen, buf, ".");
+                char pd[4]; IntToStr(pctDec, pd, sizeof(pd));
+                StrCat2(buf, bufLen, buf, pd);
+                StrCat2(buf, bufLen, buf, "%)");
+            };
 
         // Left stick plot — dot shows average position
         float lcx = X_MID - 130.f;
@@ -770,15 +793,15 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
         DrawText(lcx - TW("LEFT STICK", 1.15f) * 0.5f, lcy - PR - 16.f,
             "LEFT STICK", 1.15f, COL_YELLOW);
 
-        char lxb[10], lyb[10];
-        IntToStr(s_driftAvgLX, lxb, sizeof(lxb));
-        IntToStr(s_driftAvgLY, lyb, sizeof(lyb));
+        char lxb[20], lyb[20];
+        FmtDrift(s_driftAvgLX, lxb, sizeof(lxb));
+        FmtDrift(s_driftAvgLY, lyb, sizeof(lyb));
         float lblY = lcy + PR + 6.f;
         DrawText(lcx - 50.f, lblY, "avg X:", 1.1f, COL_GRAY);
-        DrawText(lcx + 10.f, lblY, lxb, 1.1f,
+        DrawText(lcx + 10.f, lblY, lxb, 1.0f,
             (s_driftAvgLX > DRIFT_WARN || s_driftAvgLX < -DRIFT_WARN) ? COL_RED : COL_GREEN);
         DrawText(lcx - 50.f, lblY + 14.f, "avg Y:", 1.1f, COL_GRAY);
-        DrawText(lcx + 10.f, lblY + 14.f, lyb, 1.1f,
+        DrawText(lcx + 10.f, lblY + 14.f, lyb, 1.0f,
             (s_driftAvgLY > DRIFT_WARN || s_driftAvgLY < -DRIFT_WARN) ? COL_RED : COL_GREEN);
 
         // Right stick
@@ -791,14 +814,14 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
         DrawText(rcx - TW("RIGHT STICK", 1.15f) * 0.5f, rcy - PR - 16.f,
             "RIGHT STICK", 1.15f, COL_YELLOW);
 
-        char rxb[10], ryb[10];
-        IntToStr(s_driftAvgRX, rxb, sizeof(rxb));
-        IntToStr(s_driftAvgRY, ryb, sizeof(ryb));
+        char rxb[20], ryb[20];
+        FmtDrift(s_driftAvgRX, rxb, sizeof(rxb));
+        FmtDrift(s_driftAvgRY, ryb, sizeof(ryb));
         DrawText(rcx - 50.f, lblY, "avg X:", 1.1f, COL_GRAY);
-        DrawText(rcx + 10.f, lblY, rxb, 1.1f,
+        DrawText(rcx + 10.f, lblY, rxb, 1.0f,
             (s_driftAvgRX > DRIFT_WARN || s_driftAvgRX < -DRIFT_WARN) ? COL_RED : COL_GREEN);
         DrawText(rcx - 50.f, lblY + 14.f, "avg Y:", 1.1f, COL_GRAY);
-        DrawText(rcx + 10.f, lblY + 14.f, ryb, 1.1f,
+        DrawText(rcx + 10.f, lblY + 14.f, ryb, 1.0f,
             (s_driftAvgRY > DRIFT_WARN || s_driftAvgRY < -DRIFT_WARN) ? COL_RED : COL_GREEN);
 
         // Centre status + instruction
@@ -915,7 +938,7 @@ static void Render(const DiagLogo& logo, WORD cur,
 
     float metaY = B + Y_META;
 
-    // BACK and START centered around X_MID - 80
+    // BACK and START centered around X_MID - 90
     float metaLCX = X_MID - 90.f;
     Box(metaLCX - WBW * 0.5f - 4.f, metaY,
         WBW, WBH, "BACK", 1.1f, (cur & BTN_BACK) != 0);
@@ -1072,6 +1095,10 @@ void ControllerTest_Tick(const DiagLogo& logo)
     int lx, ly, rx, ry;
     GetSticks(lx, ly, rx, ry);
 
+    // Raw (unfiltered) values for the drift test — deadzone would mask real drift
+    int rawLX, rawLY, rawRX, rawRY;
+    GetRawSticks(rawLX, rawLY, rawRX, rawRY);
+
     int lt, rt, blk, wht, btnA, btnB, btnX, btnY;
     GetTriggers(lt, rt, blk, wht, btnA, btnB, btnX, btnY);
 
@@ -1116,7 +1143,7 @@ void ControllerTest_Tick(const DiagLogo& logo)
             }
         }
         s_prev = cur;
-        RenderStickTest(logo, lx, ly, rx, ry);
+        RenderStickTest(logo, lx, ly, rx, ry, rawLX, rawLY, rawRX, rawRY);
         return;
     }
 

@@ -195,7 +195,29 @@ void GetSticks(int& lx, int& ly, int& rx, int& ry)
 }
 
 // -----------------------------------------------------------------------------
+// GetRawSticks – returns unfiltered stick values (no deadzone applied).
+// Used by the drift test in ControllerTest so it can detect sub-deadzone drift.
+// -----------------------------------------------------------------------------
+void GetRawSticks(int& lx, int& ly, int& rx, int& ry)
+{
+    lx = ly = rx = ry = 0;
+
+    for (int i = 0; i < MAX_PORTS; ++i)
+    {
+        if (!g_padHandles[i])
+            continue;
+
+        const XINPUT_GAMEPAD& gp = g_padStates[i].Gamepad;
+        lx = gp.sThumbLX;
+        ly = gp.sThumbLY;
+        rx = gp.sThumbRX;
+        ry = gp.sThumbRY;
+        return; // first connected pad only
+    }
+}
+// -----------------------------------------------------------------------------
 // GetTriggers – returns raw 0..255 analog values for all analog buttons
+// from the first connected pad. Includes triggers, Black/White, and face buttons.
 // -----------------------------------------------------------------------------
 void GetTriggers(int& lt, int& rt, int& black, int& white,
     int& btnA, int& btnB, int& btnX, int& btnY)
@@ -230,7 +252,8 @@ bool IsPortConnected(int port)
 }
 
 // -----------------------------------------------------------------------------
-// IsMUPresent – returns true if a Memory Unit handle is open on port/slot.
+// IsMUPresent – returns true if a Memory Unit is present on port/slot.
+//   Tracked via XGetDeviceChanges flags — no handle opened, no data read.
 //   slot 0 = top slot (A), slot 1 = bottom slot (B)
 // -----------------------------------------------------------------------------
 bool IsMUPresent(int port, int slot)

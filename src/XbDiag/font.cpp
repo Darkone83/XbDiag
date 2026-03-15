@@ -20,9 +20,9 @@ struct Glyph
 };
 
 // NOTE:
-//  - a�z are mapped to A�Z in FindGlyph() so we only store uppercase.
+//  - a-z are mapped to A-Z in FindGlyph() so we only store uppercase.
 //  - Unknown characters fall back to space.
-//  - This is a tweaked �Option B� style: slightly more geometric/sci-fi,
+//  - Geometric/sci-fi style: 5x7 bitmap, uppercase only, shadow via DrawChar.
 //    but still 5x7 and compatible with the rest of the project.
 
 static Glyph g_font[] =
@@ -30,7 +30,7 @@ static Glyph g_font[] =
     // Space
     { ' ',{0x00,0x00,0x00,0x00,0x00,0x00,0x00} },
 
-    // A�Z (updated shapes)
+    // A-Z
     { 'A',{0x0E,0x11,0x11,0x1F,0x11,0x11,0x11} }, // A
     { 'B',{0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E} }, // B
     { 'C',{0x0E,0x11,0x10,0x10,0x10,0x11,0x0E} }, // C
@@ -126,7 +126,7 @@ static const Glyph* FindGlyph(char c)
 }
 
 // -----------------------------------------------------------------------------
-// Low-level �raw� char draw: single pass, no effects
+// Low-level raw char draw: single pass, no effects
 // -----------------------------------------------------------------------------
 static void DrawCharRaw(float x, float y, char c, float scale, DWORD color)
 {

@@ -50,6 +50,7 @@ WORD GetButtons();
 //   lx,ly = left stick   (-32768 .. 32767)
 //   rx,ry = right stick  (-32768 .. 32767)
 void GetSticks(int& lx, int& ly, int& rx, int& ry);
+void GetRawSticks(int& lx, int& ly, int& rx, int& ry);  // no deadzone — for drift test
 
 // Returns raw analog button values (0..255) for triggers, black/white, and face buttons.
 void GetTriggers(int& lt, int& rt, int& black, int& white,

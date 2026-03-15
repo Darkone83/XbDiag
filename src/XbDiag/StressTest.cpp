@@ -2,7 +2,7 @@
 // XbDiag - Stress Test module.
 //
 // Card 0: CPU stress test (Prime95-style FPU torture)
-// Card 1: RAM stress test (stub)
+// Card 1: RAM stress test (moving inversions soak, independent state machine)
 //
 // ===========================================================================
 // Layout (640x480 design space)
@@ -2186,3 +2186,20 @@ void RamStress_AutoRun(HANDLE hReport, DWORD durationMs)
     WL("Result:        ",
         (sr_failCount == 0 && sr_totalErrors == 0) ? "PASS" : "FAIL - errors detected");
 }
+
+// ============================================================================
+// AutoRun result accessors — for XbSet loop accumulation
+// Called by XbSet after each StressTest_AutoRun / RamStress_AutoRun call
+// to read the per-loop stats and build cross-loop summaries.
+// ============================================================================
+
+BYTE  StressAutoRun_GetMinCPU() { return s_minCPU; }
+BYTE  StressAutoRun_GetMaxCPU() { return s_maxCPU; }
+BYTE  StressAutoRun_GetMinFan() { return s_minFan; }
+BYTE  StressAutoRun_GetMaxFan() { return s_maxFan; }
+BYTE  StressAutoRun_GetMeasuredLoad() { return s_measuredLoad; }
+bool  StressAutoRun_GetThermalAbort() { return s_thermalAbort; }
+
+DWORD RamAutoRun_GetSweeps() { return (DWORD)sr_sweep; }
+DWORD RamAutoRun_GetErrors() { return sr_totalErrors + sr_sweepErrors; }
+int   RamAutoRun_GetFailed() { return sr_failCount; }

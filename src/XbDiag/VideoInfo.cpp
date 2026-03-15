@@ -20,12 +20,12 @@
 //  Color Depth   32bpp
 //  Refresh Rate  60 Hz (estimated)
 //
-//  [BOT BAR]  [B] Back
+//  [BOT BAR]  [X] NTSC color bars    [Y] PAL color bars    [White] Mode test    [B] Back
 //
 // Sources:
 //   Video mode / resolution  - g_videoModeStr, g_sx, g_sy, backbuffer desc
-//   Encoder chip             - SMBus 0x8A (Conexant) / 0xD4 (Focus) reg 0x00 (ID byte)
-//   AV pack                  - SMBus 0x20 (PIC16L) reg 0x04 bits [2:0]
+//   Encoder chip             - SMBus 0x45 (Conexant, sw 0x8A) / 0x6A (Focus, sw 0xD4) reg 0x00 (ID byte)
+//   AV pack                  - SMBus 0x10 (PIC16L, sw-shifted 0x20) reg 0x04 bits [2:0]
 
 #include "VideoInfo.h"
 #include "font.h"
@@ -65,7 +65,7 @@ struct VideoData
     char fmtStr[16];     // "X8R8G8B8" etc
     char refreshStr[12]; // "60 Hz" / "50 Hz"
 
-    // Encoder (SMBus 0x10 reg 0x00)
+    // Encoder (SMBus 0x45/0x6A Conexant/Focus, reg 0x00 = chip ID)
     bool encAck;
     BYTE encIdByte;
     char encName[28];    // "Conexant CX25871" etc
@@ -74,7 +74,7 @@ struct VideoData
     // Encoder output standard (from encoder reg 0x02 / 0x01)
     char encStd[16];     // "NTSC" / "PAL-B/G" / "PAL-M" / "PAL-N" / "N/A"
 
-    // AV pack (SMBus 0x45 reg 0x04)
+    // AV pack (SMBus 0x10 PIC16L, reg 0x04 bits [2:0])
     char avPack[24];     // "Composite" / "HDTV" / "S-Video" etc
 
     // HD mod / HDMI adapter (SMBus 0x44 / 0x43, Chimeric-compatible)

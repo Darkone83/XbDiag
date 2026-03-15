@@ -14,8 +14,8 @@
 //      Conexant (0x8A) ACK   -> report "1.2/1.3" (NV2A rev byte is NOT
 //                               reliable; some 1.3 boards have A1 silicon)
 //      Focus (0xD4) ACK      -> chip ID 0x54=FS454->1.4 / 0x09=FS455->1.5
-//   3. P2L -> EMRS strap     -> splits 1.6 vs 1.6b
-//   5. NV2A EMRS RAM strap    -> splits P2L into 1.6 vs 1.6b
+//   3. P2L -> NV2A EMRS strap bits[19:18] -> splits 1.6 vs 1.6b
+//      Hynix (strap==3) -> 1.6b    Samsung (strap!=3) -> 1.6
 //
 // CPU speed: measured via TSC delta over a 100ms GetTickCount() window.
 // GPU speed: NV2A PRAMDAC NVPLL at MMIO 0xFD680500 - decode M/N/P.
@@ -28,7 +28,7 @@
 //              reg 0x09 = CPU temp (°C)
 //              reg 0x0A = board temp (°C)
 //
-// [A] Export to D:\sysinfo.txt     [B] Back
+// [A] Export to D:\sysinfo.txt     [X] Flash chip info     [Y] Dump BIOS     [B] Back
 //
 // Network: IP via UDP connect trick (no DNS, no blocking).
 
@@ -94,9 +94,7 @@ struct SysData
     char hddUDMA[8];
     bool hddPresent;
 
-    // DVD drive — presence detection only (ATAPI IDENTIFY response unreliable)
-    char dvdStatus[16];     // "DETECTED" or "NOT DETECTED"
-    bool dvdPresent;
+
 
     // Network
     char macAddr[20];
@@ -1079,67 +1077,7 @@ static void ReadSysData()
         }
     }
 
-    // --- DVD drive (ATAPI IDENTIFY PACKET DEVICE, secondary channel 0x170, master) ---
-    // Xbox optical drive is ATAPI (secondary IDE, master, 0xA0).
-    // Command 0xA1 = IDENTIFY PACKET DEVICE (ATAPI).  Returns 256 words same as ATA IDENTIFY.
-    // Words [27..46] = model string (big-endian byte pairs, swap per word).
-    // Words [23..26] = firmware revision string.
-    {
-        WORD buf[256];
-        ZeroMemory(buf, sizeof(buf));
-        d.dvdPresent = false;
 
-        BYTE status = 0;
-        int  timeout = 0;
-
-        // Wait for BSY clear on secondary status register (0x177)
-        timeout = 10000;
-        do {
-            __asm { mov dx, 0x0177 }
-            __asm { in al, dx }
-            __asm { mov status, al }
-        } while ((status & 0x80) && --timeout > 0);
-
-        if (timeout > 0)
-        {
-            // Select secondary master (nDEV=0, LBA mode)
-            __asm { mov dx, 0x0176 }
-            __asm { mov al, 0xA0 }
-            __asm { out dx, al }
-
-            // Issue IDENTIFY PACKET DEVICE (0xA1)
-            __asm { mov dx, 0x0177 }
-            __asm { mov al, 0xA1 }
-            __asm { out dx, al }
-
-            // Wait for DRQ (bit 3) set or ERR (bit 0) set
-            timeout = 50000;
-            do {
-                __asm { mov dx, 0x0177 }
-                __asm { in al, dx }
-                __asm { mov status, al }
-            } while (!(status & 0x08) && !(status & 0x01) && --timeout > 0);
-
-            if ((status & 0x08) && !(status & 0x01))
-            {
-                // DRQ set, no error — read 256 words from data register (0x170)
-                WORD* p = buf;
-                for (int i = 0; i < 256; ++i)
-                {
-                    WORD w = 0;
-                    __asm { mov dx, 0x0170 }
-                    __asm { in ax, dx }
-                    __asm { mov w, ax }
-                    *p++ = w;
-                }
-                d.dvdPresent = true;
-                StrCopy(d.dvdStatus, sizeof(d.dvdStatus), "DETECTED");
-            }
-        }
-
-        if (!d.dvdPresent)
-            StrCopy(d.dvdStatus, sizeof(d.dvdStatus), "NOT DETECTED");
-    }
 
     // MAC is now read in the EEPROM block above (ExQueryNonVolatileSetting).
 
@@ -1227,7 +1165,7 @@ static void WriteLine(HANDLE hf, const char* label, const char* value)
 // On a 256KB chip the ROM tiles four times — the banks are identical.
 // On a genuine 1MB mod chip the banks differ.
 //
-// Output: E:\BIOSios.bin — HDD data partition, survives reboots.
+// Output: D:\bios.bin — XBE launch directory.
 // ============================================================================
 // MmMapIoSpace / MmUnmapIoSpace -- kernel exports at ordinals 177 / 183.
 // Declared the same way as HalReadSMBusValue -- plain extern "C", no dllimport.
@@ -1256,11 +1194,23 @@ static void DumpBios()
     static const ULONG PHYS_256KB = 0xFFFC0000UL;
     static const ULONG PHYS_1MB = 0xFFF00000UL;
 
-    // Hard ceiling: never map at or above 0xFFFFFE00 (hidden MCPX ROM).
-    // Top 512 bytes are off-limits on rev 1.1-1.6 consoles -- hard lock.
+    // Full aligned sizes — what a correct image file should be
+    static const ULONG FULL_256KB = 0x40000UL;   // 262144 bytes
+    static const ULONG FULL_1MB = 0x100000UL;  // 1048576 bytes
+
+    // Hard ceiling: never map right up to 0xFFFFFFFF.
+    // MmMapIoSpace(0xFFFC0000, 0x40000) would compute end = 0x100000000,
+    // a 32-bit overflow to zero — the kernel maps the wrong range and the
+    // system freezes. Cap at 0xFFFFFDFF (safe on all revisions).
+    //
+    // On rev 1.1-1.6 this also avoids the MCPX ROM shadow (0xFFFFFE00-0xFFFFFFFF)
+    // which cannot be read from a running XBE.
+    //
+    // We pad the output file to the correct aligned size with 0xFF (erased flash
+    // state) so the dump is a valid 256KB or 1MB image on all boards.
     static const ULONG SAFE_TOP = 0xFFFFFE00UL;
-    static const ULONG SIZE_256KB = SAFE_TOP - PHYS_256KB; // 0x3FE00 = 261632 bytes
-    static const ULONG SIZE_1MB = SAFE_TOP - PHYS_1MB;   // 0xFFE00 = 1048064 bytes
+    static const ULONG SIZE_256KB_SAFE = SAFE_TOP - PHYS_256KB;  // 0x3FE00 = 261632
+    static const ULONG SIZE_1MB_SAFE = SAFE_TOP - PHYS_1MB;    // 0xFFE00 = 1048064
 
     // Protect value 4 = MmNonCached -- required for ROM / device regions.
     static const ULONG MM_NONCACHED = 4;
@@ -1289,7 +1239,9 @@ static void DumpBios()
     }
 
     ULONG dumpPhys = is1MB ? PHYS_1MB : PHYS_256KB;
-    ULONG dumpSize = is1MB ? SIZE_1MB : SIZE_256KB;
+    ULONG readSize = is1MB ? SIZE_1MB_SAFE : SIZE_256KB_SAFE;
+    ULONG fullSize = is1MB ? FULL_1MB : FULL_256KB;
+    ULONG padSize = fullSize - readSize;  // always 512 bytes
 
     // ---- Open output file BEFORE mapping ROM (avoids heap corruption risk) ----
     HANDLE hf = CreateFileA("D:\\bios.bin", GENERIC_WRITE, 0, NULL,
@@ -1301,7 +1253,7 @@ static void DumpBios()
     }
 
     // ---- Map the full dump region ----
-    BYTE* mapped = (BYTE*)MmMapIoSpace(dumpPhys, dumpSize, MM_NONCACHED);
+    BYTE* mapped = (BYTE*)MmMapIoSpace(dumpPhys, readSize, MM_NONCACHED);
     if (!mapped)
     {
         CloseHandle(hf);
@@ -1312,9 +1264,9 @@ static void DumpBios()
     const ULONG PAGE = 4096;
     DWORD written = 0;
     bool  ok = true;
-    for (ULONG offset = 0; offset < dumpSize && ok; offset += PAGE)
+    for (ULONG offset = 0; offset < readSize && ok; offset += PAGE)
     {
-        ULONG chunk = (dumpSize - offset < PAGE) ? (dumpSize - offset) : PAGE;
+        ULONG chunk = (readSize - offset < PAGE) ? (readSize - offset) : PAGE;
         DWORD w = 0;
         if (!WriteFile(hf, mapped + offset, chunk, &w, NULL) || w != chunk)
         {
@@ -1324,8 +1276,28 @@ static void DumpBios()
             written += w;
     }
 
+    MmUnmapIoSpace(mapped, readSize);
+
+    // ---- Pad to aligned size on rev 1.1+ (MCPX shadow region = 0xFF fill) ----
+    // The last 512 bytes of flash are overlaid by the MCPX ROM at runtime and
+    // cannot be read by memory-mapped access on rev 1.1-1.6. Fill with 0xFF
+    // (erased flash state) so the output file is always a valid 256KB or 1MB
+    // image that flashers and emulators will accept without size complaints.
+    if (ok && padSize > 0)
+    {
+        BYTE padBuf[512];
+        for (ULONG i = 0; i < padSize && i < sizeof(padBuf); ++i) padBuf[i] = 0xFF;
+        DWORD w = 0;
+        ULONG toWrite = (padSize <= sizeof(padBuf)) ? padSize : sizeof(padBuf);
+        if (!WriteFile(hf, padBuf, toWrite, &w, NULL) || w != toWrite)
+        {
+            ok = false; d.biosDumpError = 3;
+        }
+        else
+            written += w;
+    }
+
     CloseHandle(hf);
-    MmUnmapIoSpace(mapped, dumpSize);
 
     d.biosDumpSize = written;
     d.biosDumpDone = true;
@@ -1505,7 +1477,6 @@ static void ExportSysInfo()
     WriteLine(hf, "HDD Serial:    ", d.hddSerial);
     WriteLine(hf, "HDD Size:      ", d.hddSizeGB);
     WriteLine(hf, "HDD UDMA:      ", d.hddUDMA);
-    WriteLine(hf, "DVD Drive:     ", d.dvdStatus);
     WriteLine(hf, "MAC Address:   ", d.macAddr);
     WriteLine(hf, "IP Address:    ", d.ipAddr);
     CloseHandle(hf);
@@ -1846,9 +1817,6 @@ static void Render(const DiagLogo& logo)
     DrawRow(C2, y2, V2, "MODE   :", d.hddUDMA, COL_WHITE);    y2 += LH + GAP;
 
     // ---- RIGHT: DVD drive ----
-    DrawSection(C2, y2, RULEW, "DVD DRIVE");                     y2 += LH + 4.f;
-    DrawRow(C2, y2, V2, "STATUS :", d.dvdStatus,
-        d.dvdPresent ? COL_GREEN : COL_RED);                 y2 += LH + GAP;
 
     // ---- RIGHT: Network ----
     DrawSection(C2, y2, RULEW, "NETWORK");                       y2 += LH + 4.f;
@@ -1965,7 +1933,6 @@ void SysInfo_AutoRun(HANDLE hReport)
     WriteLine(hReport, "HDD Model:     ", d.hddModel);
     WriteLine(hReport, "HDD Size:      ", d.hddSizeGB);
     WriteLine(hReport, "HDD UDMA:      ", d.hddUDMA);
-    WriteLine(hReport, "DVD:           ", d.dvdStatus);
     WriteLine(hReport, "MAC:           ", d.macAddr);
     WriteLine(hReport, "IP:            ", d.ipAddr);
 }

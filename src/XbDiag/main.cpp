@@ -11,7 +11,11 @@
 //   STATE_EEPROM   -> EepromView  (read-once/display, sub-view toggle)
 //   STATE_VIDEO    -> VideoInfo   (read-once/display)
 //   STATE_HDD      -> HddInfo     (read-once/display)
-//   STATE_ABOUT    -> AboutScreen (static display)
+//   STATE_ABOUT    -> AboutScreen    (static display)
+//   STATE_CTRL     -> ControllerTest (live, tick+render each frame)
+//   STATE_STRESS   -> StressTest     (live, tick+render each frame)
+//   STATE_FILES    -> FileExplorer   (live, tick+render each frame)
+//   STATE_XBSET    -> XbSet          (automation settings, tick+render each frame)
 //   STATE_EXIT     -> XLaunchNewImage to dashboard
 
 #include "DiagCommon.h"
@@ -76,13 +80,9 @@ void RequestState(int newState)
 }
 
 // ============================================================================
-// D3D initialisation
-// ============================================================================
-
-// ============================================================================
 // Video mode detection
 // Reads XGetVideoFlags() and XGetVideoStandard() to pick the best available
-// mode.  Priority: 720p > 480p > 576i (PAL) > 480i (NTSC fallback).
+// mode.  Priority: 720p > 1080i > 480p > 576i (PAL) > 480i (NTSC fallback).
 // Sets g_sx, g_sy, g_isHD, g_videoModeStr before D3D init.
 // SW/SH remain fixed at 640/480 design units - only g_sx/g_sy know the real res.
 // Returns the present flags and backbuffer dims to use in CreateDevice.
@@ -119,8 +119,7 @@ static VideoMode DetectVideoMode()
     }
     else if (has1080i)
     {
-        // 1080i - use 720p res since most diag content is simpler
-        // and 1080i is rarely useful for a diag tool; keep as fallback
+        // 1080i — full 1920x1080 interlaced; rare on OG Xbox but handled
         m.width = 1920;
         m.height = 1080;
         m.presentFlags = D3DPRESENTFLAG_INTERLACED | D3DPRESENTFLAG_WIDESCREEN;
@@ -162,6 +161,10 @@ static VideoMode DetectVideoMode()
 
     return m;
 }
+
+// ============================================================================
+// D3D initialisation
+// ============================================================================
 
 static bool InitD3D()
 {
@@ -254,7 +257,7 @@ void __cdecl main()
         {
             PumpInput();
             WORD cur = GetButtons();
-            if ((cur & 0x2000) && !(prevBtns & 0x2000)) cancelled = true;
+            if ((cur & 0x2000) && !(prevBtns & 0x2000)) cancelled = true;  // BTN_B
             prevBtns = cur;
             DWORD elapsed = GetTickCount() - countStart;
             DWORD remain = (elapsed < 5000) ? (5000 - elapsed) / 1000 + 1 : 1;
