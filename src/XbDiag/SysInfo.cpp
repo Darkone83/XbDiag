@@ -200,17 +200,15 @@ static DWORD MeasureCpuMHz()
 {
     DWORD lo0, hi0, lo1, hi1;
 
-    // Wait for a tick boundary - cap iterations to prevent wedge on real hw
+    // Try to align to a tick boundary for accuracy, but don't bail out
+    // if we miss it — 100ms is wide enough that alignment barely matters.
     DWORD tickStart = GetTickCount();
-    DWORD deadline = tickStart + 50;
-    bool  gotEdge = false;
     for (int spin = 0; spin < 5000000; ++spin)
     {
         DWORD t = GetTickCount();
-        if (t != tickStart) { tickStart = t; gotEdge = true; break; }
-        if (t > deadline)   break;
+        if (t != tickStart) { tickStart = t; break; }
+        if ((t - tickStart) > 50) break;
     }
-    if (!gotEdge) return 733;  // timer not advancing
 
     __asm
     {
@@ -220,10 +218,10 @@ static DWORD MeasureCpuMHz()
     }
 
     // Wait ~100ms with hard ceiling of 500ms
-    deadline = tickStart + 500;
+    DWORD deadline = tickStart + 500;
     while ((GetTickCount() - tickStart) < 100)
     {
-        if (GetTickCount() > deadline) break;
+        if ((GetTickCount() - tickStart) > 500) break;
     }
     DWORD tickEnd = GetTickCount();
 
@@ -234,14 +232,13 @@ static DWORD MeasureCpuMHz()
         mov hi1, edx
     }
 
-    DWORD elapsed = tickEnd - tickStart;   // ms
+    DWORD elapsed = tickEnd - tickStart;
     if (elapsed == 0) return 733;
 
-    // MHz = TSC delta / (elapsed_ms * 1000)
     DWORD tscDelta = lo1 - lo0;
     DWORD mhz = tscDelta / (elapsed * 1000);
-    // Sanity check - Xbox CPU range is roughly 500-1400MHz
-    if (mhz < 400 || mhz > 2000) return 733;
+    // Sanity check — covers stock 733MHz through Tualatin upgrades (~1400MHz)
+    if (mhz < 400 || mhz > 1500) return 733;
     return mhz;
 }
 

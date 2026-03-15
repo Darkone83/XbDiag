@@ -78,11 +78,12 @@
 //   0x8C-0x8F   4  TZ DST Bias         daylight offset (int32, minutes)
 //   0x90-0x93   4  Language            1=English 2=Japanese 3=German 4=French
 //                                      5=Spanish 6=Italian 7=Korean
-//   0x94-0x97   4  Video Flags         XC_VIDEO_FLAGS_* bitmask (valid bits: 0x5F)
-//                                      0x01=widescreen 0x02=720p 0x04=1080i
-//                                      0x08=480p 0x10=letterbox 0x40=PAL60
-//   0x98-0x9B   4  Audio Flags         XC_AUDIO_FLAGS_* bitmask (valid bits: 0x1F)
-//                                      0x01=mono 0x02=stereo 0x04=surround 0x08=DTS 0x10=AC3
+//   0x94-0x97   4  Video Flags         XC_VIDEO_FLAGS_* bitmask (valid bits: 0x005F0000)
+//                                      0x00010000=widescreen 0x00020000=720p 0x00040000=1080i
+//                                      0x00080000=480p 0x00100000=letterbox 0x00400000=PAL60
+//   0x98-0x9B   4  Audio Flags         XC_AUDIO_FLAGS_* bitmask (valid bits: 0x00030003)
+//                                      0x00000001=mono 0x00000002=surround (0=stereo)
+//                                      0x00010000=AC3  0x00020000=DTS
 //   0x9C-0x9F   4  Game Rating         ESRB max: 0=disabled 1-8=rating 0xFF=all blocked
 //   0xA0-0xA3   4  Parental Passcode   nibble-encoded D-pad sequence (0=none,1=up,2=down,
 //                                      3=left,4=right); 0x00000000=disabled
@@ -344,13 +345,17 @@ static void DecodeField(int fi, char* out, int outLen)
         FmtMAC(p, out, outLen);
         break;
 
-        // Video Standard — XC_VIDEO_STANDARD_*
-    case 0x48:
+        // Online Key at 0x48 — 16-byte Xbox Live provisioning key, show hex
+        // (no special decode — any non-zero value just means "provisioned")
+
+        // Video Standard at 0x58 — XC_VIDEO_STANDARD_* DWORD constants
+    case 0x58:
     {
-        DWORD v = ReadDW(0x48);
-        if (v == 1) SafeCopy(out, outLen, "NTSC-M (N. America)");
-        else if (v == 2) SafeCopy(out, outLen, "NTSC-J (Japan)");
-        else if (v == 3) SafeCopy(out, outLen, "PAL-I (Europe)");
+        DWORD v = ReadDW(0x58);
+        if (v == 0x00400100) SafeCopy(out, outLen, "NTSC-M (N. America)");
+        else if (v == 0x00400200) SafeCopy(out, outLen, "NTSC-J (Japan)");
+        else if (v == 0x00800300) SafeCopy(out, outLen, "PAL-I (Europe/AUS)");
+        else if (v == 0x00400400) SafeCopy(out, outLen, "PAL-M (Brazil)");
         else
         {
             SafeCopy(out, outLen, "0x");
@@ -360,31 +365,34 @@ static void DecodeField(int fi, char* out, int outLen)
     }
 
     // Video Flags — XC_VIDEO_FLAGS_* at 0x94 (user section)
+    // Bits are in the HIGH word: bit16=widescreen, bit17=720p, bit18=1080i,
+    // bit19=480p, bit20=letterbox, bit23=PAL60. Valid mask: 0x005F0000.
     case 0x94:
     {
         DWORD v = ReadDW(0x94);
         bool any = false;
-        if (v & 0x01) { SafeAppend(out, outLen, "WIDE");    any = true; }
-        if (v & 0x02) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "720p");  any = true; }
-        if (v & 0x04) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "1080i"); any = true; }
-        if (v & 0x08) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "480p");  any = true; }
-        if (v & 0x10) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "LBOX");  any = true; }
-        if (v & 0x40) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "PAL60"); any = true; }
+        if (v & 0x00010000) { SafeAppend(out, outLen, "WIDE");    any = true; }
+        if (v & 0x00020000) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "720p");  any = true; }
+        if (v & 0x00040000) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "1080i"); any = true; }
+        if (v & 0x00080000) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "480p");  any = true; }
+        if (v & 0x00100000) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "LBOX");  any = true; }
+        if (v & 0x00400000) { if (any) SafeAppend(out, outLen, " "); SafeAppend(out, outLen, "PAL60"); any = true; }
         if (!any) SafeCopy(out, outLen, "STANDARD (no HDTV)");
-        if (v & ~0x5F) { SafeAppend(out, outLen, " !UNK"); }  // unknown bits set
+        if (v & ~0x005F0000UL) { SafeAppend(out, outLen, " !UNK"); }
         break;
     }
 
     // Audio Flags — XC_AUDIO_FLAGS_* at 0x98 (user section)
+    // bit0=mono, bit1=surround (0=stereo), bit16=AC3, bit17=DTS.
     case 0x98:
     {
         DWORD v = ReadDW(0x98);
         if (v & 0x01) SafeCopy(out, outLen, "Mono");
-        else if (v & 0x04) SafeCopy(out, outLen, "Surround");
+        else if (v & 0x02) SafeCopy(out, outLen, "Surround");
         else SafeCopy(out, outLen, "Stereo");
-        if (v & 0x08) SafeAppend(out, outLen, " +DTS");
-        if (v & 0x10) SafeAppend(out, outLen, " +AC3");
-        if (v & ~0x1F) SafeAppend(out, outLen, " !UNK");  // unknown bits set
+        if (v & 0x00010000) SafeAppend(out, outLen, " +AC3");
+        if (v & 0x00020000) SafeAppend(out, outLen, " +DTS");
+        if (v & ~0x00030003UL) SafeAppend(out, outLen, " !UNK");
         break;
     }
 
@@ -450,15 +458,15 @@ static void DecodeField(int fi, char* out, int outLen)
         break;
     }
 
-    // TZ name strings — WCHAR[4] (UTF-16LE), extract ASCII low bytes
+    // TZ name strings — plain ASCII[4] at 0x68 (standard) and 0x6C (DST)
     case 0x68:
-    case 0x70:
+    case 0x6C:
     {
-        // Each WCHAR is 2 bytes; low byte is ASCII for standard timezone abbrevs
+        // 4 plain ASCII bytes, null-terminated
         for (int i = 0; i < 4; ++i)
         {
-            BYTE lo = p[i * 2];
-            t[0] = (lo >= 0x20 && lo < 0x7F) ? (char)lo : (lo ? '?' : '\0');
+            BYTE b = p[i];
+            t[0] = (b >= 0x20 && b < 0x7F) ? (char)b : (b ? '?' : '\0');
             if (t[0] == '\0') break;
             t[1] = '\0';
             SafeAppend(out, outLen, t);
@@ -919,13 +927,42 @@ static int TzFindIndex(int stdBias, int dstBias)
 // Load working copies from s_eeprom
 static void EditLoadFromEeprom()
 {
-    s_editVideoStd = ReadDW(0x48);
-    s_editVideoFlags = ReadDW(0x94);  // video flags at 0x94 (user section)
-    s_editAudioFlags = ReadDW(0x98);  // audio flags at 0x98 (user section)
-    s_editGameRegion = ReadDW(0x54);
-    s_editDvdRegion = ReadDW(0xBC);   // DVD region at 0xBC (not 0x58 which is Video Standard)
-    s_editParental = ReadDW(0x9C);   // game rating at 0x9C (not 0x5C which is padding)
-    s_editTzIndex = TzFindIndex((int)ReadDW(0x64), (int)ReadDW(0x8C)); // TZ bias=0x64, DST bias=0x8C
+    // Video Standard at 0x58 — stored as XC_VIDEO_STANDARD_* DWORD constants.
+    // Internally we use enum 1=NTSC-M, 2=NTSC-J, 3=PAL-I, 4=PAL-M so the Edit
+    // view can cycle with simple index arithmetic.
+    {
+        DWORD vs = ReadDW(0x58);
+        if (vs == 0x00400200) s_editVideoStd = 2; // NTSC-J
+        else if (vs == 0x00800300) s_editVideoStd = 3; // PAL-I
+        else if (vs == 0x00400400) s_editVideoStd = 4; // PAL-M (Brazil)
+        else                       s_editVideoStd = 1; // NTSC-M (default / unknown)
+    }
+
+    s_editVideoFlags = ReadDW(0x94);  // video flags bitmask, stored as-is (bits 16-23)
+
+    // Audio flags at 0x98 — EEPROM format: bit0=mono, bit1=surround (0=stereo),
+    // bit16=AC3, bit17=DTS.  Internal Edit format: low word = mode (0/1/2),
+    // bit16=AC3, bit17=DTS (same positions as EEPROM — only mode bits differ).
+    {
+        DWORD raw = ReadDW(0x98);
+        DWORD mode;
+        if (raw & 0x01) mode = 1; // mono
+        else if (raw & 0x02) mode = 2; // surround
+        else                 mode = 0; // stereo
+        s_editAudioFlags = mode | (raw & 0x00030000); // AC3/DTS pass through
+    }
+
+    // Game region — security section is RC4-encrypted in the raw buffer; read
+    // via kernel API which returns the decrypted value.
+    {
+        ULONG type = 0, len = 0;
+        s_editGameRegion = 0x00000001; // default NA
+        ExQueryNonVolatileSetting(XC_GAME_REGION, &type, &s_editGameRegion, 4, &len);
+    }
+
+    s_editDvdRegion = ReadDW(0xBC);  // DVD region at 0xBC
+    s_editParental = ReadDW(0x9C);  // max game rating at 0x9C
+    s_editTzIndex = TzFindIndex((int)ReadDW(0x64), (int)ReadDW(0x8C));
 }
 
 // Cycle an enum index by delta within [0, count-1]
@@ -942,12 +979,39 @@ static bool EditCommit()
 {
     bool ok = true;
     LONG r;
-    r = ExSaveNonVolatileSetting(XC_VIDEO_STANDARD, REG_DWORD, &s_editVideoStd, 4);
-    if (r != 0) ok = false;
+
+    // Video Standard — convert internal enum (1-4) back to XC_VIDEO_STANDARD_* DWORD
+    {
+        static const DWORD vsMap[5] = {
+            0x00400100,  // [0] unused / default
+            0x00400100,  // [1] NTSC-M (N. America)
+            0x00400200,  // [2] NTSC-J (Japan)
+            0x00800300,  // [3] PAL-I  (Europe/AUS)
+            0x00400400,  // [4] PAL-M  (Brazil)
+        };
+        DWORD vs = (s_editVideoStd >= 1 && s_editVideoStd <= 4)
+            ? vsMap[s_editVideoStd] : 0x00400100;
+        r = ExSaveNonVolatileSetting(XC_VIDEO_STANDARD, REG_DWORD, &vs, 4);
+        if (r != 0) ok = false;
+    }
+
     r = ExSaveNonVolatileSetting(XC_VIDEO_FLAGS, REG_DWORD, &s_editVideoFlags, 4);
     if (r != 0) ok = false;
-    r = ExSaveNonVolatileSetting(XC_AUDIO_FLAGS, REG_DWORD, &s_editAudioFlags, 4);
-    if (r != 0) ok = false;
+
+    // Audio flags — convert internal mode back to EEPROM format.
+    // EEPROM: bit0=mono, bit1=surround (0=stereo), bit16=AC3, bit17=DTS.
+    // AC3/DTS bits are at the same positions in both formats — pass through.
+    {
+        DWORD mode = s_editAudioFlags & 0x0000FFFF;
+        DWORD raw;
+        if (mode == 1) raw = 0x01; // mono
+        else if (mode == 2) raw = 0x02; // surround
+        else                raw = 0x00; // stereo (0x00, NOT 0x02)
+        raw |= (s_editAudioFlags & 0x00030000); // AC3/DTS pass through
+        r = ExSaveNonVolatileSetting(XC_AUDIO_FLAGS, REG_DWORD, &raw, 4);
+        if (r != 0) ok = false;
+    }
+
     r = ExSaveNonVolatileSetting(XC_GAME_REGION, REG_DWORD, &s_editGameRegion, 4);
     if (r != 0) ok = false;
     r = ExSaveNonVolatileSetting(XC_DVD_REGION, REG_DWORD, &s_editDvdRegion, 4);
@@ -1027,7 +1091,7 @@ static void EditHandleInput(WORD cur)
 
     // Up/Down moves cursor
     int fieldCount = CARD_FIELD_COUNT[s_editCard];
-    if (s_editCard == 0 && s_editVideoStd != 3)
+    if (s_editCard == 0 && s_editVideoStd != 3 && s_editVideoStd != 4)
         fieldCount = 6; // hide PAL-60 slot (cursor 6) when standard is not PAL
 
     if (EdgeDown(cur, s_prevBtns, BTN_DPAD_UP))
@@ -1052,29 +1116,29 @@ static void EditHandleInput(WORD cur)
     case 0: // VIDEO
         switch (s_editCursor)
         {
-        case 0: // Video Standard — enum 1-3
+        case 0: // Video Standard — enum 1-4
         {
             int idx = (int)s_editVideoStd - 1; // 0-based
-            idx = CycleEnum(idx, 3, delta);
+            idx = CycleEnum(idx, 4, delta);
             s_editVideoStd = (DWORD)(idx + 1);
             // If leaving PAL, clear PAL-60 flag
-            if (s_editVideoStd != 3)
-                s_editVideoFlags &= ~0x00000040;
+            if (s_editVideoStd != 3 && s_editVideoStd != 4)
+                s_editVideoFlags &= ~0x00400000u;
             break;
         }
-        case 1: s_editVideoFlags ^= 0x00000001; break; // Widescreen
-        case 2: s_editVideoFlags ^= 0x00000002; break; // 720p
-        case 3: s_editVideoFlags ^= 0x00000004; break; // 1080i
-        case 4: s_editVideoFlags ^= 0x00000008; break; // 480p
-        case 5: s_editVideoFlags ^= 0x00000010; break; // Letterbox
-        case 6: s_editVideoFlags ^= 0x00000040; break; // PAL 60Hz (only reachable when PAL)
+        case 1: s_editVideoFlags ^= 0x00010000; break; // Widescreen
+        case 2: s_editVideoFlags ^= 0x00020000; break; // 720p
+        case 3: s_editVideoFlags ^= 0x00040000; break; // 1080i
+        case 4: s_editVideoFlags ^= 0x00080000; break; // 480p
+        case 5: s_editVideoFlags ^= 0x00100000; break; // Letterbox
+        case 6: s_editVideoFlags ^= 0x00400000; break; // PAL 60Hz (only reachable when PAL)
         }
         break;
 
     case 1: // AUDIO
         switch (s_editCursor)
         {
-        case 0: // Audio mode — enum Stereo(0)/Mono(1)/Surround(2)
+        case 0: // Audio mode — Stereo(0) / Mono(1) / Surround(2)
         {
             DWORD mode = s_editAudioFlags & 0x0000FFFF;
             int idx = (int)mode;
@@ -1083,8 +1147,8 @@ static void EditHandleInput(WORD cur)
             s_editAudioFlags = (s_editAudioFlags & 0xFFFF0000) | (DWORD)idx;
             break;
         }
-        case 1: s_editAudioFlags ^= 0x00010000; break; // AC3
-        case 2: s_editAudioFlags ^= 0x00020000; break; // DTS
+        case 1: s_editAudioFlags ^= 0x00010000; break; // AC3  (bit16)
+        case 2: s_editAudioFlags ^= 0x00020000; break; // DTS  (bit17)
         }
         break;
 
@@ -1214,9 +1278,12 @@ static void RenderEdit(const DiagLogo& logo)
         {
             bool sel = (s_editCursor == 0);
             DrawText(LBL_X, y, "Video Standard", 1.2f, sel ? COL_YELLOW : COL_WHITE);
-            static const char* vstd[3] = { "NTSC-M (N.America)", "NTSC-J (Japan)", "PAL (Europe/AUS)" };
+            static const char* vstd[4] = {
+                "NTSC-M (N.America)", "NTSC-J (Japan)",
+                "PAL-I (Europe/AUS)", "PAL-M (Brazil)"
+            };
             int idx = (int)s_editVideoStd - 1;
-            if (idx < 0 || idx > 2) idx = 0;
+            if (idx < 0 || idx > 3) idx = 0;
             SafeCopy(buf, sizeof(buf), sel ? "< " : "  ");
             SafeAppend(buf, sizeof(buf), vstd[idx]);
             if (sel) SafeAppend(buf, sizeof(buf), " >");
@@ -1224,13 +1291,13 @@ static void RenderEdit(const DiagLogo& logo)
             y += ROW;
         }
 
-        // Helper macro-style: bitmask rows
+        // Helper macro-style: bitmask rows (bits in the HIGH word per VideoSettings enum)
         struct { const char* lbl; DWORD bit; } vflags[5] = {
-            { "Widescreen",  0x00000001 },
-            { "HDTV 720p",   0x00000002 },
-            { "HDTV 1080i",  0x00000004 },
-            { "HDTV 480p",   0x00000008 },
-            { "Letterbox",   0x00000010 },
+            { "Widescreen",  0x00010000 },
+            { "HDTV 720p",   0x00020000 },
+            { "HDTV 1080i",  0x00040000 },
+            { "HDTV 480p",   0x00080000 },
+            { "Letterbox",   0x00100000 },
         };
         for (int i = 0; i < 5; ++i)
         {
@@ -1242,12 +1309,12 @@ static void RenderEdit(const DiagLogo& logo)
             y += ROW;
         }
 
-        // PAL-60 — only shown when PAL is selected
-        if (s_editVideoStd == 3)
+        // PAL-60 — only shown when PAL-I or PAL-M is selected
+        if (s_editVideoStd == 3 || s_editVideoStd == 4)
         {
             bool sel = (s_editCursor == 6);
             DrawText(LBL_X + 16.f, y, "PAL 60Hz", 1.15f, sel ? COL_YELLOW : COL_WHITE);
-            bool on = (s_editVideoFlags & 0x00000040) != 0;
+            bool on = (s_editVideoFlags & 0x00400000) != 0;
             DrawText(VAL_X, y, on ? "[X] ON" : "[ ] OFF", 1.15f,
                 sel ? (on ? COL_GREEN : COL_RED) : (on ? COL_CYAN : COL_GRAY));
             y += ROW;
@@ -1618,8 +1685,8 @@ void EepromView_AutoRun(HANDLE hReport)
 //   REPAIRABLE via ExSaveNonVolatileSetting (kernel recalculates user checksum):
 //     User checksum     (0x60) — verified after kernel writes; repaired implicitly
 //     Video standard    (0x58) — reset to NTSC-M (0x00400100)
-//     Video flags       (0x94) — mask to valid bits 0x5F
-//     Audio flags       (0x98) — mask to valid bits 0x1F, fallback stereo
+//     Video flags       (0x94) — mask to valid bits 0x005F0000
+//     Audio flags       (0x98) — mask to valid bits 0x00030003
 //     Game region       (0x54) — reset to NA (0x00000001)
 //     DVD region        (0xBC) — reset to 0 (no region lock)
 //     Language          (0x90) — reset to English (1)
@@ -1673,11 +1740,11 @@ void EepromView_AutoRun(HANDLE hReport)
 //
 //   USER SETTINGS (can repair via ExSaveNonVolatileSetting)
 //   4. Video standard    0x58  must be one of four known DWORD values
-//   5. Video flags       0x94  must not have bits outside the documented mask
-//   6. Audio flags       0x98  same
-//   7. Game region       0x54  must be one of the known region codes
-//   8. DVD region        0x58  0-6 (0=none, 1-6=CSS zone)
-//   9. Language          0x90  0-7 (English through Korean)
+//   5. Video flags       0x94  must not have bits outside mask 0x005F0000
+//   6. Audio flags       0x98  must not have bits outside mask 0x00030003
+//   7. Game region       0x2C  (security section, read via kernel) must be known region code
+//   8. DVD region        0xBC  0-6 (0=none, 1-6=CSS zone)
+//   9. Language          0x90  0-9 (Neutral through Portuguese)
 //  10. Timezone          0x64  zone bias + std/dst names match a known Xbox TZ entry
 //
 // NEVER touched: HDD key (0x1C-0x2B), confounder (0x14-0x1B), serial (0x34),
@@ -1750,20 +1817,25 @@ static bool EepVideoStdOK()
 
 static bool EepVideoFlagsOK()
 {
-    // Valid bits: widescreen=0x01, 720p=0x02, 1080i=0x04, 480p=0x08,
-    //             letterbox=0x10, PAL60=0x40
-    return (EepReadDW(0x94) & ~0x5FUL) == 0;  // video flags at 0x94
+    // Valid bits: widescreen=0x00010000, 720p=0x00020000, 1080i=0x00040000,
+    //             480p=0x00080000, letterbox=0x00100000, PAL60=0x00400000
+    return (EepReadDW(0x94) & ~0x005F0000UL) == 0;
 }
 
 static bool EepAudioFlagsOK()
 {
-    // Valid bits: mono=0x01, stereo=0x02, dolby=0x04, dts=0x08, AC3=0x10
-    return (EepReadDW(0x98) & ~0x1FUL) == 0;  // audio flags at 0x98
+    // Valid bits: mono=0x00000001, surround=0x00000002 (stereo=0), AC3=0x00010000, DTS=0x00020000
+    return (EepReadDW(0x98) & ~0x00030003UL) == 0;
 }
 
 static bool EepGameRegionOK()
 {
-    DWORD gr = EepReadDW(0x54);
+    // Security section is RC4-encrypted in the raw buffer — read game region
+    // via kernel API which returns the decrypted value.
+    ULONG type = 0, len = 0;
+    DWORD gr = 0;
+    if (ExQueryNonVolatileSetting(XC_GAME_REGION, &type, &gr, 4, &len) != 0)
+        return false;
     return (gr == 0x00000001 || gr == 0x00000002 || gr == 0x00000004 ||
         gr == 0x80000000 || gr == 0x000000FF);
 }
@@ -1780,7 +1852,9 @@ static bool EepDvdRegionOK()
 static bool EepLanguageOK()
 {
     DWORD lang = EepReadDW(0x90);
-    return (lang >= 1 && lang <= 7);  // 1=English ... 7=Korean
+    // 0=Neutral, 1=English, 2=Japanese, 3=German, 4=French,
+    // 5=Spanish, 6=Italian, 7=Korean, 8=Chinese, 9=Portuguese
+    return (lang <= 9);
 }
 
 static bool EepTimezoneOK()
@@ -1847,9 +1921,10 @@ static bool EepGameRatingOK()
 
 static bool EepMovieRatingOK()
 {
-    // Max movie rating at 0xA4: 0=disabled, 1-8 = MPAA ratings, 0xFF = all blocked
+    // XboxEepromEditor MovieRating: NR=0, NC17=1, R=2, PG13=4, PG=5, G=7
+    // Values 3 and 6 are not defined (non-sequential enum).
     DWORD mr = EepReadDW(0xA4);
-    return (mr == 0 || (mr >= 1 && mr <= 8) || mr == 0xFF);
+    return (mr == 0 || mr == 1 || mr == 2 || mr == 4 || mr == 5 || mr == 7);
 }
 
 static bool EepOnlineKeyNonzero()
@@ -1956,7 +2031,7 @@ static void RepairBuildDiag()
     add("Audio Flags", "0x98  no undocumented bits set", EepAudioFlagsOK(), true);
     add("Game Region", "0x54  NA / Japan / RoW / Dev", EepGameRegionOK(), true);
     add("DVD Region", "0xBC  CSS zone 0-6", EepDvdRegionOK(), true);
-    add("Language", "0x90  English-Korean (1-7)", EepLanguageOK(), true);
+    add("Language", "0x90  Neutral-Portuguese (0-9)", EepLanguageOK(), true);
     add("Timezone", "0x64  valid bias + printable TZ name", EepTimezoneOK(), true);
     add("Game Rating", "0x9C  ESRB 0-8 or 0xFF", EepGameRatingOK(), true);
     add("Movie Rating", "0xA4  MPAA 0-8 or 0xFF", EepMovieRatingOK(), true);
@@ -2004,7 +2079,7 @@ static void RepairApply()
     // 7: Video flags — mask to documented bits
     if (s_repItems[7].state == REP_BAD)
     {
-        DWORD vf = EepReadDW(0x94) & 0x5F;  // video flags at 0x94
+        DWORD vf = EepReadDW(0x94) & 0x005F0000;  // video flags at 0x94
         s_repItems[7].state = (ExSaveNonVolatileSetting(XC_VIDEO_FLAGS, REG_DWORD, &vf, 4) == 0)
             ? REP_FIXED : REP_FAIL;
     }
@@ -2012,8 +2087,9 @@ static void RepairApply()
     // 8: Audio flags — mask to documented bits, fallback to stereo
     if (s_repItems[8].state == REP_BAD)
     {
-        DWORD af = EepReadDW(0x98) & 0x1F;  // audio flags at 0x98
-        if (af == 0) af = 0x02;
+        DWORD af = EepReadDW(0x98) & 0x00030003;  // audio flags at 0x98
+        if ((af & 0x00000003) == 0x00000003) af &= ~0x00000001u; // mono+surround both set — clear mono
+        // 0x00 = stereo is the correct fallback (not 0x02 which is Surround)
         s_repItems[8].state = (ExSaveNonVolatileSetting(XC_AUDIO_FLAGS, REG_DWORD, &af, 4) == 0)
             ? REP_FIXED : REP_FAIL;
     }
