@@ -373,7 +373,48 @@ Displays ATA IDENTIFY data for the primary HDD: model, serial number, firmware r
 <img src="https://github.com/Darkone83/XbDiag/blob/main/img/Hddinfo_smart.png">
 </div>
 
-Live SMART attribute table — attribute ID, name, value, worst, threshold, and raw data for all reported attributes.
+Live SMART attribute table read directly from the drive via ATA command `0xB0 / 0xD0` (SMART READ DATA). Up to 30 attributes are displayed with the following columns:
+
+| Column | Description |
+|--------|-------------|
+| `ID` | Attribute number in hex |
+| `ATTRIBUTE` | Human-readable name, or `Attr 0xNN` for vendor-specific IDs |
+| `CUR` | Current normalized value (drive-reported, 1–253) |
+| `WST` | Worst recorded value since the drive was manufactured |
+| `THR` | Failure threshold set by the drive manufacturer |
+| `RAW VALUE` | 6-byte vendor raw counter, most-significant byte first |
+
+#### Color Coding
+
+Each row is colored to indicate health at a glance:
+
+**Attribute name (ATTRIBUTE column)**
+- **White** — attribute is healthy or non-critical
+- **Red** — attribute is one of the three critical failure indicators (`05` Reallocated Sectors, `C5` Pending Sectors, `C6` Uncorrectable Sectors) *and* its raw value is non-zero. A non-zero raw count on any of these three attributes is a direct warning of physical media damage or imminent failure.
+
+**Current value (CUR column)**
+- **Cyan** — current value is above the manufacturer's failure threshold; attribute is passing
+- **Red** — current value has reached or fallen below the threshold (`CUR ≤ THR` where `THR > 0`). This is the same condition a drive's internal SMART status reports as a predicted failure.
+
+**Worst value (WST column)**
+- Always shown in **gray** — informational only, indicates the lowest the current value has ever been.
+
+**Threshold (THR column)**
+- Always shown in **dim** — the fixed reference value set by the drive firmware.
+
+**Raw value (RAW VALUE column)**
+- **Yellow** — at least one byte of the 6-byte raw counter is non-zero. For most attributes this means the event has occurred at least once.
+- **Dim** — all six raw bytes are zero; the event has never been recorded.
+
+#### Critical Attributes to Watch
+
+| ID | Attribute | What a non-zero raw value means |
+|----|-----------|--------------------------------|
+| `05` | Reallocated Sectors | Bad sectors have been remapped to spare area. Any non-zero count indicates physical platter damage. |
+| `C5` | Pending Sectors | Sectors that have been read with errors and are awaiting reallocation. Drive is actively detecting new bad areas. |
+| `C6` | Uncorrectable Sectors | Sectors that could not be corrected by ECC or remapped. Data loss has occurred or is occurring. |
+
+If any of these three appear in red, the drive should be considered suspect regardless of whether the overall SMART status is still "passing."
 
 | Button | Action |
 |--------|--------|
