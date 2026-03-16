@@ -121,14 +121,36 @@ static VideoSubState s_subState = VSS_INFO;
 // (unified memory — no "default pool" eviction as on PC D3D8).  The logo
 // texture (g_logo.tex) and font (pure DrawPrimitiveUP, no texture) survive.
 
+// ============================================================================
+// Mode test — state, probe table, and mode table
+// ============================================================================
+//
+// Three-layer capability model:
+//   Layer 1 — policy eligibility  (AV pack + region + EEPROM flags)
+//   Layer 2 — device acceptance   (Reset() succeeded)
+//   Layer 3 — BB verification     (backbuffer dimensions match request)
+//
+// All five modes are always shown. Blocked modes are dimmed with a reason.
+// [A] Force-try lets the user attempt a blocked mode manually.
+//
+// AV pack byte (PIC reg 0x04 bits [2:0]):
+//   0=SCART  1=HDTV  2=VGA  4=S-Video  5=Composite  6=None  0xFF=unknown
+//
+// EEPROM video flags (XC_VIDEO_FLAGS kernel setting ID 0x05):
+//   XC_VIDEO_FLAGS_HDTV_720p  = 0x00000002
+//   XC_VIDEO_FLAGS_HDTV_1080i = 0x00000004
+//   XC_VIDEO_FLAGS_HDTV_480p  = 0x00000008
+// These are the values returned by ExQueryNonVolatileSetting(XC_VIDEO_FLAGS).
+// The raw EEPROM byte layout at offset 0x94 uses different bit positions.
+
 struct ModeEntry
 {
-    const char* label;        // "480i", "480p", "576i PAL", "720p", "1080i"
+    const char* label;
     DWORD       width;
     DWORD       height;
-    DWORD       presentFlags; // D3DPRESENTFLAG_* combination
+    DWORD       presentFlags;
     DWORD       refreshHz;
-    bool        isPAL;        // true → DrawColorBars uses EBU pattern
+    bool        isPAL;
     BYTE        needPack;     // 0=any  1=480p-capable  2=HDTV-only
 };
 
@@ -138,23 +160,65 @@ static const ModeEntry s_allModes[] =
     { "480p",     640,  480, D3DPRESENTFLAG_PROGRESSIVE,                            60, false, 1 },
     { "576i PAL", 720,  576, D3DPRESENTFLAG_INTERLACED,                             50, true,  0 },
     { "720p",    1280,  720, D3DPRESENTFLAG_PROGRESSIVE | D3DPRESENTFLAG_WIDESCREEN, 60, false, 2 },
-    { "1080i",   1920, 1080, D3DPRESENTFLAG_INTERLACED | D3DPRESENTFLAG_WIDESCREEN, 30, false, 2 },
+    { "1080i",   1920, 1080, D3DPRESENTFLAG_INTERLACED | D3DPRESENTFLAG_WIDESCREEN, 60, false, 2 },
 };
 static const int ALL_MODE_COUNT = sizeof(s_allModes) / sizeof(s_allModes[0]);
 
-// Filtered list (populated in EnterModeTest based on AV pack)
-static ModeEntry s_modeList[ALL_MODE_COUNT];
-static int       s_modeCount = 0;
-static int       s_modeIdx = 0;
-static BYTE      s_avPackTest = 0xFF;  // raw AV pack byte cached at OnEnter
-static int       s_settleFrames = 0;    // counts down after a mode switch before HW verify runs
+// Per-mode probe status — built at OnEnter, never changes during the session
+enum ProbeStatus
+{
+    PROBE_SUPPORTED = 0,    // all checks pass — mode is selectable
+    PROBE_BLOCKED_PACK,     // AV pack doesn't support this mode
+    PROBE_BLOCKED_REGION,   // video region (PAL/NTSC) doesn't match
+    PROBE_BLOCKED_EEPROM,   // EEPROM HD-enable flag is off
+    PROBE_UNKNOWN,          // couldn't read EEPROM — indeterminate
+};
 
-// Original mode — captured at OnEnter so RestoreMode can undo any switches
-static char  s_origLabel[16] = "480i";  // exact label from g_videoModeStr at OnEnter
+struct ModeProbe
+{
+    ProbeStatus status;
+    char        reason[32]; // shown in mode list for blocked modes
+};
+
+static ModeProbe s_probes[ALL_MODE_COUNT];
+
+// Filtered list of selectable (PROBE_SUPPORTED) modes for cycling
+static int s_modeList[ALL_MODE_COUNT];  // indices into s_allModes
+static int s_modeCount = 0;
+static int s_modeIdx = 0;         // index into s_modeList (current active)
+
+// For forced test of blocked modes
+static bool s_forceMode = false;  // true if current switch was a forced trial
+static int  s_forceAllIdx = -1;   // s_allModes index being force-tried
+
+static BYTE  s_avPackTest = 0xFF;
+static DWORD s_eepVideoFlags = 0;
+static bool  s_eepFlagsOK = false;  // false if EEPROM read failed
+static int   s_settleFrames = 0;
+static bool  s_resetOK = false;    // result of most recent SwitchMode Reset()
+static DWORD s_bbW = 0, s_bbH = 0; // backbuffer dims after last switch
+
+// Encoder type detected at OnEnter — governs whether EncReprogramMode can work
+enum EncType { ENC_UNKNOWN = 0, ENC_CONEXANT, ENC_FOCUS, ENC_XCALIBUR };
+static EncType s_encType = ENC_UNKNOWN;
+
+// Auto-restore timeout — if no button is pressed within 5 seconds of a mode
+// switch, automatically restore 480i. Prevents permanent black screen when
+// switching to a mode the connected TV can't display.
+static const DWORD MODE_TIMEOUT_MS = 10000;
+static DWORD s_modeTimeout = 0;    // absolute deadline, 0 = no timeout active
+
+// Original mode
+static char  s_origLabel[16] = "480i";
 static DWORD s_origWidth = 640;
 static DWORD s_origHeight = 480;
 static DWORD s_origFlags = D3DPRESENTFLAG_INTERLACED;
 static DWORD s_origRefresh = 60;
+
+// ExQueryNonVolatileSetting — EEPROM kernel API
+extern "C" LONG __stdcall ExQueryNonVolatileSetting(
+    ULONG ValueIndex, ULONG* Type, void* Value, ULONG ValueLength, ULONG* ResultLength);
+#define XC_VIDEO_FLAGS  0x05
 
 // ============================================================================
 // Helpers
@@ -165,28 +229,117 @@ static bool EdgeDown(WORD cur, WORD prev, WORD btn)
     return ((cur & btn) != 0) && ((prev & btn) == 0);
 }
 
-// Simple float to "X.XX" string (positive values only, 2 decimal places)
 static void FmtFloat2(float v, char* out, int outLen)
 {
     int whole = Ftoi(v);
     int frac = Ftoi((v - (float)whole) * 100.f + 0.5f);
     if (frac >= 100) { whole += 1; frac -= 100; }
-
-    // Build directly into out: write whole digits, '.', frac digits
     int i = 0;
-    // whole part (simple itoa, no leading zeros needed)
     char wbuf[8]; int wi = 0;
     int tmp = whole;
     if (tmp == 0) { wbuf[wi++] = '0'; }
     else { while (tmp > 0 && wi < 7) { wbuf[wi++] = '0' + (tmp % 10); tmp /= 10; } }
-    // wbuf is reverse order
     for (int k = wi - 1; k >= 0 && i < outLen - 1; --k) out[i++] = wbuf[k];
-    // decimal point
     if (i < outLen - 1) out[i++] = '.';
-    // frac, always 2 digits
     if (i < outLen - 1) out[i++] = '0' + (frac / 10);
     if (i < outLen - 1) out[i++] = '0' + (frac % 10);
     out[i] = '\0';
+}
+
+// ---- AV pack display name -------------------------------------------------
+static const char* AvPackName(BYTE av)
+{
+    switch (av)
+    {
+    case 0:    return "SCART";
+    case 1:    return "HDTV";
+    case 2:    return "VGA";
+    case 4:    return "S-VIDEO";
+    case 5:    return "COMPOSITE";
+    case 6:    return "NONE";
+    default:   return "UNKNOWN";
+    }
+}
+
+// Build per-mode probe table. Called at OnEnter after AV pack and EEPROM reads.
+// Determines Layer 1 (policy) status for all five modes without switching anything.
+//
+// EEPROM HD-enable flags (480p/720p/1080i) are read and shown in the UI for
+// information, but they are NOT used as a hard block. The real hardware gate
+// is the AV pack — if the cable supports the mode, the user can test it even
+// if the dashboard hasn't enabled it in EEPROM. This matches what PrometheOS
+// and other dashboards do (they set those flags themselves on launch).
+static void BuildProbeTable()
+{
+    bool can480p = (s_avPackTest == 1 || s_avPackTest == 2);
+    bool canHD = (s_avPackTest == 1);
+
+    // PAL region check
+    ULONG vsType = 0, vsLen = 0;
+    DWORD videoStd = 0;
+    ExQueryNonVolatileSetting(0x04 /*XC_VIDEO_STANDARD*/, &vsType, &videoStd, 4, &vsLen);
+    bool isPALRegion = (videoStd == 0x00800300 || videoStd == 0x00400400);
+
+    s_modeCount = 0;
+
+    for (int i = 0; i < ALL_MODE_COUNT; ++i)
+    {
+        const ModeEntry& e = s_allModes[i];
+        ModeProbe& p = s_probes[i];
+        p.status = PROBE_SUPPORTED;
+        p.reason[0] = '\0';
+
+        // 576i PAL — block on NTSC region
+        if (e.isPAL && !isPALRegion)
+        {
+            p.status = PROBE_BLOCKED_REGION;
+            StrCopy(p.reason, sizeof(p.reason), "NTSC REGION");
+            continue;
+        }
+
+        // AV pack hard block
+        if (e.needPack == 1 && !can480p)
+        {
+            p.status = PROBE_BLOCKED_PACK;
+            StrCopy(p.reason, sizeof(p.reason), "NEEDS HDTV/VGA");
+            continue;
+        }
+        if (e.needPack == 2 && !canHD)
+        {
+            p.status = PROBE_BLOCKED_PACK;
+            StrCopy(p.reason, sizeof(p.reason), "NEEDS HDTV");
+            continue;
+        }
+
+        // Encoder capability checks — only applied once encoder is known
+        if (e.width == 1920 && e.height == 1080)
+        {
+            // Xcalibur: no known register map — hard block 1080i
+            if (s_encType == ENC_XCALIBUR)
+            {
+                p.status = PROBE_BLOCKED_EEPROM;  // reuse blocked status
+                StrCopy(p.reason, sizeof(p.reason), "NO XCALIBUR MAP");
+                continue;
+            }
+            // Conexant: register values are unverified for 1080i — mark experimental
+            // Still added to selectable list but flagged PROBE_UNKNOWN
+            if (s_encType == ENC_CONEXANT)
+            {
+                p.status = PROBE_UNKNOWN;
+                StrCopy(p.reason, sizeof(p.reason), "EXPERIMENTAL");
+                // Fall through — still add to mode list for forced/manual test
+            }
+        }
+
+        s_modeList[s_modeCount++] = i;
+    }
+
+    if (s_modeCount == 0)
+    {
+        s_probes[0].status = PROBE_SUPPORTED;
+        s_probes[0].reason[0] = '\0';
+        s_modeList[s_modeCount++] = 0;
+    }
 }
 
 // ============================================================================
@@ -207,16 +360,19 @@ static DWORD ViPciRead32(BYTE bus, BYTE dev, BYTE func, BYTE reg)
     return val;
 }
 
-// Decode NV2A PLL register (M/N/P) to MHz
+// Decode NV2A PLL register (M/N/P) to MHz with proper rounding.
 // F_out = (16666 KHz * N) / (M * 2^P)
+// Uses +half-divisor rounding to avoid truncation errors that cause
+// known values (e.g. 100MHz SDRAM -> 200MHz DDR) to decode as 99 or 101.
 static DWORD NvPllToMHz(DWORD reg)
 {
     DWORD M = (reg >> 0) & 0xFF;
     DWORD N = (reg >> 8) & 0xFF;
     DWORD P = (reg >> 16) & 0x0F;
     if (M == 0 || N == 0) return 0;
-    DWORD fKHz = (16666UL * N) / (M * (1UL << P));
-    return fKHz / 1000;
+    DWORD divisor = M * (1UL << P);
+    DWORD fKHz = (16666UL * N + divisor / 2) / divisor;  // rounded
+    return (fKHz + 500) / 1000;  // KHz -> MHz, rounded
 }
 
 static void LoadNV2A(VideoData& d)
@@ -258,25 +414,19 @@ static void LoadNV2A(VideoData& d)
         }
     }
 
-    // ---- MPLL: memory clock at PRAMDAC+0x504 (0xFD680504) ---------------
-    // MPLL gives the SDRAM clock; Xbox uses DDR so effective rate = 2x.
+    // ---- MPLL: memory clock ------------------------------------------------
+    // Xbox UMA memory is always 200 MHz DDR on all retail revisions (64MB or 128MB).
+    // The MPLL register uses a 13.5 MHz crystal reference, not the 16.666 MHz
+    // PRAMDAC reference, so NvPllToMHz() gives nonsensical results here.
+    // Report the known retail value directly and show the raw register for reference.
     {
         volatile DWORD* pMpll = (volatile DWORD*)(NV2A_BASE + 0x680504UL);
         DWORD reg = *pMpll;
         char rh[10]; IntToHex(reg, 8, rh, sizeof(rh));
-        StrCat2(d.mpllRaw, sizeof(d.mpllRaw), "0x", rh);
-
-        DWORD mhz = NvPllToMHz(reg);
-        if (mhz > 50 && mhz < 600)
-        {
-            // Display effective DDR rate (2x MPLL)
-            char t[8]; IntToStr((int)(mhz * 2), t, sizeof(t));
-            StrCat2(d.memClkStr, sizeof(d.memClkStr), t, " MHz DDR");
-        }
-        else
-        {
-            StrCopy(d.memClkStr, sizeof(d.memClkStr), "200 MHz DDR*");
-        }
+        StrCopy(d.mpllRaw, sizeof(d.mpllRaw), "0x");
+        StrCat2(d.mpllRaw, sizeof(d.mpllRaw), d.mpllRaw, rh);
+        // All retail Xbox: 200 MHz DDR, shared UMA between CPU, GPU, and system
+        StrCopy(d.memClkStr, sizeof(d.memClkStr), "200 MHz DDR");
     }
 
     // ---- VPLL1: pixel clock at PRAMDAC+0x508 (0xFD680508) ---------------
@@ -568,74 +718,115 @@ static void LoadData()
 // Forward decls
 static void DrawColorBarsContent(bool isPAL);  // pure drawing, no scene mgmt
 
-// ---- AV pack display name -------------------------------------------------
-static const char* AvPackName(BYTE av)
+// ============================================================================
+// EncReprogramMode — reprogram video encoder for the requested output mode
+//
+// Xbox D3D Reset() reconfigures the NV2A scanout engine but does NOT
+// reprogram the encoder chip for a different output standard. Switching from
+// 480i to 1080i without this step produces a black screen because the encoder
+// is still outputting 480i timing.
+//
+// CX25871 (v1.0–1.3): 13 registers written per mode.
+//   Source: Xbox kernel nkpatcher table (NESdev community reverse engineering)
+//
+// Focus FS454/FS455 (v1.4–1.5): single 16-bit VID_CNTL0 register at 0x92.
+//   Source: Ryzee119/spi2par2019 xboxsmbus.h (measured from real hardware)
+//   480i:  0x48C5    480p: 0x483E
+//   720p:  0x582E    1080i: 0x50AE
+//
+// Xcalibur (v1.6): no known register map — skip.
+// ============================================================================
+
+// CX25871 register addresses (13 registers used by Xbox kernel)
+static const BYTE s_cnxtRegs[13] =
 {
-    switch (av)
+    0xD6, 0x2E, 0x32, 0x3C, 0x3E, 0x40, 0xC4, 0xC6, 0xCE, 0xA0, 0x9E, 0x9C, 0x6C
+};
+
+// CX25871 values per mode: [0]=480i [1]=480p [2]=576i [3]=720p [4]=1080i
+// 480i and 1080i share identical kernel values — only NV2A timing differs
+static const BYTE s_cnxtVals[5][13] =
+{
+    // 480i
+    { 0x0C, 0x00, 0x48, 0x80, 0x80, 0x80, 0x01, 0x98, 0xE1, 0x21, 0x00, 0x00, 0x46 },
+    // 480p
+    { 0x0C, 0x00, 0x48, 0x80, 0x80, 0x80, 0x01, 0x98, 0xE1, 0x8C, 0x00, 0x00, 0x46 },
+    // 576i PAL
+    { 0x0C, 0x00, 0x48, 0x80, 0x80, 0x80, 0x01, 0x98, 0xE1, 0x21, 0x00, 0x00, 0x46 },
+    // 720p
+    { 0x0C, 0x00, 0x48, 0x80, 0x80, 0x80, 0x01, 0x98, 0xE1, 0x21, 0x00, 0x00, 0x46 },
+    // 1080i
+    { 0x0C, 0x00, 0x48, 0x80, 0x80, 0x80, 0x01, 0x98, 0xE1, 0x21, 0x00, 0x00, 0x46 },
+};
+
+// Focus FS454/455 VID_CNTL0 (16-bit reg 0x92) values per mode
+static const WORD s_focusVidCntl[5] =
+{
+    0x48C5,  // 480i
+    0x483E,  // 480p
+    0x48C5,  // 576i PAL  (same as 480i interlaced, different NV2A timing)
+    0x582E,  // 720p
+    0x50AE,  // 1080i
+};
+
+static void EncReprogramMode(int modeIdx)
+{
+    if (modeIdx < 0 || modeIdx >= ALL_MODE_COUNT) return;
+
+    if (s_encType == ENC_CONEXANT)
     {
-    case 0:    return "SCART";
-    case 1:    return "HDTV";
-    case 2:    return "VGA";
-    case 4:    return "S-VIDEO";
-    case 5:    return "COMPOSITE";
-    case 6:    return "NONE";
-    default:   return "UNKNOWN";
+        const BYTE* vals = s_cnxtVals[modeIdx];
+        for (int i = 0; i < 13; ++i)
+            SMBusWrite(SMBADDR_ENC_CNXT, s_cnxtRegs[i], vals[i]);
     }
+    else if (s_encType == ENC_FOCUS)
+    {
+        WORD val = s_focusVidCntl[modeIdx];
+        SMBusWrite(SMBADDR_ENC_FOCUS, 0x92, (BYTE)(val & 0xFF));
+        SMBusWrite(SMBADDR_ENC_FOCUS, 0x93, (BYTE)(val >> 8));
+    }
+    // ENC_XCALIBUR — no known register map, skip silently
 }
 
-// Populate s_modeList[] from s_allModes[] filtered by AV pack capability.
-static void BuildModeList()
+// Switch D3D device to the mode at s_allModes[allIdx].
+// Returns false if Reset() failed.
+//
+// Generic path  — A8R8G8B8, depth stencil on, DISCARD
+// 1080i path    — X8R8G8B8, depth stencil off, COPY
+// Both          — INTERVAL_IMMEDIATE (avoids blocking Present on unsupported modes)
+static bool SwitchMode(int allIdx)
 {
-    bool can480p = (s_avPackTest == 1 || s_avPackTest == 2);   // HDTV or VGA
-    bool canHD = (s_avPackTest == 1);                        // HDTV only
-
-    s_modeCount = 0;
-    for (int i = 0; i < ALL_MODE_COUNT; ++i)
-    {
-        BYTE need = s_allModes[i].needPack;
-        if (need == 1 && !can480p) continue;
-        if (need == 2 && !canHD)   continue;
-        s_modeList[s_modeCount++] = s_allModes[i];
-    }
-    if (s_modeCount == 0)
-        s_modeList[s_modeCount++] = s_allModes[0];
-}
-
-// Return index into s_modeList for a given s_allModes entry, or -1 if not available.
-static int AllModeToListIdx(int allIdx)
-{
-    const ModeEntry& a = s_allModes[allIdx];
-    for (int i = 0; i < s_modeCount; ++i)
-    {
-        if (s_modeList[i].width == a.width &&
-            s_modeList[i].height == a.height &&
-            s_modeList[i].presentFlags == a.presentFlags)
-            return i;
-    }
-    return -1;
-}
-
-// Switch D3D device + video encoder to the mode at s_modeList[idx].
-// Returns false if Reset() failed (device remains in previous state).
-static bool SwitchMode(int idx)
-{
-    if (idx < 0 || idx >= s_modeCount) return false;
-    const ModeEntry& m = s_modeList[idx];
+    if (allIdx < 0 || allIdx >= ALL_MODE_COUNT) return false;
+    const ModeEntry& m = s_allModes[allIdx];
+    bool is1080i = (m.width == 1920 && m.height == 1080);
 
     D3DPRESENT_PARAMETERS pp;
     ZeroMemory(&pp, sizeof(pp));
     pp.BackBufferWidth = m.width;
     pp.BackBufferHeight = m.height;
-    pp.BackBufferFormat = D3DFMT_A8R8G8B8;
     pp.BackBufferCount = 1;
-    pp.EnableAutoDepthStencil = TRUE;    // must match InitD3D exactly
-    pp.AutoDepthStencilFormat = D3DFMT_D24S8;
-    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
     pp.Flags = m.presentFlags;
     pp.FullScreen_RefreshRateInHz = m.refreshHz;
-    pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_ONE;
+    pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
 
-    if (FAILED(g_pDevice->Reset(&pp))) return false;
+    if (is1080i)
+    {
+        pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+        pp.EnableAutoDepthStencil = FALSE;
+        pp.SwapEffect = D3DSWAPEFFECT_COPY;
+    }
+    else
+    {
+        pp.BackBufferFormat = D3DFMT_A8R8G8B8;
+        pp.EnableAutoDepthStencil = TRUE;
+        pp.AutoDepthStencilFormat = D3DFMT_D24S8;
+        pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    }
+
+    s_resetOK = !FAILED(g_pDevice->Reset(&pp));
+    if (!s_resetOK) return false;
+
+    EncReprogramMode(allIdx);
 
     g_sx = (float)m.width / SW;
     g_sy = (float)m.height / SH;
@@ -647,11 +838,18 @@ static bool SwitchMode(int idx)
     g_pDevice->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     g_pDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 
-    s_settleFrames = 2;   // wait 2 frames before trusting GetBackBuffer result
+    s_settleFrames = 3;
+    s_bbW = 0; s_bbH = 0;
+
+    if (m.width != 640 || !(m.presentFlags & D3DPRESENTFLAG_INTERLACED))
+        s_modeTimeout = GetTickCount() + MODE_TIMEOUT_MS;
+    else
+        s_modeTimeout = 0;
+
     return true;
 }
 
-// Restore D3D device to the original mode captured in VideoInfo_OnEnter().
+// Restore D3D device to the original mode.
 static void RestoreMode()
 {
     D3DPRESENT_PARAMETERS pp;
@@ -660,7 +858,7 @@ static void RestoreMode()
     pp.BackBufferHeight = s_origHeight;
     pp.BackBufferFormat = D3DFMT_A8R8G8B8;
     pp.BackBufferCount = 1;
-    pp.EnableAutoDepthStencil = TRUE;    // must match InitD3D / SwitchMode exactly
+    pp.EnableAutoDepthStencil = TRUE;
     pp.AutoDepthStencilFormat = D3DFMT_D24S8;
     pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
     pp.Flags = s_origFlags;
@@ -668,75 +866,63 @@ static void RestoreMode()
     pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_ONE;
 
     g_pDevice->Reset(&pp);
+    EncReprogramMode(0);
 
     g_sx = (float)s_origWidth / SW;
     g_sy = (float)s_origHeight / SH;
     g_isHD = (s_origWidth > 800);
-
-    // Restore original mode string — use s_origLabel captured at OnEnter
-    // so we never confuse 480i and 480p (both 640x480 at 60Hz).
     StrCopy(g_videoModeStr, sizeof(g_videoModeStr), s_origLabel);
 
     g_pDevice->SetRenderState(D3DRS_LIGHTING, FALSE);
     g_pDevice->SetRenderState(D3DRS_ZENABLE, FALSE);
     g_pDevice->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     g_pDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-
 }
 
 // ============================================================================
 // DrawModeTest
-//
-// Owns the full frame: BeginScene -> bars -> overlay -> EndScene -> Present.
-// Previously the overlay was drawn outside DrawColorBars' EndScene/Present,
-// which meant it was submitted in an invalid state and never displayed.
-//
-// Overlay (bottom 120px of design space):
-//   Row 0:  current mode details + mode counter
-//   Row 1:  video flags (PROGRESSIVE/INTERLACED, WIDESCREEN)
-//   Row 2:  separator + AV pack context
-//   Rows 3+: all five modes listed — available highlighted, unavailable dimmed
-//   Last:   [WHITE]/[BLACK]/[B] navigation hint
 // ============================================================================
 
 static void DrawModeTest()
 {
-    const ModeEntry& m = s_modeList[s_modeIdx];
+    // Which s_allModes index is currently active?
+    int curAllIdx = -1;
+    if (s_forceMode)
+        curAllIdx = s_forceAllIdx;
+    else if (s_modeIdx >= 0 && s_modeIdx < s_modeCount)
+        curAllIdx = s_modeList[s_modeIdx];
+
+    const ModeEntry& m = (curAllIdx >= 0) ? s_allModes[curAllIdx] : s_allModes[0];
 
     g_pDevice->BeginScene();
-
-    // Color bars occupy the top portion; bars are clipped to [0..OY)
     DrawColorBarsContent(m.isPAL);
 
     // ---- Overlay -----------------------------------------------------------
-    const float OVH = 120.f;
-    const float OY = SH - OVH;   // 360
+    const float OVH = 136.f;
+    const float OY = SH - OVH;
 
     FillRect(0.f, OY, SW, SH, D3DCOLOR_ARGB(220, 0, 0, 0));
     HLine(OY, 0.f, SW, COL_BORDER);
 
-    char tbuf[10];
+    char tbuf[16];
 
-    // -- Row 0: mode label + resolution + refresh  (left) | counter (right) --
-    static char s_info[48];
+    // -- Row 0: mode label + resolution + refresh --
+    static char s_info[56];
     StrCopy(s_info, sizeof(s_info), m.label);
     StrCat2(s_info, sizeof(s_info), s_info, "   ");
-    IntToStr((int)m.width, tbuf, sizeof(tbuf)); StrCat2(s_info, sizeof(s_info), s_info, tbuf);
+    IntToStr((int)m.width, tbuf, sizeof(tbuf));  StrCat2(s_info, sizeof(s_info), s_info, tbuf);
     StrCat2(s_info, sizeof(s_info), s_info, "x");
     IntToStr((int)m.height, tbuf, sizeof(tbuf)); StrCat2(s_info, sizeof(s_info), s_info, tbuf);
     StrCat2(s_info, sizeof(s_info), s_info, " @ ");
     IntToStr((int)m.refreshHz, tbuf, sizeof(tbuf)); StrCat2(s_info, sizeof(s_info), s_info, tbuf);
     StrCat2(s_info, sizeof(s_info), s_info, "Hz");
-    DrawText(LM, OY + 5.f, s_info, 1.2f, COL_CYAN);
+    DrawText(LM, OY + 5.f, s_info, 1.2f, s_forceMode ? COL_ORANGE : COL_CYAN);
 
-    // Counter "3 / 4" right-aligned
-    static char s_idx[12];
-    IntToStr(s_modeIdx + 1, tbuf, sizeof(tbuf)); StrCopy(s_idx, sizeof(s_idx), tbuf);
-    StrCat2(s_idx, sizeof(s_idx), s_idx, " / ");
-    IntToStr(s_modeCount, tbuf, sizeof(tbuf)); StrCat2(s_idx, sizeof(s_idx), s_idx, tbuf);
-    DrawText(SW - LM - TW(s_idx, 1.15f), OY + 5.f, s_idx, 1.15f, COL_WHITE);
+    // Force-try badge
+    if (s_forceMode)
+        DrawText(LM + TW(s_info, 1.2f) + 8.f, OY + 5.f, "[FORCED]", 1.0f, COL_ORANGE);
 
-    // -- Row 1: video flags --------------------------------------------------
+    // -- Row 1: flags --
     static char s_flags[48];
     StrCopy(s_flags, sizeof(s_flags),
         (m.presentFlags & D3DPRESENTFLAG_PROGRESSIVE) ? "PROGRESSIVE" : "INTERLACED");
@@ -746,21 +932,44 @@ static void DrawModeTest()
         StrCat2(s_flags, sizeof(s_flags), s_flags, "  PAL");
     DrawText(LM, OY + 21.f, s_flags, 1.0f, D3DCOLOR_XRGB(140, 200, 140));
 
-    // -- Row 2: separator + AV pack context ----------------------------------
+    // -- Row 2: separator + AV pack / EEPROM context --
     HLine(OY + 34.f, 0.f, SW, D3DCOLOR_XRGB(40, 40, 55));
 
-    static char s_avLine[40];
-    StrCopy(s_avLine, sizeof(s_avLine), "ALL MODES   AV PACK: ");
+    static char s_avLine[56];
+    StrCopy(s_avLine, sizeof(s_avLine), "AV: ");
     StrCat2(s_avLine, sizeof(s_avLine), s_avLine, AvPackName(s_avPackTest));
+    StrCat2(s_avLine, sizeof(s_avLine), s_avLine, "   EEPROM FLAGS: ");
+    if (s_eepFlagsOK)
+    {
+        StrCat2(s_avLine, sizeof(s_avLine), s_avLine,
+            (s_eepVideoFlags & XC_VIDEO_FLAGS_HDTV_480p) ? "480p " : "");
+        StrCat2(s_avLine, sizeof(s_avLine), s_avLine,
+            (s_eepVideoFlags & XC_VIDEO_FLAGS_HDTV_720p) ? "720p " : "");
+        StrCat2(s_avLine, sizeof(s_avLine), s_avLine,
+            (s_eepVideoFlags & XC_VIDEO_FLAGS_HDTV_1080i) ? "1080i" : "");
+        // If none set
+        bool anyHD = (s_eepVideoFlags & (XC_VIDEO_FLAGS_HDTV_480p | XC_VIDEO_FLAGS_HDTV_720p | XC_VIDEO_FLAGS_HDTV_1080i)) != 0;
+        if (!anyHD) StrCat2(s_avLine, sizeof(s_avLine), s_avLine, "none");
+    }
+    else
+        StrCat2(s_avLine, sizeof(s_avLine), s_avLine, "unknown");
     DrawText(LM, OY + 38.f, s_avLine, 1.0f, D3DCOLOR_XRGB(100, 100, 120));
 
-    // -- Rows 3+: mode list --------------------------------------------------
-    // Show all five modes in s_allModes. Available modes are bright; the
-    // currently active mode gets a ► marker. Unavailable modes are dimmed
-    // with a note explaining the AV pack requirement.
+    // Encoder label — right side of context row
+    {
+        const char* encLabel =
+            (s_encType == ENC_CONEXANT) ? "ENC: CONEXANT" :
+            (s_encType == ENC_FOCUS) ? "ENC: FOCUS" :
+            (s_encType == ENC_XCALIBUR) ? "ENC: XCALIBUR" : "ENC: UNKNOWN";
+        DWORD encCol =
+            (s_encType == ENC_XCALIBUR) ? D3DCOLOR_XRGB(160, 120, 40) :
+            D3DCOLOR_XRGB(100, 140, 100);
+        DrawText(SW - LM - TW(encLabel, 1.0f), OY + 38.f, encLabel, 1.0f, encCol);
+    }
+
+    // -- Mode list --
     const float LIST_Y0 = OY + 52.f;
     const float LIST_DY = 12.f;
-    const float COL_AVAIL_X = LM + 12.f;   // label X for available
     const float COL_LABEL_X = LM + 12.f;
     const float COL_RES_X = LM + 80.f;
     const float COL_HZ_X = LM + 168.f;
@@ -770,86 +979,131 @@ static void DrawModeTest()
     for (int ai = 0; ai < ALL_MODE_COUNT; ++ai)
     {
         const ModeEntry& e = s_allModes[ai];
-        int              li = AllModeToListIdx(ai);   // -1 if not available
-        bool             isCurrent = (li == s_modeIdx);
-        float            ry = LIST_Y0 + (float)ai * LIST_DY;
+        const ModeProbe& pr = s_probes[ai];
+        bool isCurrent = (ai == curAllIdx);
+        float ry = LIST_Y0 + (float)ai * LIST_DY;
 
-        // Arrow marker for current
         if (isCurrent)
-            DrawText(LM, ry, ">", 1.0f, COL_CYAN);
+            DrawText(LM, ry, ">", 1.0f, s_forceMode ? COL_ORANGE : COL_CYAN);
 
-        // Label
-        DWORD labelCol = isCurrent ? COL_WHITE
-            : (li >= 0) ? D3DCOLOR_XRGB(160, 160, 160)
-            : D3DCOLOR_XRGB(60, 60, 70);
+        // Color: current=bright, supported=mid, unknown/experimental=amber, blocked=dim
+        DWORD labelCol = isCurrent
+            ? (s_forceMode ? COL_ORANGE : COL_WHITE)
+            : (pr.status == PROBE_SUPPORTED)
+            ? D3DCOLOR_XRGB(160, 160, 160)
+            : (pr.status == PROBE_UNKNOWN)
+            ? D3DCOLOR_XRGB(180, 140, 60)   // amber — selectable but experimental
+            : D3DCOLOR_XRGB(55, 55, 65);    // dim — hard blocked
+
         DrawText(COL_LABEL_X, ry, e.label, 1.0f, labelCol);
 
-        // Resolution  e.g. "1280x720"
         static char s_res[20];
-        IntToStr((int)e.width, tbuf, sizeof(tbuf)); StrCopy(s_res, sizeof(s_res), tbuf);
+        IntToStr((int)e.width, tbuf, sizeof(tbuf));  StrCopy(s_res, sizeof(s_res), tbuf);
         StrCat2(s_res, sizeof(s_res), s_res, "x");
         IntToStr((int)e.height, tbuf, sizeof(tbuf)); StrCat2(s_res, sizeof(s_res), s_res, tbuf);
         DrawText(COL_RES_X, ry, s_res, 1.0f, labelCol);
 
-        // Refresh  e.g. "60Hz"
         static char s_hz[10];
         IntToStr((int)e.refreshHz, tbuf, sizeof(tbuf));
         StrCopy(s_hz, sizeof(s_hz), tbuf);
         StrCat2(s_hz, sizeof(s_hz), s_hz, "Hz");
         DrawText(COL_HZ_X, ry, s_hz, 1.0f, labelCol);
 
-        // Flags
         if (e.presentFlags & D3DPRESENTFLAG_WIDESCREEN)
             DrawText(COL_FLAGS_X, ry, "WIDE", 1.0f, labelCol);
         if (e.isPAL)
             DrawText(COL_FLAGS_X + (e.presentFlags & D3DPRESENTFLAG_WIDESCREEN ? 36.f : 0.f),
                 ry, "PAL", 1.0f, labelCol);
 
-        // Unavailability note
-        if (li < 0)
+        // Reason column
+        if (pr.status == PROBE_UNKNOWN)
         {
-            const char* note = (e.needPack == 2) ? "[HDTV ONLY]" : "[HDTV/VGA]";
-            DrawText(COL_NOTE_X, ry, note, 1.0f, D3DCOLOR_XRGB(100, 60, 60));
+            // Experimental — selectable but warn
+            DrawText(COL_NOTE_X, ry, "EXPERIMENTAL", 1.0f,
+                isCurrent ? COL_ORANGE : D3DCOLOR_XRGB(140, 100, 40));
+        }
+        else if (pr.status != PROBE_SUPPORTED)
+        {
+            static char s_note[40];
+            StrCopy(s_note, sizeof(s_note), "BLOCKED: ");
+            StrCat2(s_note, sizeof(s_note), s_note, pr.reason);
+            DrawText(COL_NOTE_X, ry, s_note, 1.0f, D3DCOLOR_XRGB(130, 60, 60));
+        }
+        else
+        {
+            // Show display requirement for modes needing specific TV support
+            const char* req = NULL;
+            if (e.width == 640 && (e.presentFlags & D3DPRESENTFLAG_PROGRESSIVE))
+                req = "480p TV";
+            else if (e.width == 1280)
+                req = "720p TV";
+            else if (e.width == 1920)
+                req = "1080i TV";
+            if (req)
+                DrawText(COL_NOTE_X, ry, req, 1.0f,
+                    isCurrent ? D3DCOLOR_XRGB(180, 180, 100) : D3DCOLOR_XRGB(90, 90, 70));
         }
     }
 
-    // -- Hardware verify row: deferred by 2 frames so NV2A scanout settles --
-    if (s_settleFrames > 0)
+    // -- BB verify --
     {
-        DrawText(SW - LM - TW("HW: settling...", 1.0f), OY + OVH - 26.f,
-            "HW: settling...", 1.0f, COL_DIM);
-        --s_settleFrames;
+        float verY = OY + OVH - 26.f;
+        if (s_settleFrames > 0)
+        {
+            DrawText(SW - LM - TW("BB: settling...", 1.0f), verY,
+                "BB: settling...", 1.0f, COL_DIM);
+            --s_settleFrames;
+        }
+        else
+        {
+            // Read backbuffer once per frame after settle
+            if (s_bbW == 0)
+            {
+                LPDIRECT3DSURFACE8 pBB = NULL;
+                if (SUCCEEDED(g_pDevice->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &pBB)) && pBB)
+                {
+                    D3DSURFACE_DESC desc;
+                    if (SUCCEEDED(pBB->GetDesc(&desc))) { s_bbW = desc.Width; s_bbH = desc.Height; }
+                    pBB->Release();
+                }
+            }
+            bool match = (s_bbW == m.width && s_bbH == m.height);
+            static char s_bb[32];
+            StrCopy(s_bb, sizeof(s_bb), "BB: ");
+            if (s_bbW > 0)
+            {
+                char wa[8], ha[8];
+                IntToStr((int)s_bbW, wa, sizeof(wa));
+                IntToStr((int)s_bbH, ha, sizeof(ha));
+                StrCat2(s_bb, sizeof(s_bb), s_bb, wa);
+                StrCat2(s_bb, sizeof(s_bb), s_bb, "x");
+                StrCat2(s_bb, sizeof(s_bb), s_bb, ha);
+                StrCat2(s_bb, sizeof(s_bb), s_bb, match ? "  MATCH" : "  MISMATCH");
+            }
+            else StrCat2(s_bb, sizeof(s_bb), s_bb, "query failed");
+            DrawText(SW - LM - TW(s_bb, 1.0f), verY, s_bb, 1.0f,
+                (s_bbW == 0) ? COL_RED : (match ? COL_GREEN : COL_ORANGE));
+        }
+    }
+
+    // -- Navigation hint + auto-restore countdown --
+    if (s_modeTimeout != 0)
+    {
+        DWORD now = GetTickCount();
+        int secsLeft = (s_modeTimeout > now) ? (int)((s_modeTimeout - now) / 1000 + 1) : 0;
+        static char s_hint[64];
+        StrCopy(s_hint, sizeof(s_hint), "[B] Restore now    Auto-restore in ");
+        char sc[4]; IntToStr(secsLeft, sc, sizeof(sc));
+        StrCat2(s_hint, sizeof(s_hint), s_hint, sc);
+        StrCat2(s_hint, sizeof(s_hint), s_hint, "s...");
+        DrawText(LM, OY + OVH - 13.f, s_hint, 1.0f, COL_ORANGE);
     }
     else
     {
-        DWORD bbW = 0, bbH = 0;
-        LPDIRECT3DSURFACE8 pBB = NULL;
-        if (SUCCEEDED(g_pDevice->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &pBB)) && pBB)
-        {
-            D3DSURFACE_DESC desc;
-            if (SUCCEEDED(pBB->GetDesc(&desc))) { bbW = desc.Width; bbH = desc.Height; }
-            pBB->Release();
-        }
-        bool match = (bbW == m.width && bbH == m.height);
-        static char s_hw[48];
-        StrCopy(s_hw, sizeof(s_hw), "HW: ");
-        if (bbW > 0)
-        {
-            char wa[8], ha[8];
-            IntToStr((int)bbW, wa, sizeof(wa)); IntToStr((int)bbH, ha, sizeof(ha));
-            StrCat2(s_hw, sizeof(s_hw), s_hw, wa);
-            StrCat2(s_hw, sizeof(s_hw), s_hw, "x"); StrCat2(s_hw, sizeof(s_hw), s_hw, ha);
-            StrCat2(s_hw, sizeof(s_hw), s_hw, match ? "  OK" : "  MISMATCH");
-        }
-        else StrCat2(s_hw, sizeof(s_hw), s_hw, "query failed");
-        DrawText(SW - LM - TW(s_hw, 1.0f), OY + OVH - 26.f, s_hw, 1.0f,
-            (bbW == 0) ? COL_RED : (match ? COL_GREEN : COL_ORANGE));
+        DrawText(LM, OY + OVH - 13.f,
+            "[WHITE] Next    [BLACK] Prev    [A] Force blocked    [B] Restore & Exit",
+            1.0f, COL_YELLOW);
     }
-
-    // -- Last row: navigation hint -------------------------------------------
-    DrawText(LM, OY + OVH - 13.f,
-        "[WHITE] Next    [BLACK] Prev    [B] Restore & Exit",
-        1.05f, COL_YELLOW);
 
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
@@ -981,6 +1235,11 @@ void VideoInfo_OnEnter()
     s_prevBtns = 0;
     s_loaded = false;
     s_subState = VSS_INFO;
+    s_modeTimeout = 0;
+    s_forceMode = false;
+    s_forceAllIdx = -1;
+    s_bbW = 0; s_bbH = 0;
+    s_settleFrames = 0;
     // ---- Capture original presentation parameters for mode test restoration ----
     // Read backbuffer dimensions from D3D; infer present flags by matching
     // width+height against s_allModes[] (avoids exporting VideoMode from main.cpp).
@@ -1031,13 +1290,27 @@ void VideoInfo_OnEnter()
         }
     }
 
-    // ---- Probe AV pack now so BuildModeList has it ready when mode test opens ----
+    // ---- Probe AV pack and EEPROM video flags — both needed for BuildProbeTable ----
     s_avPackTest = 0xFF;
     {
         BYTE av = 0;
         if (SMBusRead(SMBADDR_PIC, 0x04, av))
             s_avPackTest = av & 0x07;
     }
+
+    s_eepVideoFlags = 0;
+    s_eepFlagsOK = false;
+    {
+        ULONG type = 0, len = 0;
+        if (ExQueryNonVolatileSetting(XC_VIDEO_FLAGS, &type, &s_eepVideoFlags, 4, &len) == 0)
+            s_eepFlagsOK = true;
+    }
+
+    // Build the preflight probe table now — no switching, pure policy classification
+    BuildProbeTable();
+    s_modeIdx = 0;
+    s_forceMode = false;
+    s_forceAllIdx = -1;
 }
 
 // ============================================================================
@@ -1105,11 +1378,10 @@ static void Render(const DiagLogo& logo)
 
     DrawRow(COL_L, COL_VL, y1, "GPU CLK :", d.gpuClkStr,
         COL_GREEN);                                           y1 += LH;
-    // Raw NVPLL hex — shows what the MMIO actually returned for diagnosis.
-    // Value ending in * means MMIO returned 0/invalid; default was used.
     DrawText(COL_VL, y1, d.nvpllRaw, 0.95f, COL_DIM);      y1 += LH - 4.f;
     DrawRow(COL_L, COL_VL, y1, "MEM CLK :", d.memClkStr,
         COL_CYAN);                                            y1 += LH;
+    // Raw MPLL — (est) means MPLL x2 assumed DDR; known values (200/256) shown without qualifier
     DrawText(COL_VL, y1, d.mpllRaw, 0.95f, COL_DIM);        y1 += LH - 4.f;
     DrawRow(COL_L, COL_VL, y1, "PIX CLK :", d.pixClkStr);   y1 += LH;
     DrawRow(COL_L, COL_VL, y1, "FB BASE :", d.fbBaseStr,
@@ -1212,6 +1484,20 @@ void VideoInfo_Tick(const DiagLogo& logo)
         g_pDevice->EndScene();
         g_pDevice->Present(NULL, NULL, NULL, NULL);
         LoadData();
+        // Re-sync avPackTest and detect encoder type from confirmed LoadData reads.
+        {
+            BYTE av = 0;
+            if (SMBusRead(SMBADDR_PIC, 0x04, av))
+                s_avPackTest = av & 0x07;
+        }
+        // Encoder detection — needed so mode test UI can warn about Xcalibur limits
+        {
+            BYTE pid = 0;
+            if (SMBusRead(SMBADDR_ENC_CNXT, 0x00, pid)) s_encType = ENC_CONEXANT;
+            else if (SMBusRead(SMBADDR_ENC_FOCUS, 0x00, pid)) s_encType = ENC_FOCUS;
+            else                                                s_encType = ENC_XCALIBUR;
+        }
+        BuildProbeTable();
         s_loaded = true;
         return;
     }
@@ -1235,13 +1521,31 @@ void VideoInfo_Tick(const DiagLogo& logo)
     // ---- VSS_MODE_TEST ----
     if (s_subState == VSS_MODE_TEST)
     {
+        // Auto-restore: if timeout has expired, restore 480i automatically.
+        // This recovers from black screen when the TV can't display the mode.
+        if (s_modeTimeout != 0 && GetTickCount() >= s_modeTimeout)
+        {
+            s_modeTimeout = 0;
+            s_forceMode = false;
+            s_forceAllIdx = -1;
+            // Switch back to 480i (index 0 in s_allModes)
+            s_modeIdx = 0;
+            for (int i = 0; i < s_modeCount; ++i)
+                if (s_modeList[i] == 0) { s_modeIdx = i; break; }
+            SwitchMode(s_modeList[s_modeIdx]);
+            s_prevBtns = cur;
+            DrawModeTest();
+            return;
+        }
+
         if (EdgeDown(cur, s_prevBtns, BTN_B) || EdgeDown(cur, s_prevBtns, BTN_BACK))
         {
+            s_modeTimeout = 0;
             RestoreMode();
             s_subState = VSS_INFO;
             s_loaded = false;
-            // Present one blank frame immediately after Reset so NV2A has
-            // a valid frame in the pipeline before the next Tick runs.
+            s_forceMode = false;
+            s_forceAllIdx = -1;
             g_pDevice->BeginScene();
             g_pDevice->Clear(0, NULL, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 0, 0), 1.f, 0);
             g_pDevice->EndScene();
@@ -1249,22 +1553,63 @@ void VideoInfo_Tick(const DiagLogo& logo)
             s_prevBtns = cur;
             return;
         }
+
+        // [WHITE] — next supported mode
         if (EdgeDown(cur, s_prevBtns, BTN_WHITE))
         {
-            int next = (s_modeIdx + 1) % s_modeCount;
-            if (SwitchMode(next)) s_modeIdx = next;
+            s_forceMode = false;
+            s_forceAllIdx = -1;
+            if (s_modeCount > 0)
+            {
+                s_modeIdx = (s_modeIdx + 1) % s_modeCount;
+                SwitchMode(s_modeList[s_modeIdx]);
+            }
             s_prevBtns = cur;
             DrawModeTest();
             return;
         }
+
+        // [BLACK] — previous supported mode
         if (EdgeDown(cur, s_prevBtns, BTN_BLACK))
         {
-            int prev = (s_modeIdx - 1 + s_modeCount) % s_modeCount;
-            if (SwitchMode(prev)) s_modeIdx = prev;
+            s_forceMode = false;
+            s_forceAllIdx = -1;
+            if (s_modeCount > 0)
+            {
+                s_modeIdx = (s_modeIdx - 1 + s_modeCount) % s_modeCount;
+                SwitchMode(s_modeList[s_modeIdx]);
+            }
             s_prevBtns = cur;
             DrawModeTest();
             return;
         }
+
+        // [A] — force-try next blocked mode
+        if (EdgeDown(cur, s_prevBtns, BTN_A))
+        {
+            // Find the next blocked mode after the current forced index (or from 0)
+            int startSearch = (s_forceAllIdx >= 0) ? (s_forceAllIdx + 1) % ALL_MODE_COUNT : 0;
+            int nextBlocked = -1;
+            for (int i = 0; i < ALL_MODE_COUNT; ++i)
+            {
+                int ai = (startSearch + i) % ALL_MODE_COUNT;
+                if (s_probes[ai].status != PROBE_SUPPORTED)
+                {
+                    nextBlocked = ai;
+                    break;
+                }
+            }
+            if (nextBlocked >= 0)
+            {
+                s_forceMode = true;
+                s_forceAllIdx = nextBlocked;
+                SwitchMode(nextBlocked);
+            }
+            s_prevBtns = cur;
+            DrawModeTest();
+            return;
+        }
+
         s_prevBtns = cur;
         DrawModeTest();
         return;
@@ -1291,12 +1636,15 @@ void VideoInfo_Tick(const DiagLogo& logo)
     }
     if (EdgeDown(cur, s_prevBtns, BTN_WHITE))
     {
-        // Build filtered mode list and switch to first mode on entry
-        BuildModeList();
+        // Probe table was built at OnEnter — just enter mode test and switch to first supported mode
         s_modeIdx = 0;
+        s_forceMode = false;
+        s_forceAllIdx = -1;
         s_settleFrames = 0;
+        s_bbW = 0; s_bbH = 0;
         s_subState = VSS_MODE_TEST;
-        SwitchMode(0);
+        if (s_modeCount > 0)
+            SwitchMode(s_modeList[0]);
         s_prevBtns = cur;
         return;
     }

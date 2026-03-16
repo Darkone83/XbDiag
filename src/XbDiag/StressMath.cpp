@@ -24,8 +24,8 @@
 //   Total                            166,400     139,503       ~119%
 //
 // Working set:
-//   sm_data[4096]          32KB  data buffer, fills Coppermine 32KB L1 exactly
-//   sm_sincos[512*6]       24KB  sin/cos table, L2-resident (P6 pipeline hides latency)
+//   sm_data[8192]          64KB  data buffer, overflows Coppermine 32KB L1 into L2
+//   sm_sincos[1024*6]      48KB  sin/cos table, L2-resident
 //
 // Sin/cos table layout per 48-byte block entry at [edi]:
 //   [edi+ 0]  sin2  (off2 = 0)      [edi+ 8]  cos2  (off2+8)
@@ -56,8 +56,8 @@
 #include <math.h>
 #include "StressMath.h"
 
-static const int SM_N = 4096;         // data doubles -- 32KB, fills Coppermine L1
-static const int SM_BLOCKS = SM_N / 8;     // 512 blocks per sweep
+static const int SM_N = 8192;         // data doubles -- 64KB, overflows L1 into L2
+static const int SM_BLOCKS = SM_N / 8;     // 1024 blocks per sweep
 
 static double sm_data[SM_N];               // 32KB working buffer
 static double sm_sincos[SM_BLOCKS * 6];    // 24KB sin/cos table
@@ -84,9 +84,7 @@ static void EightRealsSweep()
 
         er_loop :
 
-        fninit;; clear FPU before each block
-
-            fld     QWORD PTR[eax + 0]
+        fld     QWORD PTR[eax + 0]
             fadd    QWORD PTR[eax + 32];; new R1 = R1 + R5
             fld     QWORD PTR[eax + 0]
             fsub    QWORD PTR[eax + 32];; new R5 = R1 - R5
@@ -136,14 +134,14 @@ static void EightRealsSweep()
             fxch    st(4);; R7, R4, R6, R2, R1, R5, R8, R3
             fadd    st(6), st;; R8 = R7 + R8(final R6)
 
-            fstp    QWORD PTR[eax + 56];; ->R8
-            fstp    QWORD PTR[eax + 40];; ->R6
-            fstp    QWORD PTR[eax + 16];; ->R3
-            fstp    QWORD PTR[eax + 0];; ->R1
-            fstp    QWORD PTR[eax + 32];; ->R5
-            fstp    QWORD PTR[eax + 24];; ->R4
-            fstp    QWORD PTR[eax + 48];; ->R7
-            fstp    QWORD PTR[eax + 8];; ->R2
+            fstp    QWORD PTR[eax + 56];;->R8
+            fstp    QWORD PTR[eax + 40];;->R6
+            fstp    QWORD PTR[eax + 16];;->R3
+            fstp    QWORD PTR[eax + 0];;->R1
+            fstp    QWORD PTR[eax + 32];;->R5
+            fstp    QWORD PTR[eax + 24];;->R4
+            fstp    QWORD PTR[eax + 48];;->R7
+            fstp    QWORD PTR[eax + 8];;->R2
 
             lea     eax, [eax + 64]
             cmp     eax, ecx
@@ -172,9 +170,7 @@ static void FourComplexSweep()
 
         fc_loop :
 
-        fninit;; clear FPU before each block
-
-            fld     QWORD PTR[eax + 16]
+        fld     QWORD PTR[eax + 16]
             fmul    QWORD PTR[edi + 24];; A3 = R3 * cos3
             fld     QWORD PTR[eax + 48]
             fmul    QWORD PTR[edi + 24];; B3 = I3 * cos3
@@ -537,9 +533,7 @@ static void FourComplexUnfftSweep()
 
         fcu_loop :
 
-        fninit;; clear FPU before each block
-
-            fld     QWORD PTR[eax + 0]
+        fld     QWORD PTR[eax + 0]
             fsub    QWORD PTR[eax + 16];; R1 - R3 = new R2
             fld     QWORD PTR[eax + 8]
             fadd    QWORD PTR[eax + 24];; I1 + R4 = new I1
@@ -648,6 +642,213 @@ static void Reseed()
 
 
 // =============================================================================
+// SSE capability flag — set in StressMath_Init via live execution probe.
+// =============================================================================
+static bool sm_sseOK = false;
+
+
+// =============================================================================
+// SSESweep
+//
+// Hammers all 8 SSE1 XMM registers with packed single-precision MULPS/ADDPS.
+// On the Coppermine PIII the SSE execution unit is independent from the x87
+// FPU — running SSESweep between x87 passes keeps both units loaded.
+//
+// Working set: sm_sse[8192] = 32KB floats — matches x87 buffer footprint,
+// fits Coppermine L1. Values seeded in [0.5, 1.5] to avoid denormals.
+// xmm0-xmm3 = accumulators, xmm4-xmm7 = constants. 2048 iterations × 64 bytes.
+// =============================================================================
+
+static const int SM_SSE_N = (32 * 1024) / sizeof(float);  // 8192 floats = 32KB
+static __declspec(align(16)) float sm_sse[SM_SSE_N];
+
+static void SSESweep()
+{
+    float* end_ptr = sm_sse + SM_SSE_N;
+    __asm
+    {
+        lea     eax, sm_sse
+        mov     ecx, end_ptr
+
+        // Load xmm4..xmm7 with multiply constants from first 64 bytes
+        // movaps xmm4, [eax]
+        _emit 0x0F
+        _emit 0x28
+        _emit 0x20
+        // movaps xmm5, [eax+16]
+        _emit 0x0F
+        _emit 0x28
+        _emit 0x68
+        _emit 0x10
+        // movaps xmm6, [eax+32]
+        _emit 0x0F
+        _emit 0x28
+        _emit 0x70
+        _emit 0x20
+        // movaps xmm7, [eax+48]
+        _emit 0x0F
+        _emit 0x28
+        _emit 0x78
+        _emit 0x30
+
+        sse_loop:
+        // movaps xmm0, [eax]
+        _emit 0x0F
+            _emit 0x28
+            _emit 0x00
+            // movaps xmm1, [eax+16]
+            _emit 0x0F
+            _emit 0x28
+            _emit 0x48
+            _emit 0x10
+            // movaps xmm2, [eax+32]
+            _emit 0x0F
+            _emit 0x28
+            _emit 0x50
+            _emit 0x20
+            // movaps xmm3, [eax+48]
+            _emit 0x0F
+            _emit 0x28
+            _emit 0x58
+            _emit 0x30
+
+            // mulps xmm0, xmm4
+            _emit 0x0F
+            _emit 0x59
+            _emit 0xC4
+            // mulps xmm1, xmm5
+            _emit 0x0F
+            _emit 0x59
+            _emit 0xCD
+            // mulps xmm2, xmm6
+            _emit 0x0F
+            _emit 0x59
+            _emit 0xD6
+            // mulps xmm3, xmm7
+            _emit 0x0F
+            _emit 0x59
+            _emit 0xDF
+
+            // addps xmm0, xmm1
+            _emit 0x0F
+            _emit 0x58
+            _emit 0xC1
+            // addps xmm2, xmm3
+            _emit 0x0F
+            _emit 0x58
+            _emit 0xD3
+            // addps xmm0, xmm2
+            _emit 0x0F
+            _emit 0x58
+            _emit 0xC2
+
+            // movaps [eax], xmm0
+            _emit 0x0F
+            _emit 0x29
+            _emit 0x00
+            // movaps [eax+16], xmm1
+            _emit 0x0F
+            _emit 0x29
+            _emit 0x48
+            _emit 0x10
+            // movaps [eax+32], xmm2
+            _emit 0x0F
+            _emit 0x29
+            _emit 0x50
+            _emit 0x20
+            // movaps [eax+48], xmm3
+            _emit 0x0F
+            _emit 0x29
+            _emit 0x58
+            _emit 0x30
+
+            add     eax, 64
+            cmp     eax, ecx
+            jb      sse_loop
+    }
+}
+
+
+// =============================================================================
+// MemFlood_Timed
+//
+// Rotates through three memory access patterns until deadline to maximise
+// pressure on the FSB, MCPX northbridge, and DRAM controller:
+//
+//   1. Sequential write+read — maximum sustained bandwidth, saturates FSB
+//   2. Strided read (stride=256 bytes = 4 cache lines) — defeats hardware
+//      prefetcher, forces individual cache-line fetches from DRAM
+//   3. Dual-stream copy — simultaneous read from first half, write to second
+//      half of the buffer, stresses the memory controller's read/write
+//      arbitration and both DRAM banks simultaneously
+//
+// Buffer is 2MB (2× previous) to ensure we stay well outside L2 on every pass.
+// =============================================================================
+
+static const int SM_MEM_N = (2 * 1024 * 1024) / (int)sizeof(DWORD); // 512K DWORDs = 2MB
+static const int SM_MEM_HALF = SM_MEM_N / 2;
+static const int SM_MEM_STRIDE = 64 / sizeof(DWORD); // 64-byte stride = skip every cache line
+static DWORD sm_membuf[SM_MEM_N];
+
+void MemFlood_Timed(DWORD deadline)
+{
+    DWORD pattern = sm_sink ^ 0xA5A5A5A5UL;
+    int phase = 0;
+
+    while (GetTickCount() < deadline)
+    {
+        switch (phase & 3)
+        {
+        case 0:
+        {
+            // Sequential write — fills entire 2MB buffer
+            for (int i = 0; i < SM_MEM_N; ++i)
+                sm_membuf[i] = pattern + (DWORD)i;
+            break;
+        }
+        case 1:
+        {
+            // Sequential read — reads entire 2MB buffer back
+            DWORD acc = 0;
+            for (int i = 0; i < SM_MEM_N; ++i)
+                acc ^= sm_membuf[i];
+            sm_sink ^= acc;
+            break;
+        }
+        case 2:
+        {
+            // Strided read — stride of 16 DWORDs (64 bytes = 1 cache line skip)
+            // Defeats the hardware prefetcher, forces individual DRAM fetches
+            DWORD acc = 0;
+            for (int i = 0; i < SM_MEM_N; i += SM_MEM_STRIDE)
+                acc ^= sm_membuf[i];
+            // Second pass with offset to hit the missed lines
+            for (int i = SM_MEM_STRIDE / 2; i < SM_MEM_N; i += SM_MEM_STRIDE)
+                acc ^= sm_membuf[i];
+            sm_sink ^= acc;
+            break;
+        }
+        case 3:
+        {
+            // Dual-stream copy — simultaneous read from lower half, write to upper half
+            // Loads both read and write paths of the memory controller at once
+            DWORD* src = sm_membuf;
+            DWORD* dst = sm_membuf + SM_MEM_HALF;
+            for (int i = 0; i < SM_MEM_HALF; ++i)
+                dst[i] = src[i] ^ pattern;
+            break;
+        }
+        }
+
+        ++phase;
+        pattern = (pattern * 1664525UL) + 1013904223UL;
+    }
+
+    sm_sink ^= pattern;
+}
+
+
+// =============================================================================
 // StressMath_Init
 //
 // Sets sm_sqrthalf, builds the sin/cos table, seeds sm_data.
@@ -656,6 +857,45 @@ static void Reseed()
 
 void StressMath_Init()
 {
+    // ---- SSE1 live execution probe ------------------------------------------
+    // Write 2.0f×4, MULPS self (2×2=4), read back — verify all lanes == 4.0f.
+    // Also ensures CR4.OSFXSR is set so XMM registers are OS-enabled.
+    sm_sseOK = false;
+    {
+        DWORD cpuidEDX = 0;
+        __asm { mov eax, 1  __asm cpuid  __asm mov cpuidEDX, edx }
+        if (cpuidEDX & (1 << 25))
+        {
+            __asm
+            {
+                _emit 0x0F  // mov eax, cr4
+                _emit 0x20
+                _emit 0xE0
+                or eax, 0x600
+                _emit 0x0F  // mov cr4, eax
+                _emit 0x22
+                _emit 0xE0
+            }
+            static __declspec(align(16)) float probe[4];
+            probe[0] = probe[1] = probe[2] = probe[3] = 2.0f;
+            __asm
+            {
+                lea     eax, probe
+                _emit 0x0F
+                _emit 0x28
+                _emit 0x00
+                _emit 0x0F
+                _emit 0x59
+                _emit 0xC0
+                _emit 0x0F
+                _emit 0x29
+                _emit 0x00
+            }
+            sm_sseOK = (probe[0] == 4.0f && probe[1] == 4.0f
+                && probe[2] == 4.0f && probe[3] == 4.0f);
+        }
+    }
+
     sm_sqrthalf = sqrt(0.5);
 
     {
@@ -682,6 +922,81 @@ void StressMath_Init()
         }
         sm_sink = lcg;
     }
+
+    // Seed SSE float buffer — values in [0.5, 1.5] to avoid denormals
+    if (sm_sseOK)
+    {
+        DWORD lcg = sm_sink;
+        for (int i = 0; i < SM_SSE_N; ++i)
+        {
+            lcg = lcg * 1664525UL + 1013904223UL;
+            sm_sse[i] = 0.5f + (float)(lcg >> 1) * (1.0f / (float)0x80000000UL);
+        }
+        sm_sink = lcg;
+    }
+}
+
+
+// =============================================================================
+// IntegerStress
+//
+// Hammers the integer execution units — specifically the multiplier (IMUL),
+// ALU (ADD/XOR/SHL), and AGU — which are completely idle during FPU/SSE passes.
+// On the Coppermine the integer and FP units share the same power plane;
+// running both simultaneously maximises die-level power draw.
+//
+// Kernel: 256 iterations of a dependent IMUL chain (forces full multiplier
+// latency — 4 cycles on P6) followed by XOR/SHL chains to load the ALU.
+// Dependent chain prevents out-of-order execution from hiding latency,
+// maximising the number of active execution units per cycle.
+// =============================================================================
+
+static void IntegerStress()
+{
+    __asm
+    {
+        // eax = running product (dependent IMUL chain, can't be parallelised)
+        // ebx = running XOR accumulator
+        // ecx = loop counter
+        // edx = shift/add chain
+
+        mov     eax, 0x12345678
+        mov     ebx, 0xABCDEF01
+        mov     edx, 0x87654321
+        mov     ecx, 256
+
+        int_loop:
+
+        // Dependent IMUL chain — 4 cycle latency each, forces serialisation
+        imul    eax, eax, 0x08088405
+            imul    eax, eax, 0x6C078965
+            imul    eax, eax, 0x08088405
+            imul    eax, eax, 0x6C078965
+
+            // XOR/shift chain on ebx — loads ALU integer units
+            xor ebx, eax
+            shl     ebx, 3
+            xor ebx, edx
+            shr     ebx, 5
+            xor ebx, eax
+
+            // ADD chain on edx — more ALU pressure
+            add     edx, eax
+            add     edx, ebx
+            xor edx, 0x5A5A5A5A
+            add     edx, eax
+
+            // Another IMUL pair — keeps multiplier hot through the ALU work
+            imul    eax, eax, 0x08088405
+            imul    eax, eax, 0x6C078965
+
+            dec     ecx
+            jnz     int_loop
+
+            // Anti-elision: store result so compiler can't optimise away
+            mov     sm_sink, eax
+            xor sm_sink, ebx
+    }
 }
 
 
@@ -689,36 +1004,44 @@ void StressMath_Init()
 // CPUStress
 //
 // Burn CPU until GetTickCount() >= deadline.
-// Cycle mirrors Prime95 gwsquare pass order:
-//   EightRealsSweep     forward FFT, first pass
-//   FourComplexSweep    forward FFT, middle passes
-//   FourComplexSquare   pointwise squaring (combined forward/square/inverse)
-//   FourComplexUnfft    inverse FFT
-// Every RESEED_CYCLES cycles, reseed sm_data via LCG to prevent value drift.
+// Inner loop runs 8 full cycles before checking the deadline.
+// Each cycle: x87 FFT passes + SSE1 packed float + integer multiply/ALU.
+// All three execution domains (FPU, XMM, integer) loaded simultaneously.
 // =============================================================================
+
+static const int INNER_CYCLES = 8;
 
 void CPUStress(DWORD deadline)
 {
     int cycle = 0;
     while (GetTickCount() < deadline)
     {
-        EightRealsSweep();
-        FourComplexSweep();
-        FourComplexSquareSweep();
-        FourComplexUnfftSweep();
-
-        // Anti-elision: 8 samples spread evenly across 32KB buffer.
-        // SM_N=4096 doubles = 8192 DWORDs; stride = 1024 DWORDs = 8KB.
+        for (int inner = 0; inner < INNER_CYCLES; ++inner)
         {
-            volatile DWORD* raw = (volatile DWORD*)sm_data;
-            sm_sink ^= raw[0] ^ raw[1024] ^ raw[2048] ^ raw[3072]
-                ^ raw[4096] ^ raw[5120] ^ raw[6144] ^ raw[7168];
-        }
+            EightRealsSweep();
+            IntegerStress();
+            FourComplexSweep();
+            if (sm_sseOK) SSESweep();
+            FourComplexSquareSweep();
+            IntegerStress();
+            if (sm_sseOK) SSESweep();
+            FourComplexUnfftSweep();
+            IntegerStress();
 
-        if (++cycle >= RESEED_CYCLES)
-        {
-            Reseed();
-            cycle = 0;
+            // Anti-elision: 8 samples spread across 64KB buffer
+            {
+                volatile DWORD* raw = (volatile DWORD*)sm_data;
+                sm_sink ^= raw[0] ^ raw[2048] ^ raw[4096] ^ raw[6144]
+                    ^ raw[8192] ^ raw[10240] ^ raw[12288] ^ raw[14336];
+            }
+
+            if (++cycle >= RESEED_CYCLES)
+            {
+                Reseed();
+                cycle = 0;
+            }
         }
     }
 }
+
+bool StressMath_SSEEnabled() { return sm_sseOK; }

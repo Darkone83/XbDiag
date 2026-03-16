@@ -25,7 +25,7 @@ void InitInput()
 {
     XInitDevices(0, 0);
     memset(g_padHandles, 0, sizeof(g_padHandles));
-    memset(g_padLastPacket, 0, sizeof(g_padLastPacket));
+    memset(g_padLastPacket, 0xFF, sizeof(g_padLastPacket)); // 0xFFFFFFFF: ensures first real packet always processes
     memset(g_padStates, 0, sizeof(g_padStates));
     memset(g_padButtons, 0, sizeof(g_padButtons));
     memset(g_muPresent, 0, sizeof(g_muPresent));
@@ -52,7 +52,7 @@ void PumpInput()
                 {
                     g_padHandles[i] = XInputOpen(
                         XDEVICE_TYPE_GAMEPAD, i, XDEVICE_NO_SLOT, NULL);
-                    g_padLastPacket[i] = 0;
+                    g_padLastPacket[i] = 0xFFFFFFFF; // ensures first packet always processes
                 }
             }
             if (rem & 1)
@@ -65,7 +65,7 @@ void PumpInput()
                 // Zero state so GetSticks/GetTriggers don't return stale values
                 ZeroMemory(&g_padStates[i], sizeof(g_padStates[i]));
                 g_padButtons[i] = 0;
-                g_padLastPacket[i] = 0;
+                g_padLastPacket[i] = 0xFFFFFFFF; // ensures first packet after reconnect is always processed
                 // Reset rumble tracking so stop packet fires on reconnect
                 s_rumbleLeft = 0xFFFF;
                 s_rumbleRight = 0xFFFF;
@@ -115,29 +115,36 @@ void PumpInput()
                 g_padLastPacket[i] = st.dwPacketNumber;
                 g_padStates[i] = st;
 
-                // Begin with native digital bits:
-                //  D-Pad / Start / Back / thumb clicks
-                WORD mask = st.Gamepad.wButtons;
+                // Standard digital bits — upper byte of wButtons is RESERVED on genuine
+                // OG Xbox hardware and must be zero.  Third-party controllers (Retrofighter
+                // and others) sometimes set upper wButtons bits for their own purposes, which
+                // would collide exactly with the BTN_* synthetic constants (0x0100-0x8000).
+                // Mask to the known-valid 8 bits only: d-pad, Start, Back, thumb clicks.
+                WORD raw_w = st.Gamepad.wButtons;
+                WORD mask = raw_w & 0x00FF;
 
-                // Analog A/B/X/Y buttons -> convert to digital
+                // Analog buttons — face buttons, triggers, Black/White.
+                // Standard controllers (Duke, S) use bAnalogButtons[0-7], values 0-255.
+                // Digital-only controllers (Retrofighter) report 0 or 255 with no analog
+                // ramp.  The threshold of ANALOG_THRESHOLD handles both correctly.
+                //
+                // Belt-and-suspenders: also accept the corresponding wButtons high bits
+                // (0x1000-0x8000 for A/B/X/Y, 0x0100-0x0800 for Black/White/triggers).
+                // Some Retrofighter firmware versions put face buttons in wButtons rather
+                // than — or in addition to — bAnalogButtons.  Checking both paths means
+                // the controller works regardless of which reporting method it uses.
+                // These bits are safe to accept here because the & 0x00FF mask above has
+                // already excluded them from the base mask.
                 const BYTE* a = st.Gamepad.bAnalogButtons;
 
-                if (a[XINPUT_GAMEPAD_A] > ANALOG_THRESHOLD)
-                    mask |= BTN_A;
-                if (a[XINPUT_GAMEPAD_B] > ANALOG_THRESHOLD)
-                    mask |= BTN_B;
-                if (a[XINPUT_GAMEPAD_X] > ANALOG_THRESHOLD)
-                    mask |= BTN_X;
-                if (a[XINPUT_GAMEPAD_Y] > ANALOG_THRESHOLD)
-                    mask |= BTN_Y;
-                if (a[XINPUT_GAMEPAD_BLACK] > ANALOG_THRESHOLD)
-                    mask |= BTN_BLACK;
-                if (a[XINPUT_GAMEPAD_WHITE] > ANALOG_THRESHOLD)
-                    mask |= BTN_WHITE;
-                if (a[XINPUT_GAMEPAD_LEFT_TRIGGER] > ANALOG_THRESHOLD)
-                    mask |= BTN_LTRIG;
-                if (a[XINPUT_GAMEPAD_RIGHT_TRIGGER] > ANALOG_THRESHOLD)
-                    mask |= BTN_RTRIG;
+                if (a[XINPUT_GAMEPAD_A] > ANALOG_THRESHOLD || (raw_w & 0x1000)) mask |= BTN_A;
+                if (a[XINPUT_GAMEPAD_B] > ANALOG_THRESHOLD || (raw_w & 0x2000)) mask |= BTN_B;
+                if (a[XINPUT_GAMEPAD_X] > ANALOG_THRESHOLD || (raw_w & 0x4000)) mask |= BTN_X;
+                if (a[XINPUT_GAMEPAD_Y] > ANALOG_THRESHOLD || (raw_w & 0x8000)) mask |= BTN_Y;
+                if (a[XINPUT_GAMEPAD_BLACK] > ANALOG_THRESHOLD || (raw_w & 0x0100)) mask |= BTN_BLACK;
+                if (a[XINPUT_GAMEPAD_WHITE] > ANALOG_THRESHOLD || (raw_w & 0x0200)) mask |= BTN_WHITE;
+                if (a[XINPUT_GAMEPAD_LEFT_TRIGGER] > ANALOG_THRESHOLD || (raw_w & 0x0400)) mask |= BTN_LTRIG;
+                if (a[XINPUT_GAMEPAD_RIGHT_TRIGGER] > ANALOG_THRESHOLD || (raw_w & 0x0800)) mask |= BTN_RTRIG;
 
                 g_padButtons[i] = mask;
             }

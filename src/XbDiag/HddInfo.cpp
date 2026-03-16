@@ -10,8 +10,8 @@
 //  DRIVE (ATA IDENTIFY)              SECURITY (EEPROM SMBus 0x54)
 //  Model                             Serial No   (12 ASCII digits)
 //  Serial                            Region      (NTSC-M/J, PAL)
-//  Firmware rev                      HDD Key     (16 bytes hex)
-//  Capacity                          XBE Region  (4 bytes hex)
+//  Firmware rev                      HDD Key     (16 bytes hex, decrypted)
+//  Capacity                          XBE Region  (4 bytes hex, decrypted)
 //  Interface (UDMA mode)             Online Key  (16 bytes hex)
 //  Buffer size
 //  LBA28 / LBA48 sectors
@@ -19,29 +19,43 @@
 //
 //  [BOT BAR]  [A] Export    [Right] SMART    [RT] Bench    [B] Back
 //
+// UDMA detection:
+//   Word 53 bit 2 = validity gate for word 88 (ATA spec).
+//   Xbox MCPX programs DMA timing in PCI registers without SET FEATURES —
+//   active bits (word 88 bits 14:8) are usually zero even when UDMA is
+//   running. When word 53 bit 2 is set and supported bits are non-zero,
+//   highest supported mode is reported cleanly (no marker).
+//   '?' = word 53 bit 2 clear, word 88 not spec-guaranteed.
+//
+// EEPROM / HDD Key:
+//   ExQueryNonVolatileSetting(0xFFFF) returns raw physical EEPROM bytes.
+//   Security section (0x14-0x2F, 28 bytes) is RC4-encrypted on the chip.
+//   EepromDecryptSecurity() implements the Xbox custom two-pass SHA1 + RC4
+//   decryption (ref: XboxEepromEditor HmacSha1.cs / RC4.cs) and tries all
+//   four hardware versions (Debug / RetailFirst 1.0 / RetailMiddle 1.1-1.4 /
+//   RetailLast 1.6), verifying via HMAC re-hash before accepting.
+//   Factory/user sections (0x30+, serial/MAC/online key) are plaintext.
+//
 // ATA IDENTIFY (port 0x1F0, primary channel, master):
 //   Word 10-19  = serial number (byte-swapped ASCII)
 //   Word 23-26  = firmware revision (byte-swapped ASCII)
 //   Word 27-46  = model string (byte-swapped ASCII)
-//   Word 47     = max sectors per R/W multiple
 //   Word 49     = capabilities (LBA support bit 9)
-//   Word 54-58  = current CHS geometry
+//   Word 53     = validity flags (bit 2 = word 88 valid)
 //   Word 60-61  = LBA28 addressable sectors
 //   Word 63     = multiword DMA modes
 //   Word 80     = ATA standard version
 //   Word 83     = LBA48 support (bit 10)
-//   Word 85-87  = enabled features
-//   Word 88     = UDMA modes (bits 0-5 supported, bits 8-13 active)
+//   Word 88     = UDMA modes (bits 6:0 supported, bits 14:8 active)
 //   Word 100-103= LBA48 addressable sectors (64-bit)
 //   Word 128    = security status register
-//   Word 168    = nominal media rotation rate (0x0001 = SSD)
-//   Word 217    = nominal media rotation rate (newer standard)
+//   Word 217    = nominal media rotation rate (0x0001 = SSD)
 //
 // EEPROM layout (SMBus 0x54, 93LC56 256-byte):
 //   0x00-0x13   HMAC SHA1 hash       (20 bytes)
-//   0x14-0x1B   Confounder           (8 bytes)
-//   0x1C-0x2B   HDD key              (16 bytes)
-//   0x2C-0x2F   XBE region code      (4 bytes)
+//   0x14-0x1B   Confounder           (8 bytes)   [RC4-encrypted]
+//   0x1C-0x2B   HDD key              (16 bytes)  [RC4-encrypted]
+//   0x2C-0x2F   XBE region code      (4 bytes)   [RC4-encrypted]
 //   0x30-0x33   Checksum2            (4 bytes)
 //   0x34-0x3F   Serial number        (12 bytes ASCII)
 //   0x40-0x45   MAC address          (6 bytes)
@@ -133,6 +147,7 @@ struct HddData
 
     // EEPROM security data
     bool  eepromOK;
+    bool  eepromDecrypted;    // true = security section was successfully RC4-decrypted
     BYTE  hddKey[16];
     BYTE  xbeRegion[4];
     BYTE  onlineKey[16];
@@ -543,6 +558,223 @@ static void AtaStr(const WORD* words, int nWords, char* out, int outLen)
 }
 
 // ============================================================================
+// Xbox EEPROM Security Section Decryption
+// ============================================================================
+//
+// ExQueryNonVolatileSetting(0xFFFF) returns raw physical EEPROM bytes.
+// The security section (bytes 0x14–0x2F, 28 bytes) is RC4-encrypted on the
+// chip. Factory/user sections (0x30+) are plaintext — so serial, MAC, online
+// key are fine to read directly; HDD key, confounder, and region are not.
+//
+// Decryption algorithm (from XboxEepromEditor HmacSha1.cs / RC4.cs):
+//   1. SecurityHash   = eep[0x00..0x13]  (20 bytes)
+//   2. EncryptedBlock = eep[0x14..0x2F]  (28 bytes: confounder + hddkey + region)
+//   3. For each EepromVersion (RetailFirst/Middle/Last/Debug):
+//      a. rc4Key  = XboxHmac(version, SecurityHash)          → 20 bytes
+//      b. plaintext = RC4(rc4Key, EncryptedBlock)             → 28 bytes
+//      c. verify  = XboxHmac(version, plaintext) == SecurityHash
+//      d. if verified: plaintext[8..23] = HDD key, done
+//
+// XboxHmac is a two-pass custom SHA1 variant:
+//   - Uses right-rotation instead of left-rotation
+//   - Pre-seeded intermediate hash state (per hardware version)
+//   - Inner length counter pre-set to 512 bits
+//
+// IV constants sourced from XboxEepromEditor/Cryptography/HmacSha1.cs
+// ============================================================================
+
+// ---- Custom SHA1 ----
+
+// SHA1 requires left rotation (ROTL).
+static DWORD Rotl32(DWORD x, int n)
+{
+    return (x << n) | (x >> (32 - n));
+}
+
+struct XSha1
+{
+    DWORD H[5];
+    BYTE  B[64];
+    DWORD bi;
+    DWORD bitLen;
+};
+
+static void XSha1ProcessBlock(XSha1& s)
+{
+    static const DWORD k[4] = { 0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xCA62C1D6 };
+    DWORD w[80];
+    for (int i = 0; i < 16; ++i)
+    {
+        w[i] = (DWORD)s.B[i * 4] << 24;
+        w[i] |= (DWORD)s.B[i * 4 + 1] << 16;
+        w[i] |= (DWORD)s.B[i * 4 + 2] << 8;
+        w[i] |= s.B[i * 4 + 3];
+    }
+    for (int i = 16; i < 80; ++i)
+        w[i] = Rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+
+    DWORD a = s.H[0], b = s.H[1], c = s.H[2], d = s.H[3], e = s.H[4];
+    for (int i = 0; i < 80; ++i)
+    {
+        DWORD f;
+        switch (i / 20)
+        {
+        case 0: f = (b & c) | ((~b) & d);              break;
+        case 1: f = b ^ c ^ d;                          break;
+        case 2: f = (b & c) | (b & d) | (c & d);       break;
+        default:f = b ^ c ^ d;                          break;
+        }
+        DWORD tmp = Rotl32(a, 5) + f + e + w[i] + k[i / 20];
+        e = d; d = c; c = Rotl32(b, 30); b = a; a = tmp;
+    }
+    s.H[0] += a; s.H[1] += b; s.H[2] += c; s.H[3] += d; s.H[4] += e;
+    s.bi = 0;
+}
+
+static void XSha1Update(XSha1& s, const BYTE* data, int len)
+{
+    for (int i = 0; i < len; ++i)
+    {
+        s.B[s.bi++] = data[i];
+        s.bitLen += 8;
+        if (s.bi == 64) XSha1ProcessBlock(s);
+    }
+}
+
+static void XSha1Final(XSha1& s, BYTE out[20])
+{
+    // Pad
+    if (s.bi > 55)
+    {
+        s.B[s.bi++] = 0x80;
+        while (s.bi < 64) s.B[s.bi++] = 0;
+        XSha1ProcessBlock(s);
+        while (s.bi < 56) s.B[s.bi++] = 0;
+    }
+    else
+    {
+        s.B[s.bi++] = 0x80;
+        while (s.bi < 56) s.B[s.bi++] = 0;
+    }
+    // Length in bits, big-endian 64-bit (upper 32 always 0 for our input sizes)
+    s.B[56] = 0; s.B[57] = 0; s.B[58] = 0; s.B[59] = 0;
+    s.B[60] = (BYTE)(s.bitLen >> 24);
+    s.B[61] = (BYTE)(s.bitLen >> 16);
+    s.B[62] = (BYTE)(s.bitLen >> 8);
+    s.B[63] = (BYTE)(s.bitLen);
+    XSha1ProcessBlock(s);
+
+    for (int i = 0; i < 20; ++i)
+        out[i] = (BYTE)(s.H[i >> 2] >> (8 * (3 - (i & 3))));
+}
+
+// Xbox custom HMAC: two-pass with pre-seeded state per hardware version.
+// version: 0=Debug 1=RetailFirst(1.0) 2=RetailMiddle(1.1-1.4) 3=RetailLast(1.6)
+static void XboxHmac(int version, const BYTE* data, int dataLen, BYTE out[20])
+{
+    // Pre-seeded IV pairs (isFirst, isSecond) from HmacSha1.cs
+    static const DWORD ivs[4][2][5] = {
+        { // Debug
+            { 0x85F9E51A, 0xE04613D2, 0x6D86A50C, 0x77C32E3C, 0x4BD717A4 },
+            { 0x5D7A9C6B, 0xE1922BEB, 0xB82CCDBC, 0x3137AB34, 0x486B52B3 }
+        },
+        { // RetailFirst (1.0)
+            { 0x72127625, 0x336472B9, 0xBE609BEA, 0xF55E226B, 0x99958DAC },
+            { 0x76441D41, 0x4DE82659, 0x2E8EF85E, 0xB256FACA, 0xC4FE2DE8 }
+        },
+        { // RetailMiddle (1.1-1.4)
+            { 0x39B06E79, 0xC9BD25E8, 0xDBC6B498, 0x40B4389D, 0x86BBD7ED },
+            { 0x9B49BED3, 0x84B430FC, 0x6B8749CD, 0xEBFE5FE5, 0xD96E7393 }
+        },
+        { // RetailLast (1.6)
+            { 0x8058763A, 0xF97D4E0E, 0x865A9762, 0x8A3D920D, 0x08995B2C },
+            { 0x01075307, 0xA2F1E037, 0x1186EEEA, 0x88DA9992, 0x168A5609 }
+        }
+    };
+
+    XSha1 s;
+
+    // Pass 1: inner hash
+    for (int j = 0; j < 5; ++j) s.H[j] = ivs[version][0][j];
+    s.bi = 0; s.bitLen = 512;
+    XSha1Update(s, data, dataLen);
+    BYTE mid[20];
+    XSha1Final(s, mid);
+
+    // Pass 2: outer hash
+    for (int j = 0; j < 5; ++j) s.H[j] = ivs[version][1][j];
+    s.bi = 0; s.bitLen = 512;
+    XSha1Update(s, mid, 20);
+    XSha1Final(s, out);
+}
+
+// ---- RC4 ----
+
+struct RC4Ctx { BYTE S[256]; int x, y; };
+
+static void RC4Init(RC4Ctx& ctx, const BYTE* key, int keyLen)
+{
+    ctx.x = 0; ctx.y = 0;
+    for (int i = 0; i < 256; ++i) ctx.S[i] = (BYTE)i;
+    int j = 0;
+    for (int i = 0; i < 256; ++i)
+    {
+        j = (key[i % keyLen] + ctx.S[i] + j) & 0xFF;
+        BYTE t = ctx.S[i]; ctx.S[i] = ctx.S[j]; ctx.S[j] = t;
+    }
+}
+
+static void RC4Crypt(RC4Ctx& ctx, BYTE* data, int len)
+{
+    for (int i = 0; i < len; ++i)
+    {
+        ctx.x = (ctx.x + 1) & 0xFF;
+        ctx.y = (ctx.S[ctx.x] + ctx.y) & 0xFF;
+        BYTE t = ctx.S[ctx.x]; ctx.S[ctx.x] = ctx.S[ctx.y]; ctx.S[ctx.y] = t;
+        data[i] ^= ctx.S[(ctx.S[ctx.x] + ctx.S[ctx.y]) & 0xFF];
+    }
+}
+
+// Attempt to decrypt the 28-byte security section of a raw EEPROM buffer.
+// Returns true if any version matched (verified by re-hashing).
+// On success, buf[0x14..0x2F] is overwritten with plaintext.
+static bool EepromDecryptSecurity(BYTE* buf)
+{
+    const BYTE* secHash = buf + 0x00;   // 20-byte SecurityHash at offset 0
+    BYTE  encBlock[28];
+    for (int i = 0; i < 28; ++i) encBlock[i] = buf[0x14 + i];
+
+    for (int v = 0; v < 4; ++v)
+    {
+        // Derive RC4 key
+        BYTE rc4Key[20];
+        XboxHmac(v, secHash, 20, rc4Key);
+
+        // Decrypt a copy of the 28-byte block
+        BYTE plain[28];
+        for (int i = 0; i < 28; ++i) plain[i] = encBlock[i];
+        RC4Ctx rc4;
+        RC4Init(rc4, rc4Key, 20);
+        RC4Crypt(rc4, plain, 28);
+
+        // Verify: XboxHmac(version, plaintext) should equal SecurityHash
+        BYTE verify[20];
+        XboxHmac(v, plain, 28, verify);
+        bool match = true;
+        for (int i = 0; i < 20; ++i)
+            if (verify[i] != secHash[i]) { match = false; break; }
+
+        if (match)
+        {
+            // Write decrypted plaintext back into the buffer
+            for (int i = 0; i < 28; ++i) buf[0x14 + i] = plain[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
 // Data loading
 // ============================================================================
 
@@ -597,48 +829,68 @@ static void LoadData()
         }
         else StrCopy(d.lba48sectors, sizeof(d.lba48sectors), "N/A");
 
-        // UDMA mode (word 88: bits [13:8] = active, bits [5:0] = supported)
-        // Active bits are set by the host controller after negotiation.
-        // At first IDENTIFY they may be 0 even if the BIOS has programmed
-        // UDMA — fall back to highest supported bit in that case.
-        BYTE udmaActive = (BYTE)(w[88] >> 8) & 0x7F;
-        BYTE udmaSupported = (BYTE)(w[88]) & 0x7F;
-        int  udmaA = -1, udmaS = -1;
-        for (int i = 6; i >= 0; --i)
+        // UDMA detection (ATA/ATAPI-7 T13 spec):
+        //   Word 53 bit 2: validity gate for word 88.
+        //   Word 88 bits 6:0  = supported UDMA modes.
+        //   Word 88 bits 14:8 = active UDMA modes.
+        //
+        // Xbox MCPX programs DMA timing in its own PCI registers without issuing
+        // software SET FEATURES — active bits (14:8) are usually zero on cold boot
+        // even though UDMA IS running.  Treat zero-active / non-zero-supported (with
+        // word 53 bit 2 set) as "MCPX-configured UDMA" — report cleanly, no marker.
+        // '?' = word 53 bit 2 clear, word 88 validity not guaranteed by ATA spec.
         {
-            if (udmaA < 0 && (udmaActive & (1 << i))) udmaA = i;
-            if (udmaS < 0 && (udmaSupported & (1 << i))) udmaS = i;
-        }
-        if (udmaA >= 0)
-        {
-            // Host confirmed active mode
-            StrCopy(d.udmaMode, sizeof(d.udmaMode), "UDMA");
-            IntToStr(udmaA, t, sizeof(t));
-            StrCat2(d.udmaMode, sizeof(d.udmaMode), d.udmaMode, t);
-        }
-        else if (udmaS >= 0)
-        {
-            // Controller hasn't written active bit yet — show supported max
-            StrCopy(d.udmaMode, sizeof(d.udmaMode), "UDMA");
-            IntToStr(udmaS, t, sizeof(t));
-            StrCat2(d.udmaMode, sizeof(d.udmaMode), d.udmaMode, t);
-            StrCat2(d.udmaMode, sizeof(d.udmaMode), d.udmaMode, "*");
-        }
-        else
-        {
-            // No UDMA — check MWDMA (word 63 high=active, low=supported)
-            BYTE mwA = (BYTE)(w[63] >> 8) & 0x07;
-            BYTE mwS = (BYTE)(w[63]) & 0x07;
-            int  mwMode = -1;
-            for (int i = 2; i >= 0; --i)
-                if ((mwA & (1 << i)) || (mwS & (1 << i))) { mwMode = i; break; }
-            if (mwMode >= 0)
+            bool w88valid = !!(w[53] & (1 << 2));
+            BYTE active = (BYTE)(w[88] >> 8) & 0x7F;
+            BYTE supported = (BYTE)(w[88] & 0xFF) & 0x7F;
+            int  mode = -1;
+            bool needMark = false;
+
+            if (w88valid && (active || supported))
             {
-                StrCopy(d.udmaMode, sizeof(d.udmaMode), "MWDMA");
-                IntToStr(mwMode, t, sizeof(t));
-                StrCat2(d.udmaMode, sizeof(d.udmaMode), d.udmaMode, t);
+                // Active preferred; fall back to supported (MCPX zero-active path)
+                BYTE use = active ? active : supported;
+                for (int i = 6; i >= 0; --i)
+                    if (use & (1 << i)) { mode = i; break; }
+                needMark = false;   // clean: word 88 valid, using correct data
             }
-            else StrCopy(d.udmaMode, sizeof(d.udmaMode), "PIO");
+            else if (!w88valid && (active || supported))
+            {
+                // Word 53 bit 2 clear — word 88 validity not spec-guaranteed
+                BYTE use = active ? active : supported;
+                for (int i = 6; i >= 0; --i)
+                    if (use & (1 << i)) { mode = i; break; }
+                needMark = true;
+            }
+
+            if (mode >= 0)
+            {
+                StrCopy(d.udmaMode, sizeof(d.udmaMode), "UDMA");
+                IntToStr(mode, t, sizeof(t));
+                StrCat2(d.udmaMode, sizeof(d.udmaMode), d.udmaMode, t);
+                if (needMark) StrCat2(d.udmaMode, sizeof(d.udmaMode), d.udmaMode, "?");
+            }
+            else
+            {
+                // Word 88 zero or unusable — fall back to MWDMA (word 63)
+                BYTE mwA = (BYTE)(w[63] >> 8) & 0x07;
+                BYTE mwS = (BYTE)(w[63] & 0xFF) & 0x07;
+                int  mwMode = -1;
+                bool mwFall = false;
+                for (int i = 2; i >= 0; --i)
+                    if (mwA & (1 << i)) { mwMode = i; break; }
+                if (mwMode < 0)
+                    for (int i = 2; i >= 0; --i)
+                        if (mwS & (1 << i)) { mwMode = i; mwFall = true; break; }
+                if (mwMode >= 0)
+                {
+                    StrCopy(d.udmaMode, sizeof(d.udmaMode), "MWDMA");
+                    IntToStr(mwMode, t, sizeof(t));
+                    StrCat2(d.udmaMode, sizeof(d.udmaMode), d.udmaMode, t);
+                    if (mwFall) StrCat2(d.udmaMode, sizeof(d.udmaMode), d.udmaMode, "?");
+                }
+                else StrCopy(d.udmaMode, sizeof(d.udmaMode), "PIO");
+            }
         }
 
         // Buffer size (word 21, in 512-byte units)
@@ -673,8 +925,11 @@ static void LoadData()
         // Bit 1 = security enabled
         // Bit 2 = security locked
         // Bit 3 = security frozen
+        // Match PrometheOS isDriveLocked(): locked only when BOTH enabled AND locked
+        // bits are set. Bit 2 alone can be set on some third-party drives in a
+        // transient/malformed state — PrometheOS correctly requires bit 1 as well.
         d.securitySupported = (w[128] & 0x01) != 0;
-        d.isLocked = (w[128] & 0x04) != 0;
+        d.isLocked = ((w[128] & 0x02) != 0) && ((w[128] & 0x04) != 0);
 
         // SMART support: word 82 bit 0 = SMART feature set supported
         d.smartSupported = (w[82] & 0x01) != 0;
@@ -696,8 +951,10 @@ static void LoadData()
     }
 
     // ---- EEPROM — safe kernel read via ExQueryNonVolatileSetting(0xFFFF) ----
-    // Reads all 256 bytes atomically through the kernel, avoiding raw SMBus
-    // contention with the dashboard/other EEPROM users (ref: PrometheOS XKEEPROM).
+    // Returns raw physical EEPROM bytes (256 bytes).
+    // Factory/user sections (0x30+) are plaintext — serial, MAC, online key OK.
+    // Security section (0x14-0x2F: confounder + HDD key + region) is RC4-encrypted
+    // on the chip. Must call EepromDecryptSecurity() before reading those fields.
     {
         BYTE   eepBuf[256];
         ULONG  eeType = 0, eeLen = 0;
@@ -706,35 +963,49 @@ static void LoadData()
 
         if (d.eepromOK)
         {
-            // HDD key: bytes 0x1C-0x2B (16 bytes)
+            // Decrypt the security section in-place before reading any of its fields.
+            // EepromDecryptSecurity tries all 4 hardware versions and verifies via HMAC.
+            d.eepromDecrypted = EepromDecryptSecurity(eepBuf);
+
+            // HDD key: bytes 0x1C-0x2B (16 bytes) — in security section, must be decrypted
             for (int i = 0; i < 16; ++i) d.hddKey[i] = eepBuf[0x1C + i];
-            // XBE Region: bytes 0x2C-0x2F (4 bytes)
+
+            // XBE Region: bytes 0x2C-0x2F (4 bytes) — also in security section
             for (int i = 0; i < 4; ++i) d.xbeRegion[i] = eepBuf[0x2C + i];
-            // Online key: bytes 0x48-0x57 (16 bytes)
+
+            // Online key: bytes 0x48-0x57 (16 bytes) — factory section, plaintext
             for (int i = 0; i < 16; ++i) d.onlineKey[i] = eepBuf[0x48 + i];
 
-            // Region from XBERegion[0]
-            d.regionByte = d.xbeRegion[0];
-            switch (d.regionByte & 0x07)
+            // Region from XBERegion[0] — valid only if decrypted
+            d.regionByte = d.eepromDecrypted ? d.xbeRegion[0] : 0;
+            if (d.eepromDecrypted)
             {
-            case 0x01: StrCopy(d.regionStr, sizeof(d.regionStr), "NTSC-M  (N. America)"); break;
-            case 0x02: StrCopy(d.regionStr, sizeof(d.regionStr), "NTSC-J  (Japan)");      break;
-            case 0x04: StrCopy(d.regionStr, sizeof(d.regionStr), "PAL     (Europe/AUS)"); break;
-            default:
-            {
-                char t[4]; IntToHex(d.regionByte, 2, t, sizeof(t));
-                StrCopy(d.regionStr, sizeof(d.regionStr), "0x");
-                StrCat2(d.regionStr, sizeof(d.regionStr), d.regionStr, t);
+                switch (d.regionByte & 0x07)
+                {
+                case 0x01: StrCopy(d.regionStr, sizeof(d.regionStr), "NTSC-M  (N. America)"); break;
+                case 0x02: StrCopy(d.regionStr, sizeof(d.regionStr), "NTSC-J  (Japan)");      break;
+                case 0x04: StrCopy(d.regionStr, sizeof(d.regionStr), "PAL     (Europe/AUS)"); break;
+                default:
+                {
+                    char t[4]; IntToHex(d.regionByte, 2, t, sizeof(t));
+                    StrCopy(d.regionStr, sizeof(d.regionStr), "0x");
+                    StrCat2(d.regionStr, sizeof(d.regionStr), d.regionStr, t);
+                }
+                }
             }
+            else
+            {
+                // Decryption failed — security section is still encrypted
+                StrCopy(d.regionStr, sizeof(d.regionStr), "(encrypted)");
             }
 
-            // Serial: bytes 0x34-0x3F (12 bytes ASCII)
+            // Serial: bytes 0x34-0x3F (12 bytes ASCII) — factory section, plaintext
             for (int i = 0; i < 12; ++i) d.serialEEPROM[i] = (char)eepBuf[0x34 + i];
             d.serialEEPROM[12] = '\0';
-
         }
         else
         {
+            d.eepromDecrypted = false;
             StrCopy(d.serialEEPROM, sizeof(d.serialEEPROM), "EEPROM READ FAILED");
         }
     }
@@ -1038,14 +1309,21 @@ static void DrawRow(float lx, float vx, float y,
 }
 
 // Draw a multi-byte hex key across up to two lines
+// Draw a multi-byte hex key across up to two lines.
+// If eepromOK but !decrypted, the security-section bytes are still encrypted.
 static void DrawKeyRow(float lx, float vx, float y,
     const char* label, const BYTE* data, int count,
-    bool eepromOK)
+    bool eepromOK, bool decrypted = true)
 {
     DrawText(lx, y, label, 1.2f, COL_GRAY);
     if (!eepromOK)
     {
         DrawText(vx, y, "EEPROM NAK", 1.2f, COL_RED);
+        return;
+    }
+    if (!decrypted)
+    {
+        DrawText(vx, y, "(encrypted - version unknown)", 1.2f, COL_ORANGE);
         return;
     }
     // Split 16 bytes into two rows of 8
@@ -1183,17 +1461,22 @@ static void Render(const DiagLogo& logo)
         COL_CYAN);                                         y2 += LH + GAP;
 
     // HDD key (16 bytes = 2 rows)
-    DrawText(COL_R, y2, "HDD KEY", 1.2f, COL_YELLOW);
+    {
+        // Header shows decryption status
+        const char* hdrStr = d.eepromDecrypted ? "HDD KEY" : "HDD KEY  (decryption failed)";
+        DWORD hdrCol = d.eepromDecrypted ? COL_YELLOW : COL_ORANGE;
+        DrawText(COL_R, y2, hdrStr, 1.2f, hdrCol);
+    }
     HLine(y2 + LH + 1.f, COL_R, SW - LM, COL_BORDER);
     y2 += LH + 5.f;
-    DrawKeyRow(COL_R, COL_VR, y2, "BYTES   :", d.hddKey, 16, d.eepromOK);
+    DrawKeyRow(COL_R, COL_VR, y2, "BYTES   :", d.hddKey, 16, d.eepromOK, d.eepromDecrypted);
     y2 += LH * 2.f + GAP;
 
     // XBE Region (4 bytes = 1 row)
     DrawText(COL_R, y2, "XBE REGION", 1.2f, COL_YELLOW);
     HLine(y2 + LH + 1.f, COL_R, SW - LM, COL_BORDER);
     y2 += LH + 5.f;
-    DrawKeyRow(COL_R, COL_VR, y2, "BYTES   :", d.xbeRegion, 4, d.eepromOK);
+    DrawKeyRow(COL_R, COL_VR, y2, "BYTES   :", d.xbeRegion, 4, d.eepromOK, d.eepromDecrypted);
     y2 += LH + GAP;
 
     // Online key (16 bytes = 2 rows)

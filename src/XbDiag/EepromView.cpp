@@ -205,13 +205,14 @@ static bool    s_loaded = false;
 static int  s_editCard;
 static int  s_editCursor;   // field index within current card
 
-// Working copies of editable fields (loaded from s_eeprom on VIEW_EDIT entry)
+// 0=ok, 1=read failed, 2=decrypt failed, 3=write failed
+static int s_editFailReason = 0;
 static DWORD s_editVideoStd;   // 1=NTSC-M 2=NTSC-J 3=PAL
 static DWORD s_editVideoFlags; // bitmask
 static DWORD s_editAudioFlags; // low word=mode, high word=AC3/DTS bits
 static DWORD s_editGameRegion; // enum
-static DWORD s_editDvdRegion;  // 1-6
-static DWORD s_editParental;   // 0-6
+static DWORD s_editDvdRegion;  // 0=Region Free, 1-6=CSS zone
+static DWORD s_editGameRating;   // ESRB max game rating at 0x9C (0=disabled, 1-8=rating, 0xFF=all blocked)
 static int   s_editTzIndex;    // index into s_tzTable
 
 // Confirm-write prompt state
@@ -223,7 +224,7 @@ static bool  s_editWriteOK;
 static const int CARD_FIELD_COUNT[4] = {
     7,  // VIDEO:  VideoStd, Wide, 720p, 1080i, 480p, Letterbox, PAL60 (PAL60 hidden when not PAL)
     3,  // AUDIO:  Mode, AC3, DTS
-    3,  // REGION: GameRegion, DvdRegion, Parental
+    2,  // REGION: DvdRegion, GameRating (GameRegion is display-only — encrypted, not editable)
     1,  // TIME:   TZ picker (1 row)
 };
 
@@ -293,6 +294,33 @@ static DWORD ReadDW(int off)
 }
 
 // ============================================================================
+// Kernel EEPROM API — declared here so DecodeField and all functions below
+// can use them.  The full ReadEeprom()/WriteEeprom() section follows later.
+// ============================================================================
+
+extern "C" LONG __stdcall ExQueryNonVolatileSetting(
+    ULONG ValueIndex, ULONG* Type, void* Value, ULONG ValueLength, ULONG* ResultLength);
+
+extern "C" LONG __stdcall ExSaveNonVolatileSetting(
+    ULONG ValueIndex, ULONG Type, const void* Value, ULONG ValueLength);
+
+// XC_ index constants (ref: XAPI.H / PrometheOS XKEEPROM)
+#define XC_VIDEO_STANDARD       0x04    // kernel setting ID → EEPROM 0x58 (factory section)
+#define XC_VIDEO_FLAGS          0x05    // kernel setting ID → EEPROM 0x94 (user section)
+#define XC_AUDIO_FLAGS          0x06    // kernel setting ID → EEPROM 0x98 (user section)
+#define XC_GAME_REGION          0x07    // kernel setting ID → EEPROM 0x2C (security section, RC4-encrypted)
+#define XC_DVD_REGION           0x08    // kernel setting ID → EEPROM 0xBC
+#define XC_MAX_GAME_RATING      0x09    // kernel setting ID → EEPROM 0x9C
+#define XC_TIMEZONE_BIAS        0x0A    // kernel setting ID → EEPROM 0x64  main UTC offset (int32 minutes west)
+#define XC_TIMEZONE_STD_NAME    0x0B    // kernel setting ID → EEPROM 0x68  4-char ASCII std TZ name ("EST\0")
+#define XC_TIMEZONE_STD_DATE    0x0C    // kernel setting ID → EEPROM 0x78  DST→STD transition date
+#define XC_TIMEZONE_STD_BIAS    0x0D    // kernel setting ID → EEPROM 0x88  standard-time offset (int32, usually 0)
+#define XC_TIMEZONE_DST_NAME    0x0E    // kernel setting ID → EEPROM 0x6C  4-char ASCII DST TZ name ("EDT\0")
+#define XC_TIMEZONE_DST_DATE    0x0F    // kernel setting ID → EEPROM 0x7C  STD→DST transition date
+#define XC_TIMEZONE_DST_BIAS    0x10    // kernel setting ID → EEPROM 0x8C  DST offset (int32, e.g. -60)
+#define REG_DWORD               4       // type tag for ExSaveNonVolatileSetting
+
+// ============================================================================
 // Field value decoder
 // ============================================================================
 
@@ -305,23 +333,28 @@ static void DecodeField(int fi, char* out, int outLen)
 
     switch (f.offset)
     {
-        // Game Region (RC4-encrypted) — decoded bytes shown; 0x2C holds the region DWORD
+        // Game Region (0x2C) — RC4-encrypted in the raw EEPROM buffer.
+        // The raw bytes here are ciphertext, not the region DWORD (0x1/0x2/0x4).
+        // Read the decrypted value via the kernel API instead.
     case 0x2C:
     {
-        BYTE r = p[0];
-        if (r == 0x00) SafeCopy(out, outLen, "NTSC-M (N. America)");
-        else if (r == 0x01) SafeCopy(out, outLen, "NTSC-J (Japan)");
-        else if (r == 0x02) SafeCopy(out, outLen, "PAL (Europe/AUS)");
+        ULONG type = 0, len = 0;
+        DWORD gr = 0;
+        LONG  r = ExQueryNonVolatileSetting(XC_GAME_REGION, &type, &gr, 4, &len);
+        if (r != 0)
+        {
+            SafeCopy(out, outLen, "(kernel read failed)");
+            break;
+        }
+        if (gr == 0x00000001) SafeCopy(out, outLen, "N. America  (0x00000001)");
+        else if (gr == 0x00000002) SafeCopy(out, outLen, "Japan       (0x00000002)");
+        else if (gr == 0x00000004) SafeCopy(out, outLen, "Rest of World (0x00000004)");
+        else if (gr == 0x80000000) SafeCopy(out, outLen, "Manufacturing (0x80000000)");
+        else if (gr == 0xFFFFFFFF) SafeCopy(out, outLen, "All / Debug (0xFFFFFFFF)");
         else
         {
-            SafeCopy(out, outLen, "0x");
-            IntToHex(p[0], 2, t, sizeof(t)); SafeAppend(out, outLen, t);
-            SafeAppend(out, outLen, " ");
-            IntToHex(p[1], 2, t, sizeof(t)); SafeAppend(out, outLen, t);
-            SafeAppend(out, outLen, " ");
-            IntToHex(p[2], 2, t, sizeof(t)); SafeAppend(out, outLen, t);
-            SafeAppend(out, outLen, " ");
-            IntToHex(p[3], 2, t, sizeof(t)); SafeAppend(out, outLen, t);
+            SafeCopy(out, outLen, "Unknown 0x");
+            IntToHex(gr, 8, t, sizeof(t)); SafeAppend(out, outLen, t);
         }
         break;
     }
@@ -396,7 +429,101 @@ static void DecodeField(int fi, char* out, int outLen)
         break;
     }
 
-    // DVD region — at 0xBC per XboxEepromEditor (Eeprom.cs DvdPlaybackZone)
+    // Language — XC_LANGUAGE enum at 0x90 (user section)
+    // 0=Neutral/Unknown, 1=English, 2=Japanese, 3=German, 4=French,
+    // 5=Spanish, 6=Italian, 7=Korean, 8=Chinese, 9=Portuguese
+    case 0x90:
+    {
+        DWORD v = ReadDW(0x90);
+        switch (v)
+        {
+        case 0: SafeCopy(out, outLen, "Neutral / Unknown"); break;
+        case 1: SafeCopy(out, outLen, "English");           break;
+        case 2: SafeCopy(out, outLen, "Japanese");          break;
+        case 3: SafeCopy(out, outLen, "German");            break;
+        case 4: SafeCopy(out, outLen, "French");            break;
+        case 5: SafeCopy(out, outLen, "Spanish");           break;
+        case 6: SafeCopy(out, outLen, "Italian");           break;
+        case 7: SafeCopy(out, outLen, "Korean");            break;
+        case 8: SafeCopy(out, outLen, "Chinese");           break;
+        case 9: SafeCopy(out, outLen, "Portuguese");        break;
+        default: FmtDword(v, out, outLen);                  break;
+        }
+        break;
+    }
+
+    // Parental Passcode — nibble-encoded D-pad sequence at 0xA0
+    // Each nibble: 0=none 1=up 2=down 3=left 4=right
+    // All-zero = disabled
+    case 0xA0:
+    {
+        DWORD v = ReadDW(0xA0);
+        if (v == 0) { SafeCopy(out, outLen, "Disabled"); break; }
+        static const char* dirs[5] = { ".", "U", "D", "L", "R" };
+        bool any = false;
+        for (int ni = 0; ni < 8; ++ni)
+        {
+            BYTE nib = (BYTE)((v >> (ni * 4)) & 0xF);
+            if (nib == 0) break;
+            if (any) SafeAppend(out, outLen, " ");
+            SafeAppend(out, outLen, nib <= 4 ? dirs[nib] : "?");
+            any = true;
+        }
+        break;
+    }
+
+    // Movie Rating — MPAA max at 0xA4 (XboxEepromEditor MovieRating enum)
+    // Values: NR=0, NC-17=1, R=2, (3 unused), PG-13=4, PG=5, (6 unused), G=7
+    // 0xFF = all movies blocked
+    case 0xA4:
+    {
+        DWORD v = ReadDW(0xA4);
+        switch (v)
+        {
+        case 0:    SafeCopy(out, outLen, "Disabled (All)"); break;
+        case 1:    SafeCopy(out, outLen, "NC-17");          break;
+        case 2:    SafeCopy(out, outLen, "R");              break;
+        case 4:    SafeCopy(out, outLen, "PG-13");          break;
+        case 5:    SafeCopy(out, outLen, "PG");             break;
+        case 7:    SafeCopy(out, outLen, "G");              break;
+        case 0xFF: SafeCopy(out, outLen, "All Blocked");    break;
+        default:   FmtDword(v, out, outLen);                break;
+        }
+        break;
+    }
+
+    // Xbox Live network settings (0xA8-0xB7) — stored as network-byte-order IPs.
+    // The EEPROM stores the 4 octets in big-endian order:
+    //   s_eeprom[off]=a, [off+1]=b, [off+2]=c, [off+3]=d → "a.b.c.d"
+    // ReadDW is little-endian so: ReadDW(off)=0xDDCCBBAA → v&0xFF=a, v>>8&0xFF=b ...
+    // All-zeros = DHCP / not configured.
+    case 0xA8:  // Live IP
+    case 0xAC:  // Live DNS
+    case 0xB0:  // Live Gateway
+    case 0xB4:  // Live Subnet
+    {
+        DWORD v = ReadDW(f.offset);
+        if (v == 0)
+        {
+            // Subnet mask 0.0.0.0 means DHCP for the IP fields; show clearly
+            SafeCopy(out, outLen, f.offset == 0xB4 ? "0.0.0.0" : "DHCP (0.0.0.0)");
+            break;
+        }
+        // Format each octet from the LE DWORD
+        // v = (d<<24)|(c<<16)|(b<<8)|a  where a.b.c.d is the dotted form
+        BYTE a = (BYTE)(v & 0xFF);
+        BYTE b = (BYTE)((v >> 8) & 0xFF);
+        BYTE c = (BYTE)((v >> 16) & 0xFF);
+        BYTE d = (BYTE)((v >> 24) & 0xFF);
+        IntToStr(a, t, sizeof(t)); SafeAppend(out, outLen, t);
+        SafeAppend(out, outLen, ".");
+        IntToStr(b, t, sizeof(t)); SafeAppend(out, outLen, t);
+        SafeAppend(out, outLen, ".");
+        IntToStr(c, t, sizeof(t)); SafeAppend(out, outLen, t);
+        SafeAppend(out, outLen, ".");
+        IntToStr(d, t, sizeof(t)); SafeAppend(out, outLen, t);
+        break;
+    }
     case 0xBC:
     {
         DWORD v = ReadDW(0xBC);
@@ -553,40 +680,138 @@ static int RowToField(int row)
 }
 
 // ============================================================================
+// EEPROM Security Section Crypto
+// Matches PrometheOS XKEEPROM::Decrypt() and EncryptAndCalculateCRC() exactly.
+// Used by EditCommit to re-encrypt the security section before writing.
+// ============================================================================
+
+static DWORD EV_Rotl32(DWORD x, int n) { return (x << n) | (x >> (32 - n)); }
+
+struct EVSha1 { DWORD H[5]; BYTE B[64]; DWORD bi; DWORD bitLen; };
+
+static void EVSha1Block(EVSha1& s)
+{
+    static const DWORD k[4] = { 0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xCA62C1D6 };
+    DWORD w[80];
+    for (int i = 0; i < 16; ++i)
+        w[i] = ((DWORD)s.B[i * 4] << 24) | ((DWORD)s.B[i * 4 + 1] << 16) | ((DWORD)s.B[i * 4 + 2] << 8) | s.B[i * 4 + 3];
+    for (int i = 16; i < 80; ++i)
+        w[i] = EV_Rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    DWORD a = s.H[0], b = s.H[1], c = s.H[2], d = s.H[3], e = s.H[4];
+    for (int i = 0; i < 80; ++i)
+    {
+        DWORD f;
+        switch (i / 20)
+        {
+        case 0: f = (b & c) | ((~b) & d); break;
+        case 1: f = b ^ c ^ d;          break;
+        case 2: f = (b & c) | (b & d) | (c & d); break;
+        default:f = b ^ c ^ d;          break;
+        }
+        DWORD t = EV_Rotl32(a, 5) + f + e + w[i] + k[i / 20]; e = d; d = c; c = EV_Rotl32(b, 30); b = a; a = t;
+    }
+    s.H[0] += a; s.H[1] += b; s.H[2] += c; s.H[3] += d; s.H[4] += e; s.bi = 0;
+}
+static void EVSha1Update(EVSha1& s, const BYTE* d, int len)
+{
+    for (int i = 0; i < len; ++i) { s.B[s.bi++] = d[i]; s.bitLen += 8; if (s.bi == 64) EVSha1Block(s); }
+}
+static void EVSha1Final(EVSha1& s, BYTE out[20])
+{
+    if (s.bi > 55) { s.B[s.bi++] = 0x80; while (s.bi < 64) s.B[s.bi++] = 0; EVSha1Block(s); while (s.bi < 56) s.B[s.bi++] = 0; }
+    else { s.B[s.bi++] = 0x80; while (s.bi < 56) s.B[s.bi++] = 0; }
+    s.B[56] = s.B[57] = s.B[58] = s.B[59] = 0;
+    s.B[60] = (BYTE)(s.bitLen >> 24); s.B[61] = (BYTE)(s.bitLen >> 16); s.B[62] = (BYTE)(s.bitLen >> 8); s.B[63] = (BYTE)s.bitLen;
+    EVSha1Block(s);
+    for (int i = 0; i < 20; ++i) out[i] = (BYTE)(s.H[i >> 2] >> (8 * (3 - (i & 3))));
+}
+static void EVXboxHmac(int ver, const BYTE* data, int len, BYTE out[20])
+{
+    static const DWORD ivs[4][2][5] = {
+        {{0x85F9E51A,0xE04613D2,0x6D86A50C,0x77C32E3C,0x4BD717A4},{0x5D7A9C6B,0xE1922BEB,0xB82CCDBC,0x3137AB34,0x486B52B3}},
+        {{0x72127625,0x336472B9,0xBE609BEA,0xF55E226B,0x99958DAC},{0x76441D41,0x4DE82659,0x2E8EF85E,0xB256FACA,0xC4FE2DE8}},
+        {{0x39B06E79,0xC9BD25E8,0xDBC6B498,0x40B4389D,0x86BBD7ED},{0x9B49BED3,0x84B430FC,0x6B8749CD,0xEBFE5FE5,0xD96E7393}},
+        {{0x8058763A,0xF97D4E0E,0x865A9762,0x8A3D920D,0x08995B2C},{0x01075307,0xA2F1E037,0x1186EEEA,0x88DA9992,0x168A5609}},
+    };
+    EVSha1 s; BYTE mid[20];
+    for (int j = 0; j < 5; ++j) s.H[j] = ivs[ver][0][j]; s.bi = 0; s.bitLen = 512;
+    EVSha1Update(s, data, len); EVSha1Final(s, mid);
+    for (int j = 0; j < 5; ++j) s.H[j] = ivs[ver][1][j]; s.bi = 0; s.bitLen = 512;
+    EVSha1Update(s, mid, 20); EVSha1Final(s, out);
+}
+struct EVRC4 { BYTE S[256]; int x, y; };
+static void EVRC4Init(EVRC4& c, const BYTE* key, int klen)
+{
+    c.x = c.y = 0; for (int i = 0; i < 256; ++i) c.S[i] = (BYTE)i;
+    int j = 0;
+    for (int i = 0; i < 256; ++i) { j = (key[i % klen] + c.S[i] + j) & 0xFF; BYTE t = c.S[i]; c.S[i] = c.S[j]; c.S[j] = t; }
+}
+static void EVRC4Crypt(EVRC4& c, BYTE* data, int len)
+{
+    for (int i = 0; i < len; ++i) {
+        c.x = (c.x + 1) & 0xFF; c.y = (c.S[c.x] + c.y) & 0xFF;
+        BYTE t = c.S[c.x]; c.S[c.x] = c.S[c.y]; c.S[c.y] = t;
+        data[i] ^= c.S[(c.S[c.x] + c.S[c.y]) & 0xFF];
+    }
+}
+
+// Decrypt security section (0x14-0x2F) in-place. Returns version index or -1.
+// Matches PrometheOS Decrypt() — auto-detects version by trying all 4.
+static int EVDecryptSecurity(BYTE* buf)
+{
+    BYTE orig[28];
+    for (int i = 0; i < 28; ++i) orig[i] = buf[0x14 + i];
+    for (int v = 0; v < 4; ++v)
+    {
+        BYTE kh[20]; EVXboxHmac(v, buf + 0x00, 20, kh);
+        BYTE plain[28]; for (int i = 0; i < 28; ++i) plain[i] = orig[i];
+        EVRC4 rc4; EVRC4Init(rc4, kh, 20); EVRC4Crypt(rc4, plain, 28);
+        BYTE chk[20]; EVXboxHmac(v, plain, 28, chk);
+        bool ok = true; for (int i = 0; i < 20; ++i) if (chk[i] != buf[i]) { ok = false; break; }
+        if (ok) { for (int i = 0; i < 28; ++i) buf[0x14 + i] = plain[i]; return v; }
+        // restore on mismatch
+        for (int i = 0; i < 28; ++i) buf[0x14 + i] = orig[i];
+    }
+    return -1;
+}
+
+// Re-encrypt security section in-place using the given version.
+// Matches PrometheOS EncryptAndCalculateCRC():
+//   1. Zero HMAC field, compute HMAC over Confounder(8)+HDDKey(20)
+//   2. Derive RC4 key from HMAC
+//   3. RC4-encrypt Confounder(8) then HDDKey(20) with the same stream
+static void EVEncryptSecurity(BYTE* buf, int ver)
+{
+    // Step 1: zero HMAC, compute new HMAC over plaintext Confounder+HDDKey
+    for (int i = 0; i < 20; ++i) buf[i] = 0;
+    // EVXboxHmac takes a single contiguous block — Confounder(8)+HDDKey(20) = 28 bytes at 0x14
+    // PrometheOS passes them as two separate variadic args (8 bytes, 20 bytes) but
+    // XBOX_HMAC_SHA1 feeds them sequentially into SHA1Input — same as one 28-byte block
+    EVXboxHmac(ver, buf + 0x14, 28, buf + 0x00);
+
+    // Step 2: derive RC4 key from the new HMAC
+    BYTE kh[20]; EVXboxHmac(ver, buf + 0x00, 20, kh);
+
+    // Step 3: encrypt Confounder(8) then HDDKey(20) — same RC4 stream
+    EVRC4 rc4; EVRC4Init(rc4, kh, 20);
+    EVRC4Crypt(rc4, buf + 0x14, 8);   // Confounder
+    EVRC4Crypt(rc4, buf + 0x1C, 20);  // HDDKey (16 bytes) + XBERegion (4 bytes) = 20 bytes
+}
+
+// ============================================================================
 // EEPROM read
 // ============================================================================
 
-// ExQueryNonVolatileSetting — kernel export for safe EEPROM access.
-// Using index 0xFFFF reads all 256 bytes at once (ref: PrometheOS XKEEPROM::ReadFromXBOX).
-// This is arbitrated by the kernel and is safe to call alongside other EEPROM users.
-extern "C" LONG __stdcall ExQueryNonVolatileSetting(
-    ULONG ValueIndex, ULONG* Type, void* Value, ULONG ValueLength, ULONG* ResultLength);
-
-extern "C" LONG __stdcall ExSaveNonVolatileSetting(
-    ULONG ValueIndex, ULONG Type, const void* Value, ULONG ValueLength);
-
-// XC_ index constants (ref: XAPI.H / PrometheOS XKEEPROM)
-#define XC_VIDEO_STANDARD       0x04    // kernel setting ID → EEPROM 0x58 (factory section)
-#define XC_VIDEO_FLAGS          0x05    // kernel setting ID → EEPROM 0x94 (user section)
-#define XC_AUDIO_FLAGS          0x06    // kernel setting ID → EEPROM 0x98 (user section)
-#define XC_GAME_REGION          0x07    // kernel setting ID → EEPROM 0x54 (factory encrypted)
-#define XC_DVD_REGION           0x08    // kernel setting ID → EEPROM 0xBC
-#define XC_MAX_GAME_RATING      0x09    // kernel setting ID → EEPROM 0x9C
-#define XC_TIMEZONE_BIAS        0x0A    // kernel setting ID → EEPROM 0x64 (int32 minutes west)
-#define XC_TIMEZONE_STD_BIAS    0x0B    // kernel setting ID → EEPROM 0x8C (DST offset minutes)
-#define REG_DWORD               4       // type tag for ExSaveNonVolatileSetting
-
 static void ReadEeprom()
 {
-    ULONG type = 0;
-    ULONG resultLen = 0;
-    LONG  status = ExQueryNonVolatileSetting(0xFFFF, &type, s_eeprom, 256, &resultLen);
+    // Matches PrometheOS XKEEPROM::ReadFromXBOX():
+    //   ExQueryNonVolatileSetting(0xFFFF, &type, &m_EEPROMData, 256, &size)
+    // This is the same source buffer that save() reads from before writing.
+    ULONG type = 0, resultLen = 0;
+    LONG status = ExQueryNonVolatileSetting(0xFFFF, &type, s_eeprom, 256, &resultLen);
     s_readOK = (status == 0 && resultLen >= 16);
     if (!s_readOK)
-    {
-        // Kernel read failed — zero fill so decoded view shows clean state
         for (int i = 0; i < 256; ++i) s_eeprom[i] = 0;
-    }
 }
 
 // ============================================================================
@@ -824,101 +1049,201 @@ static void RenderDecoded(const DiagLogo& logo)
 
 // ============================================================================
 // Timezone table — matches Xbox dashboard timezone list and kernel bias values.
-// stdBias: minutes WEST of UTC (kernel convention, negate for UTC+ display).
-// dstBias: additional DST offset in minutes (typically -60 = spring forward 1hr).
-//          0 = no DST observed.
+// Timezone table — each entry carries the full 44-byte raw EEPROM block for
+// offsets 0x64-0x8F, sourced directly from XboxEepromEditor _timeZoneMappings.
+// This is the authoritative data; writing these 44 bytes produces a fully
+// consistent timezone block that the Xbox kernel recognises.
+//
+// Block layout (44 bytes):
+//   [0x00-0x03]  0x64  TZ Bias (int32 LE, minutes west of UTC)
+//   [0x04-0x07]  0x68  Std TZ Name (4 ASCII bytes)
+//   [0x08-0x0B]  0x6C  DST TZ Name (4 ASCII bytes)
+//   [0x0C-0x13]  0x70  padding (8 bytes)
+//   [0x14-0x17]  0x78  Std transition date (packed Month/Day/DayOfWeek/Hour)
+//   [0x18-0x1B]  0x7C  DST transition date
+//   [0x1C-0x23]  0x80  padding (8 bytes)
+//   [0x24-0x27]  0x88  Std Bias (int32 LE, minutes)
+//   [0x28-0x2B]  0x8C  DST Bias (int32 LE, minutes)
 // ============================================================================
 
 struct TzEntry
 {
-    const char* name;   // display name shown to user
-    int         stdBias; // minutes west (stored at 0x60)
-    int         dstBias; // DST offset minutes (stored at 0x64), 0=no DST
+    const char* name;
+    BYTE        raw[44];  // full 44-byte block for 0x64-0x8F
 };
+
+// Bias helpers for TzFindIndex — read from raw block
+static int TzRawBias(const TzEntry& e) // stdBias at raw[0]
+{
+    return (int)((DWORD)e.raw[0] | ((DWORD)e.raw[1] << 8) | ((DWORD)e.raw[2] << 16) | ((DWORD)e.raw[3] << 24));
+}
+static int TzRawDstBias(const TzEntry& e) // dstBias at raw[40]
+{
+    return (int)((DWORD)e.raw[40] | ((DWORD)e.raw[41] << 8) | ((DWORD)e.raw[42] << 16) | ((DWORD)e.raw[43] << 24));
+}
 
 static const TzEntry s_tzTable[] =
 {
-    // Name                             stdBias   dstBias
-    { "International Date Line West",    720,       0   }, // UTC-12
-    { "Midway Island, Samoa",            660,       0   }, // UTC-11
-    { "Hawaii",                          600,       0   }, // UTC-10 (no DST)
-    { "Alaska",                          540,     -60   }, // UTC-9
-    { "Pacific Time (US & Canada)",      480,     -60   }, // UTC-8
-    { "Mountain Time (US & Canada)",     420,     -60   }, // UTC-7
-    { "Arizona",                         420,       0   }, // UTC-7 no DST
-    { "Central Time (US & Canada)",      360,     -60   }, // UTC-6
-    { "Mexico City, Tegucigalpa",        360,     -60   }, // UTC-6
-    { "Saskatchewan",                    360,       0   }, // UTC-6 no DST
-    { "Eastern Time (US & Canada)",      300,     -60   }, // UTC-5
-    { "Indiana (East)",                  300,       0   }, // UTC-5 no DST
-    { "Bogota, Lima, Quito",             300,       0   }, // UTC-5 no DST
-    { "Atlantic Time (Canada)",          240,     -60   }, // UTC-4
-    { "Caracas, La Paz",                 240,       0   }, // UTC-4 no DST
-    { "Santiago",                        240,     -60   }, // UTC-4
-    { "Newfoundland",                    210,     -60   }, // UTC-3:30
-    { "Brasilia",                        180,     -60   }, // UTC-3
-    { "Buenos Aires, Georgetown",        180,       0   }, // UTC-3 no DST
-    { "Greenland",                       180,     -60   }, // UTC-3
-    { "Mid-Atlantic",                    120,     -60   }, // UTC-2
-    { "Azores",                           60,     -60   }, // UTC-1
-    { "Cape Verde Islands",               60,       0   }, // UTC-1 no DST
-    { "Greenwich Mean Time (GMT)",          0,       0   }, // UTC+0 no DST
-    { "Dublin, Edinburgh, London",          0,     -60   }, // UTC+0
-    { "Casablanca, Monrovia",               0,       0   }, // UTC+0 no DST
-    { "Amsterdam, Berlin, Rome",          -60,     -60   }, // UTC+1
-    { "Prague, Paris, Madrid",            -60,     -60   }, // UTC+1
-    { "West Central Africa",              -60,       0   }, // UTC+1 no DST
-    { "Athens, Istanbul, Minsk",         -120,     -60   }, // UTC+2
-    { "Bucharest, Cairo, Helsinki",      -120,     -60   }, // UTC+2
-    { "Jerusalem",                       -120,     -60   }, // UTC+2
-    { "Baghdad, Kuwait, Riyadh",         -180,       0   }, // UTC+3 no DST
-    { "Moscow, St. Petersburg",          -180,     -60   }, // UTC+3
-    { "Nairobi",                         -180,       0   }, // UTC+3 no DST
-    { "Tehran",                          -210,     -60   }, // UTC+3:30
-    { "Abu Dhabi, Muscat",               -240,       0   }, // UTC+4 no DST
-    { "Baku, Tbilisi, Yerevan",          -240,     -60   }, // UTC+4
-    { "Kabul",                           -270,       0   }, // UTC+4:30
-    { "Ekaterinburg",                    -300,     -60   }, // UTC+5
-    { "Islamabad, Karachi, Tashkent",    -300,       0   }, // UTC+5 no DST
-    { "Calcutta, Chennai, Mumbai",       -330,       0   }, // UTC+5:30
-    { "Kathmandu",                       -345,       0   }, // UTC+5:45
-    { "Almaty, Novosibirsk",             -360,     -60   }, // UTC+6
-    { "Astana, Dhaka",                   -360,       0   }, // UTC+6 no DST
-    { "Sri Jayawardenepura",             -360,       0   }, // UTC+6 no DST
-    { "Rangoon",                         -390,       0   }, // UTC+6:30
-    { "Bangkok, Hanoi, Jakarta",         -420,       0   }, // UTC+7 no DST
-    { "Krasnoyarsk",                     -420,     -60   }, // UTC+7
-    { "Beijing, Chongqing, Hong Kong",   -480,       0   }, // UTC+8 no DST
-    { "Kuala Lumpur, Singapore",         -480,       0   }, // UTC+8 no DST
-    { "Irkutsk, Ulaan Bataar",           -480,     -60   }, // UTC+8
-    { "Perth",                           -480,       0   }, // UTC+8 no DST
-    { "Taipei",                          -480,       0   }, // UTC+8 no DST
-    { "Osaka, Sapporo, Tokyo",           -540,       0   }, // UTC+9 no DST
-    { "Seoul",                           -540,       0   }, // UTC+9 no DST
-    { "Yakutsk",                         -540,     -60   }, // UTC+9
-    { "Adelaide",                        -570,     -60   }, // UTC+9:30
-    { "Darwin",                          -570,       0   }, // UTC+9:30 no DST
-    { "Brisbane",                        -600,       0   }, // UTC+10 no DST
-    { "Canberra, Melbourne, Sydney",     -600,     -60   }, // UTC+10
-    { "Guam, Port Moresby",              -600,       0   }, // UTC+10 no DST
-    { "Hobart",                          -600,     -60   }, // UTC+10
-    { "Vladivostok",                     -600,     -60   }, // UTC+10
-    { "Magadan, Solomon Is.",            -660,     -60   }, // UTC+11
-    { "Auckland, Wellington",            -720,     -60   }, // UTC+12
-    { "Fiji, Kamchatka",                 -720,       0   }, // UTC+12 no DST
+    { "Samoa",
+      {0x94,0x02,0x00,0x00, 0x4E,0x53,0x54,0x00, 0x4E,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Hawaii",
+      {0x58,0x02,0x00,0x00, 0x48,0x53,0x54,0x00, 0x48,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Alaska",
+      {0x1C,0x02,0x00,0x00, 0x59,0x53,0x54,0x00, 0x59,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x02, 0x04,0x01,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Pacific Time (US & Canada)",
+      {0xE0,0x01,0x00,0x00, 0x50,0x53,0x54,0x00, 0x50,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x02, 0x04,0x01,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Mountain Time (US & Canada)",
+      {0xA4,0x01,0x00,0x00, 0x4D,0x53,0x54,0x00, 0x4D,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x02, 0x04,0x01,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Arizona",
+      {0xA4,0x01,0x00,0x00, 0x4D,0x53,0x54,0x00, 0x4D,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Saskatchewan",
+      {0x68,0x01,0x00,0x00, 0x43,0x43,0x53,0x54, 0x43,0x43,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Mexico City, Tegucigalpa",
+      {0x68,0x01,0x00,0x00, 0x4D,0x53,0x54,0x00, 0x4D,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x02, 0x04,0x01,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Central Time (US & Canada)",
+      {0x68,0x01,0x00,0x00, 0x43,0x53,0x54,0x00, 0x43,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x02, 0x04,0x01,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Central America",
+      {0x68,0x01,0x00,0x00, 0x43,0x41,0x53,0x54, 0x43,0x41,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Indiana (East)",
+      {0x2C,0x01,0x00,0x00, 0x45,0x53,0x54,0x00, 0x45,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Eastern Time (US & Canada)",
+      {0x2C,0x01,0x00,0x00, 0x45,0x53,0x54,0x00, 0x45,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x02, 0x04,0x01,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Bogota, Lima, Quito",
+      {0x2C,0x01,0x00,0x00, 0x53,0x50,0x53,0x54, 0x53,0x50,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Santiago",
+      {0xF0,0x00,0x00,0x00, 0x50,0x53,0x53,0x54, 0x50,0x53,0x44,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x03,0x02,0x06,0x00, 0x0A,0x02,0x06,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Caracas, La Paz",
+      {0xF0,0x00,0x00,0x00, 0x53,0x57,0x53,0x54, 0x53,0x57,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Atlantic Time (Canada)",
+      {0xF0,0x00,0x00,0x00, 0x41,0x53,0x54,0x00, 0x41,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x02, 0x04,0x01,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Greenland",
+      {0xB4,0x00,0x00,0x00, 0x47,0x53,0x54,0x00, 0x47,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x02, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Buenos Aires, Georgetown",
+      {0xB4,0x00,0x00,0x00, 0x53,0x45,0x53,0x54, 0x53,0x45,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Brasilia",
+      {0xB4,0x00,0x00,0x00, 0x45,0x53,0x52,0x54, 0x45,0x53,0x44,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x02,0x02,0x00,0x02, 0x0A,0x03,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Newfoundland",
+      {0xD2,0x00,0x00,0x00, 0x4E,0x53,0x54,0x00, 0x4E,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x02, 0x04,0x01,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Mid-Atlantic",
+      {0x78,0x00,0x00,0x00, 0x4D,0x41,0x53,0x54, 0x4D,0x41,0x44,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x09,0x05,0x00,0x02, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Cape Verde Islands",
+      {0x3C,0x00,0x00,0x00, 0x57,0x41,0x54,0x00, 0x57,0x41,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Azores",
+      {0x3C,0x00,0x00,0x00, 0x41,0x53,0x54,0x00, 0x41,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x03, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Casablanca, Monrovia",
+      {0x00,0x00,0x00,0x00, 0x47,0x53,0x54,0x00, 0x47,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Dublin, Edinburgh, London",
+      {0x00,0x00,0x00,0x00, 0x47,0x4D,0x54,0x00, 0x42,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x02, 0x03,0x05,0x00,0x01, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Amsterdam, Berlin, Rome",
+      {0xC4,0xFF,0xFF,0xFF, 0x57,0x45,0x53,0x54, 0x57,0x45,0x44,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x03, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Belgrade, Bratislava",
+      {0xC4,0xFF,0xFF,0xFF, 0x43,0x45,0x53,0x54, 0x43,0x45,0x44,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x03, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Paris, Madrid",
+      {0xC4,0xFF,0xFF,0xFF, 0x52,0x53,0x54,0x00, 0x52,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x03, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "West Central Africa",
+      {0xC4,0xFF,0xFF,0xFF, 0x57,0x41,0x53,0x54, 0x57,0x41,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Athens, Istanbul, Minsk",
+      {0x88,0xFF,0xFF,0xFF, 0x47,0x54,0x53,0x54, 0x47,0x54,0x44,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x03, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Cairo",
+      {0x88,0xFF,0xFF,0xFF, 0x45,0x53,0x54,0x00, 0x45,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x09,0x05,0x03,0x02, 0x05,0x01,0x05,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Helsinki, Kyiv",
+      {0x88,0xFF,0xFF,0xFF, 0x46,0x4C,0x53,0x54, 0x46,0x4C,0x44,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x04, 0x03,0x05,0x00,0x03, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Jerusalem",
+      {0x88,0xFF,0xFF,0xFF, 0x4A,0x53,0x54,0x00, 0x4A,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Baghdad",
+      {0x4C,0xFF,0xFF,0xFF, 0x41,0x53,0x54,0x00, 0x41,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x01,0x00,0x04, 0x04,0x01,0x00,0x03, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Kuwait, Riyadh",
+      {0x4C,0xFF,0xFF,0xFF, 0x41,0x53,0x54,0x00, 0x41,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Moscow, St. Petersburg",
+      {0x4C,0xFF,0xFF,0xFF, 0x52,0x53,0x54,0x00, 0x52,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x03, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Nairobi",
+      {0x4C,0xFF,0xFF,0xFF, 0x45,0x41,0x53,0x54, 0x45,0x41,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Tehran",
+      {0x2E,0xFF,0xFF,0xFF, 0x49,0x53,0x54,0x00, 0x49,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x09,0x04,0x02,0x02, 0x03,0x01,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Abu Dhabi, Muscat",
+      {0x10,0xFF,0xFF,0xFF, 0x41,0x53,0x54,0x00, 0x41,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Baku, Tbilisi, Yerevan",
+      {0x10,0xFF,0xFF,0xFF, 0x43,0x53,0x54,0x00, 0x43,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x03, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Kabul",
+      {0xF2,0xFE,0xFF,0xFF, 0x41,0x53,0x54,0x00, 0x41,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Ekaterinburg",
+      {0xD4,0xFE,0xFF,0xFF, 0x45,0x53,0x54,0x00, 0x45,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x03, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Islamabad, Karachi, Tashkent",
+      {0xD4,0xFE,0xFF,0xFF, 0x57,0x41,0x53,0x54, 0x57,0x41,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Calcutta, Chennai, Mumbai",
+      {0xB6,0xFE,0xFF,0xFF, 0x49,0x53,0x54,0x00, 0x49,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Kathmandu",
+      {0xA7,0xFE,0xFF,0xFF, 0x4E,0x53,0x54,0x00, 0x4E,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Almaty, Novosibirsk",
+      {0x98,0xFE,0xFF,0xFF, 0x4E,0x43,0x53,0x54, 0x4E,0x43,0x44,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x03, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Astana, Dhaka",
+      {0x98,0xFE,0xFF,0xFF, 0x43,0x41,0x53,0x54, 0x43,0x41,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Sri Lanka",
+      {0x98,0xFE,0xFF,0xFF, 0x53,0x52,0x53,0x54, 0x53,0x52,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Rangoon",
+      {0x7A,0xFE,0xFF,0xFF, 0x4D,0x53,0x54,0x00, 0x4D,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Bangkok, Hanoi, Jakarta",
+      {0x5C,0xFE,0xFF,0xFF, 0x53,0x41,0x53,0x54, 0x53,0x41,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Krasnoyarsk",
+      {0x5C,0xFE,0xFF,0xFF, 0x4E,0x41,0x53,0x54, 0x4E,0x41,0x44,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x03, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Beijing, Chongqing, Hong Kong",
+      {0x20,0xFE,0xFF,0xFF, 0x43,0x53,0x54,0x00, 0x43,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Irkutsk, Ulaan Bataar",
+      {0x20,0xFE,0xFF,0xFF, 0x4E,0x45,0x53,0x54, 0x4E,0x45,0x44,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x03, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Perth",
+      {0x20,0xFE,0xFF,0xFF, 0x41,0x57,0x53,0x54, 0x41,0x57,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Kuala Lumpur, Singapore",
+      {0x20,0xFE,0xFF,0xFF, 0x4D,0x50,0x53,0x54, 0x4D,0x50,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Taipei",
+      {0x20,0xFE,0xFF,0xFF, 0x54,0x53,0x54,0x00, 0x54,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Seoul",
+      {0xE4,0xFD,0xFF,0xFF, 0x4B,0x53,0x54,0x00, 0x4B,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Osaka, Sapporo, Tokyo",
+      {0xE4,0xFD,0xFF,0xFF, 0x54,0x53,0x54,0x00, 0x54,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Yakutsk",
+      {0xE4,0xFD,0xFF,0xFF, 0x59,0x53,0x54,0x00, 0x59,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x03, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Adelaide",
+      {0xC6,0xFD,0xFF,0xFF, 0x41,0x43,0x53,0x54, 0x41,0x43,0x44,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x03,0x05,0x00,0x02, 0x0A,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Darwin",
+      {0xC6,0xFD,0xFF,0xFF, 0x41,0x43,0x53,0x54, 0x41,0x43,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Brisbane",
+      {0xA8,0xFD,0xFF,0xFF, 0x41,0x45,0x53,0x54, 0x41,0x45,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Canberra, Melbourne, Sydney",
+      {0xA8,0xFD,0xFF,0xFF, 0x41,0x45,0x53,0x54, 0x41,0x45,0x44,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x03,0x05,0x00,0x02, 0x0A,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Guam, Port Moresby",
+      {0xA8,0xFD,0xFF,0xFF, 0x57,0x50,0x53,0x54, 0x57,0x50,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Hobart",
+      {0xA8,0xFD,0xFF,0xFF, 0x54,0x53,0x54,0x00, 0x54,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x03,0x05,0x00,0x02, 0x0A,0x01,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Vladivostok",
+      {0xA8,0xFD,0xFF,0xFF, 0x56,0x53,0x54,0x00, 0x56,0x44,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x0A,0x05,0x00,0x03, 0x03,0x05,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Magadan, Solomon Islands",
+      {0x6C,0xFD,0xFF,0xFF, 0x43,0x50,0x53,0x54, 0x43,0x50,0x53,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
+    { "Auckland, Wellington",
+      {0x30,0xFD,0xFF,0xFF, 0x4E,0x5A,0x53,0x54, 0x4E,0x5A,0x44,0x54, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x03,0x03,0x00,0x02, 0x0A,0x01,0x00,0x02, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xC4,0xFF,0xFF,0xFF} },
+    { "Fiji, Kamchatka",
+      {0x30,0xFD,0xFF,0xFF, 0x46,0x53,0x54,0x00, 0x46,0x53,0x54,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00} },
 };
 static const int TZ_COUNT = sizeof(s_tzTable) / sizeof(s_tzTable[0]);
 
-// Find the closest matching entry index for current bias values
+// Find index by matching the full 44-byte raw block against current EEPROM data.
+// Falls back to bias-only match if no exact match found.
 static int TzFindIndex(int stdBias, int dstBias)
 {
-    // Exact match first
+    // Try exact raw block match first
+    const BYTE* cur = s_eeprom + 0x64;
     for (int i = 0; i < TZ_COUNT; ++i)
-        if (s_tzTable[i].stdBias == stdBias && s_tzTable[i].dstBias == dstBias)
+    {
+        bool match = true;
+        for (int j = 0; j < 44; ++j)
+            if (s_tzTable[i].raw[j] != cur[j]) { match = false; break; }
+        if (match) return i;
+    }
+    // Fallback: match on bias values
+    for (int i = 0; i < TZ_COUNT; ++i)
+        if (TzRawBias(s_tzTable[i]) == stdBias && TzRawDstBias(s_tzTable[i]) == dstBias)
             return i;
-    // Fallback: match stdBias only
     for (int i = 0; i < TZ_COUNT; ++i)
-        if (s_tzTable[i].stdBias == stdBias)
+        if (TzRawBias(s_tzTable[i]) == stdBias)
             return i;
     return 0;
 }
@@ -952,17 +1277,12 @@ static void EditLoadFromEeprom()
         s_editAudioFlags = mode | (raw & 0x00030000); // AC3/DTS pass through
     }
 
-    // Game region — security section is RC4-encrypted in the raw buffer; read
-    // via kernel API which returns the decrypted value.
-    {
-        ULONG type = 0, len = 0;
-        s_editGameRegion = 0x00000001; // default NA
-        ExQueryNonVolatileSetting(XC_GAME_REGION, &type, &s_editGameRegion, 4, &len);
-    }
-
     s_editDvdRegion = ReadDW(0xBC);  // DVD region at 0xBC
-    s_editParental = ReadDW(0x9C);  // max game rating at 0x9C
+    s_editGameRating = ReadDW(0x9C);  // max game rating at 0x9C
     s_editTzIndex = TzFindIndex((int)ReadDW(0x64), (int)ReadDW(0x8C));
+    // Game region (0x2C) is not loaded here — it is in the encrypted security
+    // section and editing it requires per-console key re-encryption. Displayed
+    // read-only on the Region card via a direct ExQueryNonVolatileSetting call.
 }
 
 // Cycle an enum index by delta within [0, count-1]
@@ -974,59 +1294,151 @@ static int CycleEnum(int cur, int count, int delta)
     return cur;
 }
 
-// Write all working copies back via ExSaveNonVolatileSetting
+// Forward declaration — defined in the repair section below.
+static DWORD EepCalcChecksum(const BYTE* data, int offset, int size);
+static bool  EepSMBusWriteDW(int offset, DWORD val);
+
+// Write a DWORD little-endian into a raw buffer at offset
+static void BufWriteDW(BYTE* buf, int off, DWORD val)
+{
+    buf[off + 0] = (BYTE)(val);
+    buf[off + 1] = (BYTE)(val >> 8);
+    buf[off + 2] = (BYTE)(val >> 16);
+    buf[off + 3] = (BYTE)(val >> 24);
+}
+
+// Read a DWORD little-endian from a raw buffer at offset
+static DWORD BufReadDW(const BYTE* buf, int off)
+{
+    return (DWORD)buf[off]
+        | ((DWORD)buf[off + 1] << 8)
+        | ((DWORD)buf[off + 2] << 16)
+        | ((DWORD)buf[off + 3] << 24);
+}
+
+// Recalculate and write both checksums into a 256-byte EEPROM buffer.
+// Matches PrometheOS CalculateChecksum2() + CalculateChecksum3():
+//   Checksum2 (0x30): ~Calc(buf+0x34, 0x2C) — serial/MAC/online key/video std
+//   Checksum3 (0x60): ~Calc(buf+0x64, 0x5C) — tz/language/flags/ratings/dvd
+static void EepRecalcChecksums(BYTE* buf)
+{
+    DWORD cs2 = ~EepCalcChecksum(buf, 0x34, 0x2C);
+    BufWriteDW(buf, 0x30, cs2);
+    DWORD cs3 = ~EepCalcChecksum(buf, 0x64, 0x5C);
+    BufWriteDW(buf, 0x60, cs3);
+}
+
+// Write all working copies back to EEPROM.
+// Exact port of PrometheOS xboxConfig::save() + XKEEPROM:
+//   ReadFromXBOX()         = ExQueryNonVolatileSetting(0xFFFF, ...)
+//   SetXBERegionVal()      = Decrypt() + modify + EncryptAndCalculateCRC()
+//   SetVideoFlagsVal()     = direct write + CalculateChecksum3
+//   SetAudioFlagsVal()     = direct write + CalculateChecksum3
+//   SetVideoStandardVal()  = direct write + CalculateChecksum2
+//   SetDVDRegionVal()      = direct write + CalculateChecksum3
+//   WriteToXBOX()          = ExSaveNonVolatileSetting(0xFFFF, 3, buf, 256)
 static bool EditCommit()
 {
-    bool ok = true;
-    LONG r;
+    s_editFailReason = 0;
 
-    // Video Standard — convert internal enum (1-4) back to XC_VIDEO_STANDARD_* DWORD
+    // ReadFromXBOX — read raw encrypted bytes directly from chip via SMBus.
+    // We do NOT use ExQueryNonVolatileSetting(0xFFFF) here because the kernel
+    // returns a partially-processed buffer where 0x00-0x13 (HMAC) may be zeroed
+    // after internal decryption, causing EVDecryptSecurity to false-positive and
+    // EVEncryptSecurity to produce an invalid HMAC that survives the write call
+    // but fails verification on next boot.
+    // SMBus gives us the true raw chip bytes — the same source RestoreFromFile uses.
+    BYTE buf[256];
+    {
+        for (int i = 0; i < 256; ++i)
+        {
+            BYTE b = 0;
+            if (!SMBusRead(SMBADDR_EEPROM, (BYTE)i, b))
+            {
+                s_editFailReason = 1; return false;
+            }
+            buf[i] = b;
+        }
+    }
+
+    // SetXBERegionVal equivalent — Decrypt, then EncryptAndCalculateCRC.
+    // PrometheOS always calls this even when region is unchanged.
+    // This is what regenerates a valid HMAC before WriteToXBOX.
+    // If decrypt fails (kernel already decrypted the buffer), skip decrypt
+    // but still re-encrypt to generate the required HMAC.
+    int ver = EVDecryptSecurity(buf);
+    if (ver < 0)
+    {
+        s_editFailReason = 2; return false;
+    }
+
+    // SetVideoStandardVal — direct write + CalculateChecksum2
     {
         static const DWORD vsMap[5] = {
-            0x00400100,  // [0] unused / default
-            0x00400100,  // [1] NTSC-M (N. America)
-            0x00400200,  // [2] NTSC-J (Japan)
-            0x00800300,  // [3] PAL-I  (Europe/AUS)
-            0x00400400,  // [4] PAL-M  (Brazil)
+            0x00400100, 0x00400100, 0x00400200, 0x00800300, 0x00400400
         };
         DWORD vs = (s_editVideoStd >= 1 && s_editVideoStd <= 4)
             ? vsMap[s_editVideoStd] : 0x00400100;
-        r = ExSaveNonVolatileSetting(XC_VIDEO_STANDARD, REG_DWORD, &vs, 4);
-        if (r != 0) ok = false;
+        BufWriteDW(buf, 0x58, vs);
     }
 
-    r = ExSaveNonVolatileSetting(XC_VIDEO_FLAGS, REG_DWORD, &s_editVideoFlags, 4);
-    if (r != 0) ok = false;
+    // SetVideoFlagsVal — direct write + CalculateChecksum3
+    BufWriteDW(buf, 0x94, s_editVideoFlags & 0x005F0000UL);
 
-    // Audio flags — convert internal mode back to EEPROM format.
-    // EEPROM: bit0=mono, bit1=surround (0=stereo), bit16=AC3, bit17=DTS.
-    // AC3/DTS bits are at the same positions in both formats — pass through.
+    // SetAudioFlagsVal — direct write + CalculateChecksum3
     {
-        DWORD mode = s_editAudioFlags & 0x0000FFFF;
-        DWORD raw;
-        if (mode == 1) raw = 0x01; // mono
-        else if (mode == 2) raw = 0x02; // surround
-        else                raw = 0x00; // stereo (0x00, NOT 0x02)
-        raw |= (s_editAudioFlags & 0x00030000); // AC3/DTS pass through
-        r = ExSaveNonVolatileSetting(XC_AUDIO_FLAGS, REG_DWORD, &raw, 4);
-        if (r != 0) ok = false;
+        DWORD mode = s_editAudioFlags & 0x0000FFFFUL;
+        DWORD raw = (mode == 1) ? 0x01 : (mode == 2) ? 0x02 : 0x00;
+        raw |= (s_editAudioFlags & 0x00030000UL);
+        raw &= 0x00030003UL;
+        BufWriteDW(buf, 0x98, raw);
     }
 
-    r = ExSaveNonVolatileSetting(XC_GAME_REGION, REG_DWORD, &s_editGameRegion, 4);
-    if (r != 0) ok = false;
-    r = ExSaveNonVolatileSetting(XC_DVD_REGION, REG_DWORD, &s_editDvdRegion, 4);
-    if (r != 0) ok = false;
-    r = ExSaveNonVolatileSetting(XC_MAX_GAME_RATING, REG_DWORD, &s_editParental, 4);
-    if (r != 0) ok = false;
-    ULONG tzStd = (ULONG)s_tzTable[s_editTzIndex].stdBias;
-    r = ExSaveNonVolatileSetting(XC_TIMEZONE_BIAS, REG_DWORD, &tzStd, 4);
-    if (r != 0) ok = false;
-    ULONG tzDst = (ULONG)s_tzTable[s_editTzIndex].dstBias;
-    r = ExSaveNonVolatileSetting(XC_TIMEZONE_STD_BIAS, REG_DWORD, &tzDst, 4);
-    if (r != 0) ok = false;
-    // Re-read EEPROM so decoded/hex views reflect new state
-    ReadEeprom();
-    return ok;
+    // SetDVDRegionVal — direct write + CalculateChecksum3
+    BufWriteDW(buf, 0xBC, s_editDvdRegion);
+
+    // Game rating — direct write + CalculateChecksum3
+    BufWriteDW(buf, 0x9C, s_editGameRating);
+
+    // Timezone — full 44-byte block + CalculateChecksum3
+    for (int i = 0; i < 44; ++i)
+        buf[0x64 + i] = s_tzTable[s_editTzIndex].raw[i];
+
+    // CalculateChecksum2 + CalculateChecksum3
+    EepRecalcChecksums(buf);
+
+    // EncryptAndCalculateCRC — regenerate HMAC, RC4 re-encrypt security section,
+    // recalculate both checksums. This is what makes the kernel accept the write.
+    EVEncryptSecurity(buf, ver);
+    EepRecalcChecksums(buf);
+
+    // WriteToXBOX — ExSaveNonVolatileSetting(0xFFFF, 3, buf, 256)
+    // Updates the kernel's internal cache so the running system sees new values.
+    {
+        ULONG type = 3;
+        if (ExSaveNonVolatileSetting(0xFFFF, type, buf, 256) != 0)
+        {
+            s_editFailReason = 3; return false;
+        }
+    }
+
+    // Also write directly to the physical EEPROM chip via SMBus.
+    // ExSaveNonVolatileSetting updates the kernel cache but may not flush to
+    // hardware outside of the dashboard context. SMBus write ensures persistence
+    // across reboots — the same path RestoreFromFile uses successfully.
+    for (int i = 0; i < 256; ++i)
+    {
+        if (!SMBusWrite(SMBADDR_EEPROM, (BYTE)i, buf[i]))
+        {
+            s_editFailReason = 3; return false;
+        }
+        Sleep(10);
+    }
+
+    // Update s_eeprom[] from what we wrote so decoded/hex views reflect new state
+    for (int i = 0; i < 256; ++i) s_eeprom[i] = buf[i];
+    EditLoadFromEeprom();
+    return true;
 }
 
 // ============================================================================
@@ -1155,34 +1567,20 @@ static void EditHandleInput(WORD cur)
     case 2: // REGION
         switch (s_editCursor)
         {
-        case 0: // Game region — enum 0-4 (NA/Japan/RoW/Mfg/All)
+        case 0: // DVD region — 0=Region Free, 1-6=CSS zones  (7 options)
         {
-            static const DWORD gameRegVals[5] = {
-                0x00000001, 0x00000002, 0x00000004,
-                0x80000000, 0xFFFFFFFF
-            };
-            // Find current index
-            int idx = 0;
-            for (int i = 0; i < 5; ++i)
-                if (s_editGameRegion == gameRegVals[i]) { idx = i; break; }
-            idx = CycleEnum(idx, 5, delta);
-            s_editGameRegion = gameRegVals[idx];
-            break;
-        }
-        case 1: // DVD region — 1-6
-        {
-            int idx = (int)s_editDvdRegion - 1;
-            if (idx < 0 || idx > 5) idx = 0;
-            idx = CycleEnum(idx, 6, delta);
-            s_editDvdRegion = (DWORD)(idx + 1);
-            break;
-        }
-        case 2: // Parental — 0-6
-        {
-            int idx = (int)s_editParental;
+            int idx = (int)s_editDvdRegion;
             if (idx < 0 || idx > 6) idx = 0;
             idx = CycleEnum(idx, 7, delta);
-            s_editParental = (DWORD)idx;
+            s_editDvdRegion = (DWORD)idx;
+            break;
+        }
+        case 1: // Game Rating at 0x9C
+        {
+            int idx = (int)s_editGameRating;
+            if (idx < 0 || idx > 6) idx = 0;
+            idx = CycleEnum(idx, 7, delta);
+            s_editGameRating = (DWORD)idx;
             break;
         }
         }
@@ -1227,23 +1625,25 @@ static void RenderEdit(const DiagLogo& logo)
     // Confirm overlay
     if (s_editConfirm)
     {
-        float bx = 80.f, by = 140.f, bw = 480.f, bh = 100.f;
+        float bx = 80.f, by = 130.f, bw = 480.f, bh = 130.f;
         FillRect(bx, by, bx + bw, by + bh, 0xE0101010);
         HLine(by, bx, bx + bw, COL_YELLOW);
         HLine(by + bh, bx, bx + bw, COL_YELLOW);
         VLine(bx, by, by + bh, COL_YELLOW);
         VLine(bx + bw, by, by + bh, COL_YELLOW);
         DrawText(bx + 16.f, by + 14.f, "WRITE EEPROM SETTINGS?", 1.3f, COL_YELLOW);
-        DrawText(bx + 16.f, by + 36.f, "This will update: Video, Audio, Region, Timezone.", 1.1f, COL_WHITE);
-        DrawText(bx + 16.f, by + 52.f, "The kernel recalculates the HMAC automatically.", 1.1f, COL_GRAY);
-        DrawText(bx + 16.f, by + 70.f, "[A] Yes, write    [B] Cancel", 1.2f, COL_WHITE);
+        HLine(by + 34.f, bx + 1.f, bx + bw - 1.f, 0x44FFFF00);
+        DrawText(bx + 16.f, by + 44.f, "This will update: Video, Audio, Region, Timezone.", 1.1f, COL_WHITE);
+        DrawText(bx + 16.f, by + 64.f, "Security section will be re-encrypted correctly.", 1.1f, COL_GRAY);
+        HLine(by + 84.f, bx + 1.f, bx + bw - 1.f, 0x33FFFFFF);
+        DrawText(bx + 16.f, by + 96.f, "[A] Yes, write    [B] Cancel", 1.2f, COL_WHITE);
         return;
     }
 
     // Write result overlay
     if (s_editWriteDone)
     {
-        float bx = 80.f, by = 160.f, bw = 480.f, bh = 70.f;
+        float bx = 80.f, by = 150.f, bw = 480.f, bh = 110.f;
         FillRect(bx, by, bx + bw, by + bh, 0xE0101010);
         DWORD borderCol = s_editWriteOK ? COL_GREEN : COL_RED;
         HLine(by, bx, bx + bw, borderCol);
@@ -1251,10 +1651,23 @@ static void RenderEdit(const DiagLogo& logo)
         VLine(bx, by, by + bh, borderCol);
         VLine(bx + bw, by, by + bh, borderCol);
         if (s_editWriteOK)
-            DrawText(bx + 16.f, by + 20.f, "WRITE OK  - Settings saved.", 1.3f, s_editWriteOK ? COL_GREEN : COL_RED);
+        {
+            DrawText(bx + 16.f, by + 16.f, "WRITE OK  - Settings saved.", 1.3f, COL_GREEN);
+            HLine(by + 38.f, bx + 1.f, bx + bw - 1.f, 0x3300FF00);
+            DrawText(bx + 16.f, by + 48.f, "Reboot required for changes to take effect.", 1.1f, COL_YELLOW);
+        }
         else
-            DrawText(bx + 16.f, by + 20.f, "WRITE FAILED - One or more settings not saved.", 1.2f, COL_RED);
-        DrawText(bx + 16.f, by + 44.f, "Press any button to return.", 1.1f, COL_GRAY);
+        {
+            const char* failMsg =
+                (s_editFailReason == 1) ? "FAILED - Could not read EEPROM." :
+                (s_editFailReason == 2) ? "FAILED - Security decrypt failed." :
+                (s_editFailReason == 4) ? "FAILED - Checksum validation failed." :
+                "FAILED - Write rejected by kernel.";
+            DrawText(bx + 16.f, by + 16.f, failMsg, 1.3f, COL_RED);
+            HLine(by + 38.f, bx + 1.f, bx + bw - 1.f, 0x33FF0000);
+        }
+        HLine(by + 72.f, bx + 1.f, bx + bw - 1.f, 0x33FFFFFF);
+        DrawText(bx + 16.f, by + 84.f, "Press any button to return.", 1.1f, COL_GRAY);
         return;
     }
 
@@ -1369,36 +1782,41 @@ static void RenderEdit(const DiagLogo& logo)
         DrawText(LBL_X, y, "! Changing Game Region may affect which games boot !", 1.1f, COL_RED);
         y += ROW;
 
-        // Row 0: Game Region
+        // Row 0: Game Region — display only
+        // The region is in the RC4-encrypted security section (0x2C).
+        // Writing it requires per-console key re-encryption — not supported here.
         {
-            bool sel = (s_editCursor == 0);
-            DrawText(LBL_X, y, "Game Region", 1.2f, sel ? COL_YELLOW : COL_WHITE);
+            DrawText(LBL_X, y, "Game Region", 1.2f, COL_DIM);
             static const char* greg[5] = {
                 "N. America", "Japan", "Rest of World", "Manufacturing", "ALL (debug)"
             };
             static const DWORD gregVals[5] = {
                 0x00000001, 0x00000002, 0x00000004, 0x80000000, 0xFFFFFFFF
             };
+            ULONG type = 0, len = 0;
+            DWORD gr = 0x00000001;
+            ExQueryNonVolatileSetting(XC_GAME_REGION, &type, &gr, 4, &len);
             int idx = 0;
             for (int i = 0; i < 5; ++i)
-                if (s_editGameRegion == gregVals[i]) { idx = i; break; }
-            SafeCopy(buf, sizeof(buf), sel ? "< " : "  ");
-            SafeAppend(buf, sizeof(buf), greg[idx]);
-            if (sel) SafeAppend(buf, sizeof(buf), " >");
-            DrawText(VAL_X, y, buf, 1.2f, sel ? COL_CYAN : COL_WHITE);
+                if (gr == gregVals[i]) { idx = i; break; }
+            char tmp[32];
+            SafeCopy(tmp, sizeof(tmp), greg[idx]);
+            SafeAppend(tmp, sizeof(tmp), " (read-only)");
+            DrawText(VAL_X, y, tmp, 1.2f, COL_DIM);
             y += ROW;
         }
 
         // Row 1: DVD Region
         {
-            bool sel = (s_editCursor == 1);
+            bool sel = (s_editCursor == 0);
             DrawText(LBL_X, y, "DVD Region", 1.2f, sel ? COL_YELLOW : COL_WHITE);
-            static const char* dvdr[6] = {
+            static const char* dvdr[7] = {
+                "0 - Region Free",
                 "1 (USA/CA)", "2 (EUR/JPN)", "3 (SE Asia)",
                 "4 (AUS/LAT)", "5 (USSR)", "6 (China)"
             };
-            int idx = (int)s_editDvdRegion - 1;
-            if (idx < 0 || idx > 5) idx = 0;
+            int idx = (int)s_editDvdRegion;
+            if (idx < 0 || idx > 6) idx = 0;
             SafeCopy(buf, sizeof(buf), sel ? "< " : "  ");
             SafeAppend(buf, sizeof(buf), dvdr[idx]);
             if (sel) SafeAppend(buf, sizeof(buf), " >");
@@ -1406,15 +1824,15 @@ static void RenderEdit(const DiagLogo& logo)
             y += ROW;
         }
 
-        // Row 2: Parental Control
+        // Row 2: Game Rating
         {
-            bool sel = (s_editCursor == 2);
-            DrawText(LBL_X, y, "Parental Control", 1.2f, sel ? COL_YELLOW : COL_WHITE);
+            bool sel = (s_editCursor == 1);
+            DrawText(LBL_X, y, "Game Rating", 1.2f, sel ? COL_YELLOW : COL_WHITE);
             static const char* pcr[7] = {
                 "DISABLED (All)", "Adults Only", "Mature (M)",
                 "Teen (T)", "Everyone (E)", "Kids to Adults", "Early Childhood"
             };
-            int idx = (int)s_editParental;
+            int idx = (int)s_editGameRating;
             if (idx < 0 || idx > 6) idx = 0;
             SafeCopy(buf, sizeof(buf), sel ? "< " : "  ");
             SafeAppend(buf, sizeof(buf), pcr[idx]);
@@ -1453,7 +1871,7 @@ static void RenderEdit(const DiagLogo& logo)
             if (sel)
             {
                 char utcStr[16];
-                int display = -s_tzTable[idx].stdBias;
+                int display = -TzRawBias(s_tzTable[idx]);
                 int hrs = display / 60;
                 int mins = display % 60;
                 if (mins < 0) mins = -mins;
@@ -1470,7 +1888,7 @@ static void RenderEdit(const DiagLogo& logo)
                 DrawText(VAL_X + 60.f, y, utcStr, 1.15f, COL_WHITE);
 
                 // DST note
-                if (s_tzTable[idx].dstBias != 0)
+                if (TzRawDstBias(s_tzTable[idx]) != 0)
                     DrawText(VAL_X + 120.f, y, "DST", 1.1f, COL_GREEN);
                 else
                     DrawText(VAL_X + 120.f, y, "No DST", 1.1f, COL_GRAY);
@@ -1662,14 +2080,22 @@ void EepromView_AutoRun(HANDLE hReport)
         WL("Video Std:    ", vsStr);
     }
 
-    // Game region: bytes 0x54-0x57
+    // Game region: encrypted in security section (0x2C).
+    // Read via kernel API which returns the decrypted value.
     {
-        DWORD gr = (DWORD)s_eeprom[0x54] | ((DWORD)s_eeprom[0x55] << 8)
-            | ((DWORD)s_eeprom[0x56] << 16) | ((DWORD)s_eeprom[0x57] << 24);
-        char grHex[12];
-        IntToHex(gr, 8, grHex, sizeof(grHex));
-        char grLine[16]; StrCat2(grLine, sizeof(grLine), "0x", grHex);
-        WL("Game Region:  ", grLine);
+        ULONG type = 0, len = 0;
+        DWORD gr = 0;
+        const char* grStr = "Unknown";
+        if (ExQueryNonVolatileSetting(XC_GAME_REGION, &type, &gr, 4, &len) == 0)
+        {
+            if (gr == 0x00000001) grStr = "N. America";
+            else if (gr == 0x00000002) grStr = "Japan";
+            else if (gr == 0x00000004) grStr = "Rest of World";
+            else if (gr == 0x80000000) grStr = "Manufacturing";
+            else if (gr == 0xFFFFFFFF) grStr = "All / Debug";
+        }
+        else grStr = "Kernel read failed";
+        WL("Game Region:  ", grStr);
     }
 }
 
@@ -1842,10 +2268,7 @@ static bool EepGameRegionOK()
 
 static bool EepDvdRegionOK()
 {
-    DWORD dr = EepReadDW(0x58);  // same offset as video std in user section
-    // Actually DVD region is at 0xBC in some layouts — use offset from field table
-    // EepromView stores it at user section 0xBC: XC_DVD_REGION
-    dr = EepReadDW(0xBC);
+    DWORD dr = EepReadDW(0xBC);
     return (dr <= 6);
 }
 
@@ -1864,9 +2287,9 @@ static bool EepTimezoneOK()
     // offset (within ±14 hours = ±840 minutes) and the std/dst name bytes
     // (0x68-0x6B and 0x6C-0x6F) are printable ASCII or zero.
     int bias = (int)EepReadDW(0x64);
-    if (bias < -840 * 60 || bias > 840 * 60) return false;  // stored as seconds? No, minutes
-    // Bias is stored as minutes (int32). Valid range: -840 to +840.
-    // The value is actually stored as negative minutes west of UTC.
+    // The bias is stored in minutes (int32, positive = west of UTC).
+    // Valid range: ±840 minutes (UTC-14 to UTC+14).
+    if (bias < -840 || bias > 840) return false;
     // Check name bytes are ASCII printable or zero
     for (int i = 0x68; i < 0x70; ++i)
     {
@@ -2029,7 +2452,7 @@ static void RepairBuildDiag()
     add("Video Standard", "0x58  NTSC-M/J or PAL-I/M", EepVideoStdOK(), true);
     add("Video Flags", "0x94  no undocumented bits set", EepVideoFlagsOK(), true);
     add("Audio Flags", "0x98  no undocumented bits set", EepAudioFlagsOK(), true);
-    add("Game Region", "0x54  NA / Japan / RoW / Dev", EepGameRegionOK(), true);
+    add("Game Region", "0x2C (enc)  NA / Japan / RoW / Dev", EepGameRegionOK(), true);
     add("DVD Region", "0xBC  CSS zone 0-6", EepDvdRegionOK(), true);
     add("Language", "0x90  Neutral-Portuguese (0-9)", EepLanguageOK(), true);
     add("Timezone", "0x64  valid bias + printable TZ name", EepTimezoneOK(), true);
@@ -2047,121 +2470,145 @@ static int RepairBadCount()
 }
 
 // ---- Apply repairs ----------------------------------------------------------
+// Strategy matches PrometheOS save() approach:
+//   1. Game region (security section) — kernel-managed per-field write first
+//   2. Read fresh 256-byte image
+//   3. Write all bad user-section field defaults directly into the buffer
+//   4. Recalculate both checksums in the buffer
+//   5. Write all 256 bytes atomically
+//
+// Factory checksum (item 0) is included in the Checksum2 recalculation at step 4 —
+// no separate SMBus write needed. Items 2-5 (security hash, serial, MAC, online key)
+// are detect-only and never modified.
 
 static void RepairApply()
 {
-    // 0: Factory checksum — direct SMBus write
-    if (s_repItems[0].state == REP_BAD)
-    {
-        DWORD cs = ~EepCalcChecksum(s_eeprom, 0x34, 0x2C);
-        bool ok = EepSMBusWriteDW(0x30, cs);
-        if (ok)
-        {
-            s_eeprom[0x30] = (BYTE)(cs);
-            s_eeprom[0x31] = (BYTE)(cs >> 8);
-            s_eeprom[0x32] = (BYTE)(cs >> 16);
-            s_eeprom[0x33] = (BYTE)(cs >> 24);
-        }
-        s_repItems[0].state = (ok && EepFactoryChecksumOK()) ? REP_FIXED : REP_FAIL;
-    }
-
-    // 1: User checksum — kernel recalculates when any user field is written below.
-    // 2: Security hash — detect only. 3/4/5: Serial/MAC/OnlineKey — detect only.
-
-    // 6: Video standard — reset to NTSC-M
-    if (s_repItems[6].state == REP_BAD)
-    {
-        DWORD vs = 0x00400100;
-        s_repItems[6].state = (ExSaveNonVolatileSetting(XC_VIDEO_STANDARD, REG_DWORD, &vs, 4) == 0)
-            ? REP_FIXED : REP_FAIL;
-    }
-
-    // 7: Video flags — mask to documented bits
-    if (s_repItems[7].state == REP_BAD)
-    {
-        DWORD vf = EepReadDW(0x94) & 0x005F0000;  // video flags at 0x94
-        s_repItems[7].state = (ExSaveNonVolatileSetting(XC_VIDEO_FLAGS, REG_DWORD, &vf, 4) == 0)
-            ? REP_FIXED : REP_FAIL;
-    }
-
-    // 8: Audio flags — mask to documented bits, fallback to stereo
-    if (s_repItems[8].state == REP_BAD)
-    {
-        DWORD af = EepReadDW(0x98) & 0x00030003;  // audio flags at 0x98
-        if ((af & 0x00000003) == 0x00000003) af &= ~0x00000001u; // mono+surround both set — clear mono
-        // 0x00 = stereo is the correct fallback (not 0x02 which is Surround)
-        s_repItems[8].state = (ExSaveNonVolatileSetting(XC_AUDIO_FLAGS, REG_DWORD, &af, 4) == 0)
-            ? REP_FIXED : REP_FAIL;
-    }
-
-    // 9: Game region — reset to NA
+    // ── Step 1: Game region (item 9) — kernel handles security section encryption
     if (s_repItems[9].state == REP_BAD)
     {
-        DWORD gr = 0x00000001;
-        s_repItems[9].state = (ExSaveNonVolatileSetting(XC_GAME_REGION, REG_DWORD, &gr, 4) == 0)
-            ? REP_FIXED : REP_FAIL;
+        DWORD gr = 0x00000001;  // reset to N. America
+        LONG r = ExSaveNonVolatileSetting(XC_GAME_REGION, REG_DWORD, &gr, 4);
+        s_repItems[9].state = (r == 0) ? REP_FIXED : REP_FAIL;
     }
 
-    // 10: DVD region — reset to 0
-    if (s_repItems[10].state == REP_BAD)
-    {
-        DWORD dr = 0;
-        s_repItems[10].state = (ExSaveNonVolatileSetting(XC_DVD_REGION, REG_DWORD, &dr, 4) == 0)
-            ? REP_FIXED : REP_FAIL;
-    }
-
-    // 11: Language — reset to English
-    if (s_repItems[11].state == REP_BAD)
-    {
-        DWORD lang = 1;
-        s_repItems[11].state = (ExSaveNonVolatileSetting(0x01, REG_DWORD, &lang, 4) == 0)
-            ? REP_FIXED : REP_FAIL;
-    }
-
-    // 12: Timezone — reset bias to 0 (UTC)
-    if (s_repItems[12].state == REP_BAD)
-    {
-        DWORD b = 0, d = 0;
-        LONG r0 = ExSaveNonVolatileSetting(XC_TIMEZONE_BIAS, REG_DWORD, &b, 4);
-        LONG r1 = ExSaveNonVolatileSetting(XC_TIMEZONE_STD_BIAS, REG_DWORD, &d, 4);
-        s_repItems[12].state = (r0 == 0 && r1 == 0) ? REP_FIXED : REP_FAIL;
-    }
-
-    // 13: Game rating — reset to disabled
-    if (s_repItems[13].state == REP_BAD)
-    {
-        DWORD gr = 0;
-        s_repItems[13].state = (ExSaveNonVolatileSetting(XC_MAX_GAME_RATING, REG_DWORD, &gr, 4) == 0)
-            ? REP_FIXED : REP_FAIL;
-    }
-
-    // 14: Movie rating — reset to disabled
-    if (s_repItems[14].state == REP_BAD)
-    {
-        DWORD mr = 0;
-        // XC_MAX_DVD_RATING = 0x0D in kernel
-        s_repItems[14].state = (ExSaveNonVolatileSetting(0x0D, REG_DWORD, &mr, 4) == 0)
-            ? REP_FIXED : REP_FAIL;
-    }
-
-    // 15: Parental passcode — reset to disabled (0)
-    if (s_repItems[15].state == REP_BAD)
-    {
-        DWORD pc = 0;
-        // XC_PARENTAL_CONTROL_GAMES_PASSCODE = 0x12
-        s_repItems[15].state = (ExSaveNonVolatileSetting(0x12, REG_DWORD, &pc, 4) == 0)
-            ? REP_FIXED : REP_FAIL;
-    }
-
-    // Verify user checksum after all kernel writes
+    // ── Step 2: Read fresh 256-byte image ─────────────────────────────────────
+    BYTE buf[256];
     {
         ULONG type = 0, len = 0;
-        BYTE buf[256];
-        if (ExQueryNonVolatileSetting(0xFFFF, &type, buf, 256, &len) == 0 && len >= 0xC0)
-            for (int i = 0; i < 256; ++i) s_eeprom[i] = buf[i];
+        if (ExQueryNonVolatileSetting(0xFFFF, &type, buf, 256, &len) != 0)
+        {
+            // Cannot read — mark all pending repairs failed
+            for (int i = 0; i < s_repCount; ++i)
+                if (s_repItems[i].state == REP_BAD) s_repItems[i].state = REP_FAIL;
+            return;
+        }
+    }
 
-        if (s_repItems[1].state == REP_BAD)
-            s_repItems[1].state = EepUserChecksumOK() ? REP_FIXED : REP_FAIL;
+    // ── Step 3: Write safe defaults for each bad user-section field ───────────
+
+    // Item 6: Video Standard (0x58) — factory section (Checksum2 covers this)
+    if (s_repItems[6].state == REP_BAD)
+    {
+        BufWriteDW(buf, 0x58, 0x00400100);  // NTSC-M
+        s_repItems[6].state = REP_FIXED;    // confirmed below after write
+    }
+
+    // Item 7: Video Flags (0x94) — mask undocumented bits, preserve valid ones
+    if (s_repItems[7].state == REP_BAD)
+    {
+        DWORD vf = EepReadDW(0x94) & 0x005F0000UL;
+        BufWriteDW(buf, 0x94, vf);
+        s_repItems[7].state = REP_FIXED;
+    }
+
+    // Item 8: Audio Flags (0x98) — mask undocumented bits, resolve mono+surround conflict
+    if (s_repItems[8].state == REP_BAD)
+    {
+        DWORD af = EepReadDW(0x98) & 0x00030003UL;
+        if ((af & 0x03) == 0x03) af &= ~0x01UL;  // mono+surround both set → keep surround
+        BufWriteDW(buf, 0x98, af);
+        s_repItems[8].state = REP_FIXED;
+    }
+
+    // Item 10: DVD Region (0xBC)
+    if (s_repItems[10].state == REP_BAD)
+    {
+        BufWriteDW(buf, 0xBC, 0);  // 0 = region free
+        s_repItems[10].state = REP_FIXED;
+    }
+
+    // Item 11: Language (0x90)
+    if (s_repItems[11].state == REP_BAD)
+    {
+        BufWriteDW(buf, 0x90, 1);  // 1 = English
+        s_repItems[11].state = REP_FIXED;
+    }
+
+    // Item 12: Timezone — reset to London/UTC+0 (full 44-byte block at 0x64-0x8F)
+    if (s_repItems[12].state == REP_BAD)
+    {
+        // Find the London entry (or first UTC+0 entry) in the table
+        int tzIdx = 0;
+        for (int i = 0; i < TZ_COUNT; ++i)
+            if (TzRawBias(s_tzTable[i]) == 0) { tzIdx = i; break; }
+        for (int i = 0; i < 44; ++i)
+            buf[0x64 + i] = s_tzTable[tzIdx].raw[i];
+        s_repItems[12].state = REP_FIXED;
+    }
+
+    // Item 13: Game Rating (0x9C)
+    if (s_repItems[13].state == REP_BAD)
+    {
+        BufWriteDW(buf, 0x9C, 0);  // 0 = disabled (all ages)
+        s_repItems[13].state = REP_FIXED;
+    }
+
+    // Item 14: Movie Rating (0xA4)
+    if (s_repItems[14].state == REP_BAD)
+    {
+        BufWriteDW(buf, 0xA4, 0);  // 0 = disabled
+        s_repItems[14].state = REP_FIXED;
+    }
+
+    // Item 15: Parental Passcode (0xA0)
+    if (s_repItems[15].state == REP_BAD)
+    {
+        BufWriteDW(buf, 0xA0, 0);  // 0 = disabled
+        s_repItems[15].state = REP_FIXED;
+    }
+
+    // ── Step 4: Recalculate both checksums ────────────────────────────────────
+    // Checksum2 (0x30) covers factory section 0x34-0x5F (video std lives here).
+    // Checksum3 (0x60) covers user section 0x64-0xBF (all other repaired fields).
+    // This also implicitly repairs items 0 and 1 (bad checksums).
+    EepRecalcChecksums(buf);
+
+    // ── Step 5: Write all 256 bytes atomically ────────────────────────────────
+    ULONG type = 3;
+    bool writeOK = (ExSaveNonVolatileSetting(0xFFFF, type, buf, 256) == 0);
+
+    // If write failed, demote all freshly-marked FIXED items to FAIL
+    if (!writeOK)
+    {
+        for (int i = 0; i < s_repCount; ++i)
+            if (s_repItems[i].state == REP_FIXED) s_repItems[i].state = REP_FAIL;
+        return;
+    }
+
+    // ── Step 6: Re-read and verify checksums ──────────────────────────────────
+    {
+        ULONG rtype = 0, rlen = 0;
+        BYTE verify[256];
+        if (ExQueryNonVolatileSetting(0xFFFF, &rtype, verify, 256, &rlen) == 0)
+        {
+            for (int i = 0; i < 256; ++i) s_eeprom[i] = verify[i];
+
+            // Update checksum repair states based on actual on-chip result
+            if (s_repItems[0].state == REP_BAD || s_repItems[0].state == REP_FIXED)
+                s_repItems[0].state = EepFactoryChecksumOK() ? REP_FIXED : REP_FAIL;
+            if (s_repItems[1].state == REP_BAD || s_repItems[1].state == REP_FIXED)
+                s_repItems[1].state = EepUserChecksumOK() ? REP_FIXED : REP_FAIL;
+        }
     }
 }
 

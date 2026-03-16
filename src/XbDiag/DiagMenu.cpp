@@ -161,7 +161,7 @@ static void Render(const DiagLogo& logo)
     g_pDevice->BeginScene();
 
     DrawPageChrome(logo,
-        "XbDiag v1.0 Beta -  Hardware Diagnostic Suite",
+        "XbDiag v1.0.1 Beta -  Hardware Diagnostic Suite",
         "[Up/Down] Navigate    [A] Select    [Start] Exit to Dashboard");
 
     // -------------------------------------------------------------------------

@@ -4,9 +4,24 @@
 // All hardware data read once in OnEnter().
 //
 // Layout:
-//   Left column:  CPU / Memory / Chipset+Revision
+//   Left column:  CPU / Memory / Chipset+Revision / Mods
 //   Right column: Video / Thermal / Storage / Network
 //   Bottom strip: CPU MHz | GPU MHz (live color bar)
+//
+// CPU section:
+//   CPU    (cpuIC — Coppermine-128 / Tualatin-512 / Tualatin-256 (Cel) etc.)
+//   Speed  (TSC-measured, matching PrometheOS getCPUFreq exactly)
+//   Brand  (CPUID 0x80000002-4 extended brand string)
+//   CPUID  (raw leaf 1 EAX hex)
+//
+//   Speed measurement (MeasureCpuMHz):
+//   Matches PrometheOS xboxConfig::getCPUFreq() + RDTSC() exactly:
+//     - Each RDTSC in a single __asm {} block — EAX:EDX saved before the
+//       compiler can insert code between rdtsc and the stores.  Multiple
+//       separate __asm blocks allowed EAX corruption on Tualatin upgrades.
+//     - No CPUID serialization fence (PrometheOS doesn't use one)
+//     - 64-bit TSC as double: x = hi; x *= 2^32; x += lo  (exact PrometheOS form)
+//     - Sleep(300ms) kernel-managed window
 //
 // Revision detection (aligned with PrometheOS getHardwareRevision):
 //   1. PIC reg 0x01 x3 reads  -> 3-char board string (P01/P05/P11/P2L)
@@ -16,6 +31,23 @@
 //      Focus (0xD4) ACK      -> chip ID 0x54=FS454->1.4 / 0x09=FS455->1.5
 //   3. P2L -> NV2A EMRS strap bits[19:18] -> splits 1.6 vs 1.6b
 //      Hynix (strap==3) -> 1.6b    Samsung (strap!=3) -> 1.6
+//
+// Modchip detection (full PrometheOS modchip list):
+//   Xecuter   0xF500 == 0xE1
+//   Modxo     0xDEAD == 0xAF
+//   Smartxx   0xF701 in {0xF1, 0xF2, 0xF8}
+//   Aladdin   0xF701 in {0x11, 0x15} = 1MB  /  0x69 = 2MB
+//   Xchanger  0x1912 != 0xFF
+//   Xtremium  0x00C  low nibble 1-10  (XTREMIUM_REGISTER_BANKING)
+//   Xenium    0x00EF low nibble 1-10  (XENIUM_REGISTER_BANKING)
+//
+// UDMA detection:
+//   Word 53 bit 2 must be set for word 88 to be valid (ATA spec).
+//   Xbox MCPX programs DMA mode in its own PCI timing registers without
+//   issuing software SET FEATURES — word 88 active bits (14:8) are often
+//   zero even though UDMA IS running. If word 53 bit 2 is set and supported
+//   bits are non-zero, we report the highest supported UDMA mode (no marker).
+//   '?' suffix = word 53 bit 2 clear, word 88 validity not guaranteed.
 //
 // CPU speed: measured via TSC delta over a 100ms GetTickCount() window.
 // GPU speed: NV2A PRAMDAC NVPLL at MMIO 0xFD680500 - decode M/N/P.
@@ -63,14 +95,14 @@ struct SysData
     // Chipset + board revision
     char chipDevId[12];
     char chipRev[8];
-    char boardRevPIC[4];        // raw 3-char PIC string  (P01/P05/P11/P2L/DBG...)
+    char boardRevPIC[5];        // raw 3-char PIC string + null  (P01/P05/P11/P2L/DBG...)
     char boardRevFinal[16];     // human-readable: "1.0", "1.4/1.5", "1.6b" etc.
     char serialNum[16];         // raw EEPROM serial string
     bool  rtcPresent;           // X-RTC module at SMBus 0x68
     bool  dispPresent;          // I2C display detected at 0x27, 0x3C, or 0x3D
     char  dispAddr[8];          // e.g. "0x3C"
     char  modchipName[20];      // e.g. "Aladdin 1MB", "Modxo", "None/TSOP"
-    char  hdModVer[16];         // e.g. "V1.2.3" or "Not Detected"
+    char  hdModVer[24];         // e.g. "X-HD V255.255.255 BL" (20 chars + null)
 
     // BIOS
     char biosVer[32];
@@ -192,54 +224,63 @@ static void DoCpuid(DWORD leaf,
 
 // ============================================================================
 // TSC-based CPU frequency measurement
-// Read TSC delta over a ~100ms wall-clock window.
-// Returns MHz.
+// Matches PrometheOS xboxConfig::getCPUFreq() and RDTSC() exactly.
+//
+// Key points:
+//   - Each RDTSC is a single __asm {} block — EAX and EDX are saved to locals
+//     inside the block before the compiler can insert any code between the
+//     rdtsc instruction and the stores.  Separate per-instruction __asm blocks
+//     allow the compiler to clobber EAX/EDX between them which corrupts the
+//     reading, especially at higher clock speeds (Tualatin 1000-1400 MHz).
+//   - No CPUID serialization fence — PrometheOS doesn't use one, Sleep(300)
+//     provides a wide enough window that pipeline effects are negligible.
+//   - 64-bit TSC accumulated as double (hi * 2^32 + lo) matching PrometheOS
+//     RDTSC() exactly — handles absolute TSC values without overflow.
+//   - Sleep(300ms) kernel-managed window — no busy-wait.
 // ============================================================================
 
 static DWORD MeasureCpuMHz()
 {
-    DWORD lo0, hi0, lo1, hi1;
+    unsigned long lo0, hi0, lo1, hi1;
 
-    // Try to align to a tick boundary for accuracy, but don't bail out
-    // if we miss it — 100ms is wide enough that alignment barely matters.
-    DWORD tickStart = GetTickCount();
-    for (int spin = 0; spin < 5000000; ++spin)
-    {
-        DWORD t = GetTickCount();
-        if (t != tickStart) { tickStart = t; break; }
-        if ((t - tickStart) > 50) break;
-    }
-
+    // First RDTSC — single block so the compiler saves EAX:EDX atomically
     __asm
     {
         rdtsc
         mov lo0, eax
         mov hi0, edx
     }
+    DWORD tick0 = GetTickCount();
 
-    // Wait ~100ms with hard ceiling of 500ms
-    DWORD deadline = tickStart + 500;
-    while ((GetTickCount() - tickStart) < 100)
-    {
-        if ((GetTickCount() - tickStart) > 500) break;
-    }
-    DWORD tickEnd = GetTickCount();
+    Sleep(300);
 
+    // Second RDTSC — same single-block pattern
     __asm
     {
         rdtsc
         mov lo1, eax
         mov hi1, edx
     }
+    DWORD tick1 = GetTickCount();
 
-    DWORD elapsed = tickEnd - tickStart;
+    DWORD elapsed = tick1 - tick0;
     if (elapsed == 0) return 733;
 
-    DWORD tscDelta = lo1 - lo0;
-    DWORD mhz = tscDelta / (elapsed * 1000);
-    // Sanity check — covers stock 733MHz through Tualatin upgrades (~1400MHz)
-    if (mhz < 400 || mhz > 1500) return 733;
-    return mhz;
+    // Build 64-bit TSC values as doubles, matching PrometheOS RDTSC() exactly:
+    //   x = hi; x *= 0x100000000; x += lo;
+    double tsc0 = (double)hi0; tsc0 *= 4294967296.0; tsc0 += (double)lo0;
+    double tsc1 = (double)hi1; tsc1 *= 4294967296.0; tsc1 += (double)lo1;
+
+    // (tsc_delta / elapsed_ms) / 1000 = MHz
+    // Matching PrometheOS: fcpu = delta / ms_elapsed; return fcpu / 1000;
+    double fcpu = tsc1 - tsc0;
+    fcpu /= (double)elapsed;
+    double mhz = fcpu / 1000.0;
+
+    // Sanity: 400 MHz (lower than any real Xbox) to 1600 MHz (above Tualatin max)
+    if (mhz < 400.0 || mhz > 1600.0) return 733;
+
+    return (DWORD)Ftoi((float)mhz);
 }
 
 // ============================================================================
@@ -423,7 +464,7 @@ static void DetectBoardRevision(SysData& d, BYTE nvRev)
     d.boardRevPIC[0] = ok ? (char)b0 : '?';
     d.boardRevPIC[1] = ok ? (char)b1 : '?';
     d.boardRevPIC[2] = ok ? (char)b2 : '?';
-    d.boardRevPIC[3] = ' ';
+    d.boardRevPIC[3] = '\0';   // properly null-terminated — adjacent boardRevFinal is NOT a backstop
 
     if (!ok) { StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "UNKNOWN"); return; }
 
@@ -504,48 +545,84 @@ static void DetectBoardRevision(SysData& d, BYTE nvRev)
 }
 
 // ============================================================================
-// Modchip detection  (ref: PrometheOS modchip::detectModchip)
+// Modchip detection  (ref: PrometheOS modchip::detectModchip + individual chip files)
 // Uses direct port I/O reads at known modchip LPC signature addresses.
 // Returns a static string — do not free.
 // IMPORTANT: unknown result means TSOP/no modchip, NOT a probe failure.
+//
+// Probe order (most-unique signatures first to avoid aliasing):
+//   Xecuter   0xF500 == 0xE1          (PrometheOS: active)
+//   Modxo     0xDEAD == 0xAF          (PrometheOS: active)
+//   Smartxx   0xF701 in {0xF1,F2,F8}  (PrometheOS: commented out, values confirmed)
+//   Aladdin   0xF701 in {0x11,15,69}  (PrometheOS: active — read same port as above)
+//   Xchanger  0x1912 != 0xFF          (PrometheOS: active)
+//   Xtremium  0x00C  low nibble 1-10  (XTREMIUM_REGISTER_BANKING; distinct from Xenium)
+//   Xenium    0x00EF low nibble 1-10  (XENIUM_REGISTER_BANKING; also Smartxx fallback,
+//                                      but Smartxx caught above via 0xF701)
+//
+// Xenium/Xtremium/Smartxx were commented out of PrometheOS's detectModchip()
+// because PrometheOS defaults to Xenium (it knows it launched from one).
+// XbDiag cannot default — we use safe read-only bank-register probes instead.
+// On an unmodded LPC bus, floating pulls return 0xFF; valid bank IDs are 0x01-0x0A.
 // ============================================================================
 
 static const char* DetectModchip()
 {
-    // Each probe: read a port, check for a known signature byte.
-    // All inline __asm per-instruction (no __ftol2_sse concern here, but
-    // keeping consistent with project style).
     BYTE val = 0;
 
-    // Xecuter: port 0xF500 == 0xE1
+    // ---- Xecuter: port 0xF500 == 0xE1 ----
     __asm { mov dx, 0xF500 }
     __asm { in  al, dx     }
     __asm { mov val, al    }
     if (val == 0xE1) return "Xecuter";
 
-    // Modxo: port 0xDEAD == 0xAF
+    // ---- Modxo: port 0xDEAD == 0xAF ----
     __asm { mov dx, 0xDEAD }
     __asm { in  al, dx     }
     __asm { mov val, al    }
     if (val == 0xAF) return "Modxo";
 
-    // Aladdin 1MB Lattice: port 0xF701 == 0x11
+    // ---- Smartxx + Aladdin share port 0xF701 — read once, branch on value ----
+    // Smartxx values (from PrometheOS modchipSmartxx, commented-out probe):
+    //   0xF1 = OGXbox Smartxx v1.0
+    //   0xF2 = OGXbox Smartxx v2.0
+    //   0xF8 = Smartxx OPX
+    // Aladdin values: 0x11 (Lattice 1MB), 0x15 (Xilinx 1MB), 0x69 (Lattice 2MB)
     __asm { mov dx, 0xF701 }
     __asm { in  al, dx     }
     __asm { mov val, al    }
-    if (val == 0x11) return "Aladdin 1MB";
+    if (val == 0xF1 || val == 0xF2 || val == 0xF8) return "Smartxx";
+    if (val == 0x11 || val == 0x15)                return "Aladdin 1MB";
+    if (val == 0x69)                               return "Aladdin 2MB";
 
-    // Aladdin 1MB Xilinx: port 0xF701 == 0x15
-    if (val == 0x15) return "Aladdin 1MB";
-
-    // Aladdin 2MB Lattice: port 0xF701 == 0x69
-    if (val == 0x69) return "Aladdin 2MB";
-
-    // Xchanger: port 0x1912 != 0xFF
+    // ---- Xchanger: port 0x1912 != 0xFF ----
     __asm { mov dx, 0x1912 }
     __asm { in  al, dx     }
     __asm { mov val, al    }
     if (val != 0xFF) return "Xchanger";
+
+    // ---- Xtremium: XTREMIUM_REGISTER_BANKING = 0x00C ----
+    // Low nibble encodes the active bank; valid range 0x01-0x0A.
+    // Xtremium uses a different banking port than Xenium (0x00C vs 0x00EF),
+    // so we can distinguish them with read-only probes.
+    __asm { mov dx, 0x000C }
+    __asm { in  al, dx     }
+    __asm { mov val, al    }
+    {
+        BYTE bank = val & 0x0F;
+        if (bank >= 1 && bank <= 10) return "Xtremium";
+    }
+
+    // ---- Xenium: XENIUM_REGISTER_BANKING = 0x00EF ----
+    // Same low-nibble bank encoding (1-10).
+    // If we reach here Smartxx is already excluded (caught via 0xF701 above).
+    __asm { mov dx, 0x00EF }
+    __asm { in  al, dx     }
+    __asm { mov val, al    }
+    {
+        BYTE bank = val & 0x0F;
+        if (bank >= 1 && bank <= 10) return "Xenium";
+    }
 
     // No known signature matched — TSOP or softmod boot
     return "None / TSOP";
@@ -641,6 +718,12 @@ static void ReadSysData()
         DWORD ea, eb, ec, ed;
         DoCpuid(1, ea, eb, ec, ed);
         d.isXemu = (ec & 0x80000000UL) != 0;   // bit 31 = hypervisor present
+
+        // Store raw CPUID leaf 1 EAX here unconditionally — both real hardware
+        // and xemu paths use it on-screen; on xemu it reflects the host CPU.
+        char eaxHex[10];
+        IntToHex(ea, 8, eaxHex, sizeof(eaxHex));
+        StrCat2(d.cpuLeaf1, sizeof(d.cpuLeaf1), "0x", eaxHex);
     }
 
     // --- CPU brand string (CPUID 0x80000002-4) ---
@@ -690,8 +773,9 @@ static void ReadSysData()
     }
 
     // --- CPU IC identification ---
-    // Under xemu: show the brand string directly with * marker.
-    // On real hardware: derive from CPUID leaf 1 family/model.
+    // Shown on screen as "CPU    :" and also written to export/text files.
+    // Derived from CPUID leaf 1 family/model — reliable on all Xbox revisions
+    // including Tualatin upgrades (family 6 model 0x0B).
     //   Model  8 (0x08) = Coppermine  (retail Xbox: 128KB L2)
     //   Model 11 (0x0B) = Tualatin    (upgrade: PIII-S 512KB or Celeron 256KB)
     //   Model  8 + "Celeron" in brand = Celeron Coppermine upgrade
@@ -707,15 +791,13 @@ static void ReadSysData()
     }
     else
     {
+        // Re-use the values already read from leaf 1 in the hypervisor check above.
+        // We call DoCpuid(1) once more here rather than storing all four regs up
+        // there — avoids growing the hypervisor block and the cost is negligible.
         DWORD ea1, eb1, ec1, ed1;
         DoCpuid(1, ea1, eb1, ec1, ed1);
         BYTE cpuFamily = (BYTE)((ea1 >> 8) & 0x0F);
         BYTE cpuModel = (BYTE)((ea1 >> 4) & 0x0F);
-        BYTE cpuStepping = (BYTE)(ea1 & 0x0F);
-        (void)cpuStepping;
-        // Store raw EAX for on-screen diagnosis
-        char eaxHex[10]; IntToHex(ea1, 8, eaxHex, sizeof(eaxHex));
-        StrCat2(d.cpuLeaf1, sizeof(d.cpuLeaf1), "0x", eaxHex);
 
         // Scan brand string for "Celeron"
         bool isCeleron = false;
@@ -1016,53 +1098,82 @@ static void ReadSysData()
                 + sectorLo / (2UL * 1024UL * 1024UL);
             char t[12]; IntToStr((int)gb, t, sizeof(t));
             StrCat2(d.hddSizeGB, sizeof(d.hddSizeGB), t, " GB");
-            // UDMA: word 88 high byte = active bits, low byte = supported bits.
-            // Active bits are zero at IDENTIFY time if SET FEATURES hasn't been
-            // issued yet (normal on cold-boot ATA). Fall back to supported bits
-            // and mark with '*'. If word 88 is entirely zero, fall back to MWDMA
-            // (word 63 high byte), then PIO.
-            BYTE active = (BYTE)(buf[88] >> 8) & 0x7F;
-            BYTE supported = (BYTE)(buf[88] & 0xFF) & 0x7F;
-            int  mode = -1;
-            bool isFallback = false;
-
-            for (int i = 6; i >= 0; --i)
-                if (active & (1 << i)) { mode = i; break; }
-
-            if (mode < 0)
+            // UDMA detection (ATA/ATAPI-7 T13 spec):
+            //   Word 53 bit 2: must be set for word 88 to be valid.
+            //   Word 88 bits 6:0  = supported UDMA modes (bit N = mode N supported).
+            //   Word 88 bits 14:8 = active   UDMA modes (bit 8+N = mode N active).
+            //
+            // Xbox MCPX behavior:
+            //   The MCPX/nForce IDE controller programs DMA mode in its own
+            //   PCI timing registers without issuing a software SET FEATURES
+            //   command to the drive.  As a result, the "active" bits in word 88
+            //   (bits 14:8) are often zero even though the drive IS running UDMA.
+            //   Treat a word53-valid, zero-active, non-zero-supported result as
+            //   "MCPX-configured UDMA" — report the highest supported mode without
+            //   the asterisk, since the hardware IS using it; asterisk is reserved
+            //   for the case where word 53 bit 2 is NOT set (word 88 unreliable).
             {
-                // Active bits zero — use supported bits
-                for (int i = 6; i >= 0; --i)
-                    if (supported & (1 << i)) { mode = i; isFallback = true; break; }
-            }
+                bool w88valid = !!(buf[53] & (1 << 2));  // word 53 bit 2
 
-            if (mode >= 0)
-            {
-                char t2[4]; IntToStr(mode, t2, sizeof(t2));
-                StrCopy(d.hddUDMA, sizeof(d.hddUDMA), "UDMA");
-                StrCat2(d.hddUDMA, sizeof(d.hddUDMA), d.hddUDMA, t2);
-                if (isFallback) StrCat2(d.hddUDMA, sizeof(d.hddUDMA), d.hddUDMA, "*");
-            }
-            else
-            {
-                // Try MWDMA (word 63 high byte = active, low byte = supported)
-                BYTE mwActive = (BYTE)(buf[63] >> 8) & 0x07;
-                BYTE mwSupp = (BYTE)(buf[63] & 0xFF) & 0x07;
-                int  mwMode = -1;
-                for (int i = 2; i >= 0; --i)
-                    if (mwActive & (1 << i)) { mwMode = i; break; }
-                if (mwMode < 0)
-                    for (int i = 2; i >= 0; --i)
-                        if (mwSupp & (1 << i)) { mwMode = i; isFallback = true; break; }
+                BYTE active = (BYTE)(buf[88] >> 8) & 0x7F;  // bits 14:8 -> 6:0
+                BYTE supported = (BYTE)(buf[88] & 0xFF) & 0x7F;  // bits  6:0
 
-                if (mwMode >= 0)
+                int  mode = -1;
+                bool needAster = false;   // asterisk = "word 88 validity uncertain"
+
+                if (w88valid && (active || supported))
                 {
-                    char t2[4]; IntToStr(mwMode, t2, sizeof(t2));
-                    StrCopy(d.hddUDMA, sizeof(d.hddUDMA), "MWDMA");
-                    StrCat2(d.hddUDMA, sizeof(d.hddUDMA), d.hddUDMA, t2);
-                    if (isFallback) StrCat2(d.hddUDMA, sizeof(d.hddUDMA), d.hddUDMA, "*");
+                    // Prefer confirmed-active bits; fall back to supported.
+                    // On MCPX consoles active is usually 0; use supported cleanly.
+                    BYTE use = active ? active : supported;
+                    for (int i = 6; i >= 0; --i)
+                        if (use & (1 << i)) { mode = i; break; }
+
+                    // Only mark with asterisk if we fell back AND word 53 says
+                    // word 88 is not valid (should never reach here, but guard anyway).
+                    needAster = false;
                 }
-                else StrCopy(d.hddUDMA, sizeof(d.hddUDMA), "PIO");
+                else if (!w88valid && (active || supported))
+                {
+                    // Word 53 bit 2 clear — word 88 data is not ATA-spec-guaranteed.
+                    // Still try to use it but flag with asterisk.
+                    BYTE use = active ? active : supported;
+                    for (int i = 6; i >= 0; --i)
+                        if (use & (1 << i)) { mode = i; break; }
+                    needAster = true;
+                }
+
+                if (mode >= 0)
+                {
+                    char t2[4]; IntToStr(mode, t2, sizeof(t2));
+                    StrCopy(d.hddUDMA, sizeof(d.hddUDMA), "UDMA");
+                    StrCat2(d.hddUDMA, sizeof(d.hddUDMA), d.hddUDMA, t2);
+                    if (needAster) StrCat2(d.hddUDMA, sizeof(d.hddUDMA), d.hddUDMA, "?");
+                }
+                else
+                {
+                    // Word 88 was zero or unusable — fall back to MWDMA (word 63).
+                    // Word 63 bits 10:8 = active MWDMA, bits 2:0 = supported MWDMA.
+                    BYTE mwActive = (BYTE)(buf[63] >> 8) & 0x07;
+                    BYTE mwSupp = (BYTE)(buf[63] & 0xFF) & 0x07;
+                    int  mwMode = -1;
+                    bool mwFall = false;
+
+                    for (int i = 2; i >= 0; --i)
+                        if (mwActive & (1 << i)) { mwMode = i; break; }
+                    if (mwMode < 0)
+                        for (int i = 2; i >= 0; --i)
+                            if (mwSupp & (1 << i)) { mwMode = i; mwFall = true; break; }
+
+                    if (mwMode >= 0)
+                    {
+                        char t2[4]; IntToStr(mwMode, t2, sizeof(t2));
+                        StrCopy(d.hddUDMA, sizeof(d.hddUDMA), "MWDMA");
+                        StrCat2(d.hddUDMA, sizeof(d.hddUDMA), d.hddUDMA, t2);
+                        if (mwFall) StrCat2(d.hddUDMA, sizeof(d.hddUDMA), d.hddUDMA, "?");
+                    }
+                    else StrCopy(d.hddUDMA, sizeof(d.hddUDMA), "PIO");
+                }
             }
         }
         else
@@ -1724,10 +1835,21 @@ static void Render(const DiagLogo& logo)
 
     // ---- LEFT: CPU ----
     DrawSection(C1, y1, RULEW, "CPU");                          y1 += LH + 4.f;
-    DrawRow(C1, y1, V1, "CPU    :", d.cpuIC, COL_CYAN);  y1 += LH;
+    // Only show the CPU identifier row when we have a useful value.
+    // "Unknown CPU" and "P6 model 0x.." are suppressed — they add no
+    // diagnostic value and would just confuse users on unrecognised silicon.
+    {
+        bool icKnown = (d.cpuIC[0] != '\0')
+            && (d.cpuIC[0] != 'U')   // "Unknown CPU"
+            && (d.cpuIC[0] != 'P');  // "P6 model 0x.."
+        if (icKnown)
+        {
+            DrawRow(C1, y1, V1, "CPU    :", d.cpuIC,
+                d.isXemu ? COL_YELLOW : COL_CYAN);              y1 += LH;
+        }
+    }
     DrawRow(C1, y1, V1, "SPEED  :", d.cpuSpeedMHz, COL_WHITE); y1 += LH;
-    DrawRow(C1, y1, V1, "BRAND  :", d.cpuBrand,
-        d.isXemu ? COL_YELLOW : COL_DIM);                       y1 += LH;
+    DrawRow(C1, y1, V1, "BRAND  :", d.cpuBrand, COL_DIM);      y1 += LH;
     DrawRow(C1, y1, V1, "CPUID  :", d.cpuLeaf1, COL_DIM);      y1 += LH + GAP;
 
     // ---- LEFT: Memory ----

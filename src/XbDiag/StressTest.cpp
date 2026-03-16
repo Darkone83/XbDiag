@@ -174,9 +174,10 @@ static DWORD s_abortHoldStart = 0;
 static int s_tempThreshold = 75;
 static bool s_thermalAbort = false;  // set true if test stopped by over-temp
 
-// Render interval during CPU stress (ms) — ~10fps keeps the NV2A watchdog
-// fed while burning almost all available CPU time between frames.
-static const DWORD RENDER_INTERVAL_MS = 100;
+// Render interval during CPU stress — longer = longer uninterrupted burn periods.
+// With 8 inner FFT cycles per GetTickCount check, the burn is already less
+// interruptible; 500ms gives roughly 2fps UI updates during the soak.
+static const DWORD RENDER_INTERVAL_MS = 500;
 static DWORD s_nextRender = 0;
 
 // Real load measurement — tracks actual time spent inside CPUStress()
@@ -529,7 +530,7 @@ static void DrawGraph()
 
         // Load — green (matches CPU LOAD bar)
         {
-            DWORD lc = D3DCOLOR_XRGB(50, 220, 80);
+            DWORD lc = D3DCOLOR_XRGB(220, 50, 220);
             float yA = GRAPH_B - GRAPH_H * ((float)s_histLoad[idxA] / GRAPH_MAX);
             float yB = GRAPH_B - GRAPH_H * ((float)s_histLoad[idxB] / GRAPH_MAX);
             for (int s = 0; s <= steps; ++s)
@@ -567,7 +568,7 @@ static void DrawGraph()
         FillRect(dotX - 3.f, cpuY - 3.f, dotX + 3.f, cpuY + 3.f,
             TempColor((int)s_curCPU, CPU_WARN, CPU_HOT));
         FillRect(dotX - 3.f, loadY - 3.f, dotX + 3.f, loadY + 3.f,
-            D3DCOLOR_XRGB(50, 220, 80));
+            D3DCOLOR_XRGB(220, 50, 220));
         if (s_fanOK)
         {
             float fanY = GRAPH_B - GRAPH_H * ((float)((int)s_curFan * 2) / GRAPH_MAX);
@@ -585,8 +586,8 @@ static void DrawGraph()
         DrawText(lx + 13.f, ly - 1.f, "CPU TEMP", 1.0f, cpuLegCol);
     }
     ly += 11.f;
-    FillRect(lx, ly, lx + 10.f, ly + 5.f, D3DCOLOR_XRGB(50, 220, 80));
-    DrawText(lx + 13.f, ly - 1.f, "LOAD %", 1.0f, D3DCOLOR_XRGB(50, 220, 80));
+    FillRect(lx, ly, lx + 10.f, ly + 5.f, D3DCOLOR_XRGB(220, 50, 220));
+    DrawText(lx + 13.f, ly - 1.f, "LOAD %", 1.0f, D3DCOLOR_XRGB(220, 50, 220));
     ly += 11.f;
     FillRect(lx, ly, lx + 10.f, ly + 5.f, COL_ORANGE);
     DrawText(lx + 13.f, ly - 1.f, "FAN %", 1.0f, COL_ORANGE);
@@ -639,6 +640,12 @@ static void DrawGraph()
             StrCat2(fanStat, sizeof(fanStat), fanStat, "%");
             DrawText(GRAPH_X + 180.f, bly, fanStat, 1.0f, COL_ORANGE);
         }
+
+        // SSE1 status — bottom right of graph
+        if (StressMath_SSEEnabled())
+            DrawText(GRAPH_R - 84.f, bly, "SSE1 ON", 1.0f, D3DCOLOR_XRGB(80, 200, 255));
+        else
+            DrawText(GRAPH_R - 84.f, bly, "SSE1 OFF", 1.0f, COL_DIM);
     }
 }
 
@@ -881,7 +888,7 @@ static void RenderCPUCard(const DiagLogo& logo)
             float fillW = bw * (loadPct / 100.f);
             if (fillW > bw) fillW = bw;
             FillRectGrad(bx, by, bx + fillW, by + LOAD_BAR_H,
-                D3DCOLOR_XRGB(50, 220, 80), D3DCOLOR_XRGB(20, 140, 40));
+                D3DCOLOR_XRGB(220, 50, 220), D3DCOLOR_XRGB(140, 20, 140));
         }
 
         char pctBuf[8]; IntToStr(loadPct, pctBuf, sizeof(pctBuf));
@@ -1886,20 +1893,13 @@ void StressTest_Tick(const DiagLogo& logo)
         // ── Window close + sensor sample ─────────────────────────────────────
         if ((now - s_windowStartMs) >= SAMPLE_INTERVAL_BURN_MS)
         {
-            // Fixed denominator: always the intended window size, never the
-            // drifted elapsed time.  Clamp to 100 in case burn somehow overran.
             DWORD load = (s_burnAccumMs * 100) / SAMPLE_INTERVAL_BURN_MS;
             s_measuredLoad = (load > 100) ? 100 : (BYTE)load;
             s_burnAccumMs = 0;
-
-            // Edge-aligned advance: move the window boundary forward by exactly
-            // one window width, not by "now".  Any scheduling jitter stays out
-            // of the next window's denominator.
             s_windowStartMs += SAMPLE_INTERVAL_BURN_MS;
-
             TakeSample();
             s_curMHz = ReadCPUMHz();
-            s_lastSample = s_windowStartMs;   // sample timestamp tracks the boundary
+            s_lastSample = s_windowStartMs;
         }
 
         // ── Render at ~10fps ─────────────────────────────────────────────────
@@ -1913,14 +1913,23 @@ void StressTest_Tick(const DiagLogo& logo)
         }
 
         // ── Burn until 2ms before the next window boundary ───────────────────
-        // Only wall time spent inside CPUStress() enters s_burnAccumMs —
-        // render time and sensor SMBus time are excluded by design.
+        // burnUntil is the end of the current (not yet closed) window.
+        // CPUStress runs x87 + SSE kernels for the bulk of the window.
+        // MemFlood_Timed follows as a tail to exercise FSB/DRAM.
         {
             DWORD burnUntil = s_windowStartMs + SAMPLE_INTERVAL_BURN_MS - 2;
+            static const DWORD MEM_SLICE_MS = 300;  // 4 memory patterns need more time
             DWORD burnStart = GetTickCount();
             if (burnStart < burnUntil)
             {
-                CPUStress(burnUntil);
+                DWORD cpuDeadline = burnUntil - MEM_SLICE_MS;
+                if (burnStart < cpuDeadline)
+                    CPUStress(cpuDeadline);
+
+                DWORD memStart = GetTickCount();
+                if (memStart < burnUntil)
+                    MemFlood_Timed(burnUntil);
+
                 s_burnAccumMs += GetTickCount() - burnStart;
             }
         }
@@ -2026,12 +2035,21 @@ void StressTest_AutoRun(HANDLE hReport, DWORD durationMs)
         }
 
         // Burn until 2ms before next window boundary
-        DWORD burnUntil = s_windowStartMs + SAMPLE_INTERVAL_BURN_MS - 2;
-        DWORD burnStart = GetTickCount();
-        if (burnStart < burnUntil)
         {
-            CPUStress(burnUntil);
-            s_burnAccumMs += GetTickCount() - burnStart;
+            DWORD burnUntil = s_windowStartMs + SAMPLE_INTERVAL_BURN_MS - 2;
+            static const DWORD MEM_SLICE_MS = 300;
+            DWORD burnStart = GetTickCount();
+            if (burnStart < burnUntil)
+            {
+                DWORD cpuDeadline = (burnUntil > MEM_SLICE_MS)
+                    ? burnUntil - MEM_SLICE_MS : burnUntil;
+                if (burnStart < cpuDeadline)
+                    CPUStress(cpuDeadline);
+                DWORD memStart = GetTickCount();
+                if (memStart < burnUntil)
+                    MemFlood_Timed(burnUntil);
+                s_burnAccumMs += GetTickCount() - burnStart;
+            }
         }
     }
 

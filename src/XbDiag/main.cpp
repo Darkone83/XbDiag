@@ -82,10 +82,19 @@ void RequestState(int newState)
 // ============================================================================
 // Video mode detection
 // Reads XGetVideoFlags() and XGetVideoStandard() to pick the best available
-// mode.  Priority: 720p > 1080i > 480p > 576i (PAL) > 480i (NTSC fallback).
+// mode.  Priority: 720p > 1080i > 480p > 576i (PAL-I) > 480i (NTSC/PAL-M/PAL60).
 // Sets g_sx, g_sy, g_isHD, g_videoModeStr before D3D init.
 // SW/SH remain fixed at 640/480 design units - only g_sx/g_sy know the real res.
 // Returns the present flags and backbuffer dims to use in CreateDevice.
+//
+// PAL notes:
+//   XC_VIDEO_STANDARD_PAL_I  (0x00800300) — Europe/Australia 576i 50Hz
+//   XC_VIDEO_STANDARD_PAL_M  (0x00400400) — Brazil: PAL colour, NTSC timing
+//                                            480i 60Hz, treat same as NTSC
+//   XC_VIDEO_FLAGS_PAL_60Hz  (0x00400000) — PAL-I console with 60Hz-capable TV:
+//                                            outputs 480i 60Hz, treat same as NTSC
+//   PAL 4:3 backbuffer = 640×576, NOT 720×576.
+//   720×576 is widescreen/anamorphic PAL — incorrect for a diagnostic tool.
 // ============================================================================
 
 struct VideoMode
@@ -96,6 +105,12 @@ struct VideoMode
     DWORD refreshHz;
 };
 
+// XC_VIDEO_STANDARD_PAL_M is not defined in the Xbox SDK headers.
+// Value from EepromEditor (Eeprom.cs VideoStandard enum) — Brazil PAL-M.
+#ifndef XC_VIDEO_STANDARD_PAL_M
+#define XC_VIDEO_STANDARD_PAL_M 0x00400400
+#endif
+
 static VideoMode DetectVideoMode()
 {
     DWORD vidStd = XGetVideoStandard();
@@ -104,7 +119,15 @@ static VideoMode DetectVideoMode()
     VideoMode m;
     m.refreshHz = 60;
 
-    bool isPAL = (vidStd == XC_VIDEO_STANDARD_PAL_I);
+    // PAL-I: Europe/Australia — 576i 50Hz UNLESS the PAL60 flag overrides it.
+    // PAL-M: Brazil — NTSC timing (480i 60Hz); treat as NTSC for mode selection.
+    bool isPAL_I = (vidStd == XC_VIDEO_STANDARD_PAL_I);
+    bool isPAL_M = (vidStd == XC_VIDEO_STANDARD_PAL_M);
+    bool hasPAL60 = (vidFlags & XC_VIDEO_FLAGS_PAL_60Hz) != 0;
+
+    // True 576i 50Hz PAL: PAL-I console, no PAL60 override, no HD mode selected
+    bool isTruePAL50 = isPAL_I && !hasPAL60;
+
     bool has720p = (vidFlags & XC_VIDEO_FLAGS_HDTV_720p) != 0;
     bool has480p = (vidFlags & XC_VIDEO_FLAGS_HDTV_480p) != 0;
     bool has1080i = (vidFlags & XC_VIDEO_FLAGS_HDTV_1080i) != 0;
@@ -119,7 +142,6 @@ static VideoMode DetectVideoMode()
     }
     else if (has1080i)
     {
-        // 1080i — full 1920x1080 interlaced; rare on OG Xbox but handled
         m.width = 1920;
         m.height = 1080;
         m.presentFlags = D3DPRESENTFLAG_INTERLACED | D3DPRESENTFLAG_WIDESCREEN;
@@ -134,28 +156,40 @@ static VideoMode DetectVideoMode()
         StrCopy(g_videoModeStr, sizeof(g_videoModeStr), "480p");
         g_isHD = true;
     }
-    else if (isPAL)
+    else if (isTruePAL50)
     {
-        m.width = 720;
+        // Standard PAL-I 576i — 50Hz interlaced, 4:3 backbuffer.
+        // Width = 640 (not 720): 720×576 is widescreen/anamorphic PAL.
+        // Standard 4:3 PAL on OG Xbox is 640×576, giving a 1:1 pixel
+        // mapping in design space horizontally (g_sx = 1.0) with a small
+        // vertical stretch (g_sy = 576/480 = 1.2) for the extra scan lines.
+        // D3DPRESENTFLAG_INTERLACED is required — without it the NV2A
+        // does not field-blend correctly and output looks wrong on PAL TVs.
+        m.width = 640;
         m.height = 576;
-        m.presentFlags = 0;
+        m.presentFlags = D3DPRESENTFLAG_INTERLACED;
         m.refreshHz = 50;
         StrCopy(g_videoModeStr, sizeof(g_videoModeStr), "576i PAL");
         g_isHD = false;
     }
     else
     {
-        // NTSC 480i - baseline fallback
+        // NTSC 480i baseline — also used for:
+        //   PAL-I + PAL60 flag (480i 60Hz on a PAL console)
+        //   PAL-M (Brazil: PAL colour, NTSC timing, 480i 60Hz)
         m.width = 640;
         m.height = 480;
         m.presentFlags = D3DPRESENTFLAG_INTERLACED;
-        StrCopy(g_videoModeStr, sizeof(g_videoModeStr), "480i");
+        if (isPAL_I && hasPAL60)
+            StrCopy(g_videoModeStr, sizeof(g_videoModeStr), "480i PAL60");
+        else if (isPAL_M)
+            StrCopy(g_videoModeStr, sizeof(g_videoModeStr), "480i PAL-M");
+        else
+            StrCopy(g_videoModeStr, sizeof(g_videoModeStr), "480i");
         g_isHD = false;
     }
 
-    // Update runtime layout globals
-    // SW/SH are compile-time constants (640/480 design space).
-    // g_sx/g_sy scale those design coords to the actual backbuffer at draw time.
+    // g_sx/g_sy scale 640×480 design coordinates to actual backbuffer pixels.
     g_sx = (float)m.width / 640.0f;
     g_sy = (float)m.height / 480.0f;
 
