@@ -43,8 +43,8 @@ enum
     MSTATE_STRESS = 10,
     MSTATE_FILES = 11,
     MSTATE_XBSET = 12,
-    MSTATE_UPDATE = 14,
-    MSTATE_EXIT = 13,
+    MSTATE_UPDATE = 13,
+    MSTATE_EXIT = 14,
 };
 
 // ============================================================================
