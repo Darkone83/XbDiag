@@ -18,6 +18,7 @@
 #include "DiagCommon.h"
 #include "input.h"
 #include "FtpServ.h"
+#include "Update.h"
 #include <xtl.h>
 
 extern "C" LONG __stdcall ExQueryNonVolatileSetting(
@@ -239,9 +240,150 @@ static void LCDReadSensors()
 // Pages
 // ============================================================================
 
+// Simple null-safe string equality (no CRT strcmp, no StrCmp in DiagCommon)
+static bool StrEq(const char* a, const char* b)
+{
+    while (*a && *b && *a == *b) { ++a; ++b; }
+    return *a == '\0' && *b == '\0';
+}
+
+// ============================================================================
+// CerBIOS LCD conflict detection
+// Parses E:\Cerbios\cerbios.ini inline — no external module.
+// Returns true if CerBIOS owns the SMBus LCD at the given 7-bit address.
+// ============================================================================
+
+#define CERBIOS_INI_PATH "E:\\Cerbios\\cerbios.ini"
+
+static bool CerBiosOwnsLCD(BYTE addr7bit)
+{
+    HANDLE hFile = CreateFileA(CERBIOS_INI_PATH, GENERIC_READ, FILE_SHARE_READ,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return false;  // not a CerBIOS install
+
+    bool lcdEnable = false;
+    int  lcdBus = 0;
+    BYTE lcdAddr = 0x3C;  // CerBIOS default
+    bool gotEnable = false, gotBus = false, gotAddr = false;
+
+    char line[256];
+    DWORD nRead;
+    int lineLen = 0;
+
+    while (!(gotEnable && gotBus && gotAddr))
+    {
+        // Read one line
+        lineLen = 0;
+        bool eof = false;
+        while (lineLen < (int)sizeof(line) - 1)
+        {
+            char ch;
+            if (!ReadFile(hFile, &ch, 1, &nRead, NULL) || nRead == 0) { eof = true; break; }
+            if (ch == '\n') break;
+            if (ch == '\r') continue;
+            line[lineLen++] = ch;
+        }
+        line[lineLen] = '\0';
+        if (eof && lineLen == 0) break;
+
+        // Skip blank lines and comments
+        int s = 0;
+        while (line[s] == ' ' || line[s] == '\t') ++s;
+        if (line[s] == '\0' || line[s] == ';') continue;
+
+        // Find '='
+        int eq = -1;
+        for (int i = s; line[i]; ++i) if (line[i] == '=') { eq = i; break; }
+        if (eq < 0) continue;
+
+        // Extract and lowercase key
+        char key[32]; int kl = 0;
+        for (int i = s; i < eq && kl < 31; ++i)
+        {
+            char c = line[i];
+            if (c == ' ' || c == '\t') continue;
+            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            key[kl++] = c;
+        }
+        key[kl] = '\0';
+
+        // Extract and lowercase value (strip inline comment)
+        char val[32]; int vl = 0;
+        int vs = eq + 1;
+        while (line[vs] == ' ' || line[vs] == '\t') ++vs;
+        for (int i = vs; line[i] && line[i] != ';' && vl < 31; ++i)
+        {
+            char c = line[i];
+            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            val[vl++] = c;
+        }
+        // Trim trailing whitespace from val
+        while (vl > 0 && (val[vl - 1] == ' ' || val[vl - 1] == '\t')) --vl;
+        val[vl] = '\0';
+
+        // Match keys
+        if (!gotEnable && StrEq(key, "inapplcdenable"))
+        {
+            lcdEnable = (StrEq(val, "true"));
+            gotEnable = true;
+        }
+        else if (!gotBus && StrEq(key, "lcdbus"))
+        {
+            lcdBus = (int)(val[0] - '0');
+            gotBus = true;
+        }
+        else if (!gotAddr && StrEq(key, "lcdi2caddr"))
+        {
+            // Parse hex: "0x3c" or "0x3C"
+            BYTE result = 0;
+            const char* p = val;
+            if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+            while (*p)
+            {
+                char hc = *p++;
+                int digit = 0;
+                if (hc >= '0' && hc <= '9') digit = hc - '0';
+                else if (hc >= 'a' && hc <= 'f') digit = 10 + (hc - 'a');
+                else break;
+                result = (BYTE)((result << 4) | (BYTE)digit);
+            }
+            lcdAddr = result;
+            gotAddr = true;
+        }
+    }
+
+    CloseHandle(hFile);
+
+    // Only block if CerBIOS has InAppLCDEnable=True, on the SMBus (bus 0),
+    // at the same 7-bit address we would use.
+    return lcdEnable && (lcdBus == 0) && (lcdAddr == addr7bit);
+}
+
+// Strip any non-numeric suffix from a version string for compact display.
+// "1.0.2 Beta" -> "1.0.2"   "1.0.2" -> "1.0.2"
+static void StripVersionSuffix(const char* src, char* dst, int dstLen)
+{
+    int i = 0;
+    while (src[i] && i < dstLen - 1)
+    {
+        char ch = src[i];
+        if (ch != '.' && (ch < '0' || ch > '9')) break;
+        dst[i] = ch;
+        ++i;
+    }
+    dst[i] = '\0';
+}
+
 static void DrawPageSplash()
 {
-    LCDGoto(0, 0); LCDPuts("** XbDiag v1.0.1 **", LCD_COLS);
+    char verNum[16];
+    StripVersionSuffix(Update_GetLocalVersion(), verNum, sizeof(verNum));
+    char line0[21];
+    StrCopy(line0, sizeof(line0), "* XbDiag v");
+    StrCat2(line0, sizeof(line0), line0, verNum);
+    StrCat2(line0, sizeof(line0), line0, " *");
+    LCDGoto(0, 0); LCDPuts(line0, LCD_COLS);
     LCDGoto(1, 0); LCDPuts(" Team  Resurgent   ", LCD_COLS);
     LCDGoto(2, 0); LCDPuts("    Darkone83      ", LCD_COLS);
     LCDGoto(3, 0); LCDPuts("                   ", LCD_COLS);
@@ -379,6 +521,11 @@ void LCD_Begin()
     s_present = false;
     s_dataReady = false;
     s_page = 1;
+
+    // Check CerBIOS INI before touching the bus.
+    // LCD_ADDR is 8-bit shifted (0x78); CerBIOS stores 7-bit (0x3C).
+    if (CerBiosOwnsLCD((BYTE)(LCD_ADDR >> 1)))
+        return;
 
     BYTE dummy = 0;
     if (!SMBusRead(LCD_ADDR, 0x00, dummy))
