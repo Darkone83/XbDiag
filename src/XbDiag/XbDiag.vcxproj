@@ -21,6 +21,7 @@
     <ClCompile Include="FtpServ.cpp" />
     <ClCompile Include="HddInfo.cpp" />
     <ClCompile Include="input.cpp" />
+    <ClCompile Include="Lcd.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="RamTest.cpp" />
     <ClCompile Include="SmBusScan.cpp" />
@@ -45,6 +46,7 @@
     <ClInclude Include="FtpServ.h" />
     <ClInclude Include="HddInfo.h" />
     <ClInclude Include="input.h" />
+    <ClInclude Include="Lcd.h" />
     <ClInclude Include="RamTest.h" />
     <ClInclude Include="SmBusScan.h" />
     <ClInclude Include="StressMath.h" />

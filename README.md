@@ -16,6 +16,18 @@ XbDiag is a native RXDK application that runs directly on original Xbox hardware
 
 ---
 
+## Active Notes
+
+### PAL Display Support
+PAL-I (576i 50Hz) and PAL-M (480i 60Hz, Brazil) consoles are fully supported. The backbuffer is sized correctly per region — 640×576 for PAL-I, 640×480 for PAL-M and PAL60. All layout is authored in 640×480 design units and scaled at runtime via `g_sx`/`g_sy`.
+
+PAL-I users: modes other than 576i (480p, 720p, 1080i) require an HDTV-capable AV pack and are blocked on PAL-I consoles by region policy check in VideoInfo. PAL60 (480i 60Hz on a PAL console) is treated as NTSC timing.
+
+### CPU Stress Test — Under Active Development
+Power draw during the CPU stress test is lower than during the RAM stress test, indicating the CPU is not being fully saturated thermally. The stress kernel in `StressMath.cpp` is under active revision. The current release ships the stable FFT-based kernel pending further testing on real hardware.
+
+---
+
 ## Modules
 
 | # | Module | Description |
@@ -42,7 +54,7 @@ XbDiag is a native RXDK application that runs directly on original Xbox hardware
 
 Displays a full hardware snapshot captured on entry. The left column covers the CPU, memory, and chipset; the right column covers video, thermal, storage, and network.
 
-**CPU** — IC identification (Coppermine-128), speed measured via TSC delta over a 100ms window, and raw CPUID leaf 1 EAX value. An `[xemu]` flag is shown when the hypervisor present bit is detected, distinguishing emulator runs from real hardware.
+**CPU** — IC identification (Coppermine-128), speed read directly from the MCPX CPUMPLL register (PCI Bus 0, Dev 3, Fun 0, Offset 0x6C) combined with the CPU ratio from MSR 0x2A. This gives an exact, instantaneous reading with no timing window — correct on all stock and Tualatin upgrade variants from 733 MHz through 1400 MHz. Raw CPUID leaf 1 EAX value also shown. An `[xemu]` flag is shown when the hypervisor present bit is detected.
 
 **Memory** — total RAM size and bank configuration.
 
@@ -62,7 +74,7 @@ Displays a full hardware snapshot captured on entry. The left column covers the 
 
 **Network** — local IP address (resolved via UDP connect trick, non-blocking) and LAN MAC.
 
-**GPU Speed** — NV2A core clock decoded from PRAMDAC NVPLL at MMIO 0xFD680500.
+**GPU Speed** — NV2A core clock decoded from PRAMDAC NVPLL at MMIO 0xFD680500, using the correct 16.666667 MHz crystal reference.
 
 | Button | Action |
 |--------|--------|
@@ -652,12 +664,38 @@ smbid.id       (created automatically if not present; user-editable SMBus device
 
 ---
 
+## Physical LCD Display (Optional)
+
+XbDiag supports an optional US2066-compatible 20×4 character OLED connected to the Xbox SMBus at address 0x3C (8-bit 0x78). Detection is automatic — if no display is found at startup the module has no effect on operation.
+
+When present, the display shows live system data cycling through four pages every 5 seconds:
+
+| Page | Content |
+|------|---------|
+| Thermal | CPU temp, board temp, fan % |
+| Clocks | CPU MHz, GPU MHz, board revision, modchip |
+| Storage | HDD model, size, UDMA mode |
+| Network | IP address, MAC address |
+
+A splash screen showing the XbDiag version and Team Resurgent / Darkone83 credits is shown at startup until SysInfo data is loaded.
+
+When the FTP server is active, the display locks to an FTP status page mirroring the on-screen overlay: connection state, IP:21, current filename, and a live progress bar (determinate for GET, animated for PUT).
+
+**Key combos** (hold all three simultaneously):
+
+| Combo | Action |
+|-------|--------|
+| START + A + WHITE | Enable display, re-initialise hardware |
+| START + A + BLACK | Disable display (sends HD44780 display-off command) |
+
+---
+
 ## Known Limitations
 
 - **Rev 1.6 temperatures** are read via PIC registers (0x09/0x0A). Xcalibur readings are noisier than ADM1032 — values are averaged across 10 samples to compensate.
 - **EEPROM export** writes to the title directory. If the directory is read-only the export will silently fail and the status indicator on screen will show `FAIL`.
 - **Flash chip detection** is suppressed when a modchip is active (LPC bus intercepted) and on rev 1.6/1.6b hardware (no TSOP present).
-- **xemu compatibility**: The PIC SMBus device (0x20) may not respond in xemu. Video Info and Temp Monitor handle this gracefully. NV2A MMIO reads in Video Info are guarded by a PCI vendor ID check and will show `N/A` if the guard fails. CPU detection uses the hypervisor present bit (CPUID leaf 1, ECX bit 31) to distinguish xemu from real hardware. All other modules work normally.
+- **xemu compatibility**: The PIC SMBus device (0x20) may not respond in xemu. Video Info and Temp Monitor handle this gracefully. NV2A MMIO reads in Video Info are guarded by a PCI vendor ID check and will show `N/A` if the guard fails. CPU detection uses the hypervisor present bit (CPUID leaf 1, ECX bit 31) to distinguish xemu from real hardware. CPU speed is read via CPUMPLL + MSR 0x2A — on xemu these registers may not reflect real hardware clocks and the displayed value is marked with `*`. All other modules work normally.
 - **LBA48 capacity** is displayed correctly for drives over 137GB. Drives over 2TB will display a `+` suffix indicating the upper 32 address bits are non-zero.
 - **Video mode switching** (`[WHITE]` in Video Info) switches the D3D device via `Reset()`. Modes unsupported by the connected AV pack will be rejected silently by the NV2A encoder — the hardware verify readout will show `MISMATCH` in that case. The original mode is always restored cleanly on exit.
 - **FTP passive mode only** — active mode (PORT) is not supported. Configure your FTP client to use passive mode.

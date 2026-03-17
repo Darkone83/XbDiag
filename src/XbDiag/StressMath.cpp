@@ -134,14 +134,14 @@ static void EightRealsSweep()
             fxch    st(4);; R7, R4, R6, R2, R1, R5, R8, R3
             fadd    st(6), st;; R8 = R7 + R8(final R6)
 
-            fstp    QWORD PTR[eax + 56];;->R8
-            fstp    QWORD PTR[eax + 40];;->R6
-            fstp    QWORD PTR[eax + 16];;->R3
-            fstp    QWORD PTR[eax + 0];;->R1
-            fstp    QWORD PTR[eax + 32];;->R5
-            fstp    QWORD PTR[eax + 24];;->R4
-            fstp    QWORD PTR[eax + 48];;->R7
-            fstp    QWORD PTR[eax + 8];;->R2
+            fstp    QWORD PTR[eax + 56];; ->R8
+            fstp    QWORD PTR[eax + 40];; ->R6
+            fstp    QWORD PTR[eax + 16];; ->R3
+            fstp    QWORD PTR[eax + 0];; ->R1
+            fstp    QWORD PTR[eax + 32];; ->R5
+            fstp    QWORD PTR[eax + 24];; ->R4
+            fstp    QWORD PTR[eax + 48];; ->R7
+            fstp    QWORD PTR[eax + 8];; ->R2
 
             lea     eax, [eax + 64]
             cmp     eax, ecx

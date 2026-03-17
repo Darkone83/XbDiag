@@ -235,22 +235,71 @@ static void PushHistory(BYTE cpu, BYTE load, BYTE fan)
 }
 
 // ============================================================================
-// CPU MHz via ICS clock generator (SMBus 0xD2, reg 0x09 bits[2:0])
-// Ref: Xbox BIOS / modchip documentation. Falls back to 733 on NAK.
+// CPU MHz via MCPX CPUMPLL (PCI 0:3:0 offset 0x6C) + MSR 0x2A ratio.
+// Exact value, no SMBus dependency, works on all CPU variants including
+// Tualatin upgrades where the ICS clock generator may be absent or replaced.
+// CPUMPLL is cached on first call — the PLL config never changes at runtime.
 // ============================================================================
+
+extern "C" VOID __stdcall HalReadWritePCISpace(
+    ULONG BusNumber, ULONG SlotNumber, ULONG RegisterNumber,
+    PVOID Buffer, ULONG Length, BOOLEAN WritePCISpace);
 
 static int ReadCPUMHz()
 {
-    BYTE reg = 0;
-    if (!SMBusRead(SMBADDR_ICS, 0x09, reg))
-        return 733;
-    switch (reg & 0x07)
+    // Cache CPUMPLL — only need to read PCI config once
+    static DWORD s_cpumpll = 0;
+    static bool  s_cpumpllRead = false;
+    if (!s_cpumpllRead)
     {
-    case 0: return 733;
-    case 1: return 800;
-    case 2: return 853;
-    default: return 733;
+        ULONG slot = (3 & 0x1F) | ((0 & 0x07) << 5); // dev=3, func=0
+        HalReadWritePCISpace(0, slot, 0x6C, &s_cpumpll, sizeof(s_cpumpll), FALSE);
+        s_cpumpllRead = true;
     }
+
+    DWORD fsb_div = s_cpumpll & 0xFF;
+    DWORD fsb_mult = (s_cpumpll >> 8) & 0xFF;
+    if (fsb_div == 0 || fsb_mult == 0) return 733;
+
+    // FSB_kHz = 16,666,667 Hz * mult / div / 1000
+    DWORD fsb_kHz = (DWORD)(16666667UL * fsb_mult / fsb_div / 1000UL);
+
+    // CPU ratio from MSR 0x2A bits [27:22] masked 0x2F
+    DWORD msr_lo = 0;
+    __asm
+    {
+        mov  ecx, 0x2A
+        rdmsr
+        mov  msr_lo, eax
+    }
+    BYTE pat = (BYTE)((msr_lo >> 22) & 0x2F);
+    DWORD ratio = 0;
+    switch (pat)
+    {
+    case 0x01: ratio = 30;  break;
+    case 0x05: ratio = 35;  break;
+    case 0x02: ratio = 40;  break;
+    case 0x06: ratio = 45;  break;
+    case 0x00: ratio = 50;  break;
+    case 0x04: ratio = 55;  break;
+    case 0x0B: ratio = 60;  break;
+    case 0x0F: ratio = 65;  break;
+    case 0x09: ratio = 70;  break;
+    case 0x0D: ratio = 75;  break;
+    case 0x0A: ratio = 80;  break;
+    case 0x26: ratio = 85;  break;
+    case 0x20: ratio = 90;  break;
+    case 0x24: ratio = 95;  break;
+    case 0x2B: ratio = 100; break;
+    case 0x2F: ratio = 105; break;
+    case 0x2A: ratio = 130; break;
+    case 0x2C: ratio = 140; break;
+    default:   return 733;
+    }
+
+    DWORD cpu_mhz = fsb_kHz * ratio / 10000UL;
+    if (cpu_mhz < 400 || cpu_mhz > 1600) return 733;
+    return (int)cpu_mhz;
 }
 
 // ============================================================================

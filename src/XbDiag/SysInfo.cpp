@@ -49,7 +49,7 @@
 //   bits are non-zero, we report the highest supported UDMA mode (no marker).
 //   '?' suffix = word 53 bit 2 clear, word 88 validity not guaranteed.
 //
-// CPU speed: measured via TSC delta over a 100ms GetTickCount() window.
+// CPU speed: read from MCPX CPUMPLL (PCI 0:3:0 offset 0x6C) + MSR 0x2A ratio.
 // GPU speed: NV2A PRAMDAC NVPLL at MMIO 0xFD680500 - decode M/N/P.
 //
 // Thermal (cross-revision):
@@ -223,64 +223,74 @@ static void DoCpuid(DWORD leaf,
 }
 
 // ============================================================================
-// TSC-based CPU frequency measurement
-// Matches PrometheOS xboxConfig::getCPUFreq() and RDTSC() exactly.
+// PLL-based CPU frequency — exact, instantaneous, no timing window.
 //
-// Key points:
-//   - Each RDTSC is a single __asm {} block — EAX and EDX are saved to locals
-//     inside the block before the compiler can insert any code between the
-//     rdtsc instruction and the stores.  Separate per-instruction __asm blocks
-//     allow the compiler to clobber EAX/EDX between them which corrupts the
-//     reading, especially at higher clock speeds (Tualatin 1000-1400 MHz).
-//   - No CPUID serialization fence — PrometheOS doesn't use one, Sleep(300)
-//     provides a wide enough window that pipeline effects are negligible.
-//   - 64-bit TSC accumulated as double (hi * 2^32 + lo) matching PrometheOS
-//     RDTSC() exactly — handles absolute TSC values without overflow.
-//   - Sleep(300ms) kernel-managed window — no busy-wait.
+// MCPX CPUMPLL: PCI Bus 0, Dev 3, Fun 0, Offset 0x6C
+//   Byte 0 = FSB divider
+//   Byte 1 = FSB multiplier
+//   FSB Hz = 16,666,667 * (mult / div)
+//
+// CPU multiplier from MSR 0x2A bits [27:22] masked 0x2F.
+// Table matches MCPX/PrometheOS ratio encoding exactly.
+//
+// CPU MHz = FSB_kHz * ratio / 10 / 1000
 // ============================================================================
+
+static DWORD CpuRatioX10FromMsr()
+{
+    DWORD lo = 0;
+    __asm
+    {
+        mov  ecx, 0x2A
+        rdmsr
+        mov  lo, eax
+    }
+    BYTE pat = (BYTE)((lo >> 22) & 0x2F);
+    switch (pat)
+    {
+    case 0x01: return 30;
+    case 0x05: return 35;
+    case 0x02: return 40;
+    case 0x06: return 45;
+    case 0x00: return 50;
+    case 0x04: return 55;   // retail 733 / 800 MHz
+    case 0x0B: return 60;
+    case 0x0F: return 65;
+    case 0x09: return 70;
+    case 0x0D: return 75;
+    case 0x0A: return 80;
+    case 0x26: return 85;
+    case 0x20: return 90;
+    case 0x24: return 95;
+    case 0x2B: return 100;
+    case 0x2F: return 105;
+    case 0x2A: return 130;
+    case 0x2C: return 140;
+    default:   return 0;
+    }
+}
 
 static DWORD MeasureCpuMHz()
 {
-    unsigned long lo0, hi0, lo1, hi1;
+    // MCPX CPUMPLL: Bus 0, Dev 3, Fun 0, Offset 0x6C
+    DWORD cpumpll = PciRead32(0, 3, 0, 0x6C);
+    DWORD fsb_div = cpumpll & 0xFF;
+    DWORD fsb_mult = (cpumpll >> 8) & 0xFF;
 
-    // First RDTSC — single block so the compiler saves EAX:EDX atomically
-    __asm
-    {
-        rdtsc
-        mov lo0, eax
-        mov hi0, edx
-    }
-    DWORD tick0 = GetTickCount();
+    if (fsb_div == 0 || fsb_mult == 0) return 733;
 
-    Sleep(300);
+    // FSB_kHz = 16,666,667 Hz * mult / div / 1000
+    DWORD fsb_kHz = (DWORD)(16666667UL * fsb_mult / fsb_div / 1000UL);
 
-    // Second RDTSC — same single-block pattern
-    __asm
-    {
-        rdtsc
-        mov lo1, eax
-        mov hi1, edx
-    }
-    DWORD tick1 = GetTickCount();
+    DWORD ratio = CpuRatioX10FromMsr();
+    if (ratio == 0) return 733;
 
-    DWORD elapsed = tick1 - tick0;
-    if (elapsed == 0) return 733;
+    // CPU MHz = FSB_kHz * ratio / 10 / 1000
+    DWORD cpu_mhz = fsb_kHz * ratio / 10000UL;
 
-    // Build 64-bit TSC values as doubles, matching PrometheOS RDTSC() exactly:
-    //   x = hi; x *= 0x100000000; x += lo;
-    double tsc0 = (double)hi0; tsc0 *= 4294967296.0; tsc0 += (double)lo0;
-    double tsc1 = (double)hi1; tsc1 *= 4294967296.0; tsc1 += (double)lo1;
-
-    // (tsc_delta / elapsed_ms) / 1000 = MHz
-    // Matching PrometheOS: fcpu = delta / ms_elapsed; return fcpu / 1000;
-    double fcpu = tsc1 - tsc0;
-    fcpu /= (double)elapsed;
-    double mhz = fcpu / 1000.0;
-
-    // Sanity: 400 MHz (lower than any real Xbox) to 1600 MHz (above Tualatin max)
-    if (mhz < 400.0 || mhz > 1600.0) return 733;
-
-    return (DWORD)Ftoi((float)mhz);
+    // Sanity: 400–1600 MHz covers all Xbox and Tualatin upgrade variants
+    if (cpu_mhz < 400 || cpu_mhz > 1600) return 733;
+    return cpu_mhz;
 }
 
 // ============================================================================
@@ -313,9 +323,9 @@ static DWORD ReadGpuMHz()
     if (M == 0) return 233;   // fallback - avoid div zero
     if (N == 0) return 233;
 
-    // Crystal = 16666 KHz
-    // F_out (KHz) = (16666 * N) / (M * (1 << P))
-    DWORD fKHz = (16666 * N) / (M * (1 << P));
+    // Crystal = 16666667 Hz (16.666... MHz)
+    // F_out (KHz) = (16666667 * N) / (M * (1 << P)) / 1000
+    DWORD fKHz = (DWORD)(16666667UL * N / (M * (1UL << P)) / 1000UL);
     DWORD mhz = fKHz / 1000;
 
     // Sanity check - NV2A should be 200-300 MHz
@@ -839,10 +849,10 @@ static void ReadSysData()
         }
     }
 
-    // --- CPU speed (TSC measurement) ---
+    // --- CPU speed (PLL: MCPX CPUMPLL + MSR 0x2A ratio) ---
     {
         d.cpuMHz = MeasureCpuMHz();
-        // If running in xemu the TSC may not reflect real hardware speed
+        // On xemu CPUMPLL/MSR may not reflect real hardware — flag with asterisk
         char t[12];
         IntToStr((int)d.cpuMHz, t, sizeof(t));
         StrCat2(d.cpuSpeedMHz, sizeof(d.cpuSpeedMHz), t, " MHz");
@@ -2021,6 +2031,32 @@ const char* SysInfo_GetBoardRev()
 {
     if (!s_dataLoaded) return "";
     return s_data.boardRevFinal;
+}
+
+void SysInfo_GetLCDData(LCDData& out)
+{
+    if (!s_dataLoaded)
+    {
+        out.boardRev = "";
+        out.modchipName = "";
+        out.cpuSpeedMHz = "";
+        out.gpuSpeedMHz = "";
+        out.hddModel = "";
+        out.hddSizeGB = "";
+        out.hddUDMA = "";
+        out.ipAddr = "";
+        out.macAddr = "";
+        return;
+    }
+    out.boardRev = s_data.boardRevFinal;
+    out.modchipName = s_data.modchipName;
+    out.cpuSpeedMHz = s_data.cpuSpeedMHz;
+    out.gpuSpeedMHz = s_data.gpuSpeedMHz;
+    out.hddModel = s_data.hddModel;
+    out.hddSizeGB = s_data.hddSizeGB;
+    out.hddUDMA = s_data.hddUDMA;
+    out.ipAddr = s_data.ipAddr;
+    out.macAddr = s_data.macAddr;
 }
 // ============================================================================
 // AutoRun — headless data gather + report write for XbSet automation

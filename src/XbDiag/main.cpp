@@ -35,6 +35,7 @@
 #include "StressTest.h"
 #include "FileExplorer.h"
 #include "XbSet.h"
+#include "lcd.h"
 
 #include <xtl.h>
 
@@ -72,6 +73,8 @@ enum AppState
 
 static AppState g_state = STATE_MENU;
 static AppState g_prevState = STATE_MENU;
+static bool     g_lcdDataFed = false;   // true once SysInfo data sent to LCD
+static WORD     g_lcdPrevBtns = 0;
 
 // Called by any module to return to the main menu
 void RequestState(int newState)
@@ -276,6 +279,10 @@ void __cdecl main()
 
     InitInput();
 
+    // Detect and initialise physical LCD display (if fitted at SMBus 0x3C).
+    // Shows splash immediately — SysInfo data fed in later via LCD_SetData.
+    LCD_Begin();
+
     // Load the shared logo once
     g_logo.tex = DiagLoadDDS("D:\\tex\\xb.dds", g_logo.w, g_logo.h);
     // Null tex is handled gracefully by DrawLogo / DrawPageChrome
@@ -353,7 +360,19 @@ void __cdecl main()
         switch (g_state)
         {
         case STATE_MENU:    DiagMenu_Tick(g_logo);    break;
-        case STATE_SYSINFO: SysInfo_Tick(g_logo);     break;
+        case STATE_SYSINFO: SysInfo_Tick(g_logo);
+            // Feed SysInfo data to LCD once it has finished loading (first tick)
+            if (!g_lcdDataFed && LCD_IsPresent())
+            {
+                LCDData ld;
+                SysInfo_GetLCDData(ld);
+                if (ld.boardRev && ld.boardRev[0] != '\0')
+                {
+                    LCD_SetData(ld);
+                    g_lcdDataFed = true;
+                }
+            }
+            break;
         case STATE_RAM:     RamTest_Tick(g_logo);     break;
         case STATE_SMBUS:   SmBusScan_Tick(g_logo);   break;
         case STATE_TEMP:    TempMonitor_Tick(g_logo); break;
@@ -366,6 +385,13 @@ void __cdecl main()
         case STATE_FILES:   FileExplorer_Tick(g_logo);   break;
         case STATE_XBSET:   XbSet_Tick(g_logo);          break;
         default:            break;
+        }
+
+        // LCD tick runs every frame regardless of app state
+        {
+            WORD cur = GetButtons();
+            LCD_Tick(cur, g_lcdPrevBtns);
+            g_lcdPrevBtns = cur;
         }
     }
 }
