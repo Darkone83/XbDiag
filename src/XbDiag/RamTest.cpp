@@ -1099,7 +1099,7 @@ static void Render(const DiagLogo& logo)
     // ---- Test status -------------------------------------------------------
     if (s_testState == STATE_IDLE)
     {
-        DrawText(MAP_LM, y, "[A] Quick    [X] 15min    [Y] 30min", TS, COL_YELLOW);
+        DrawText(MAP_LM, y, "[A] Quick [X] 15min [Y] 30min", TS, COL_YELLOW);
     }
     else
     {
@@ -1387,18 +1387,18 @@ static void Render(const DiagLogo& logo)
             if (s_is128MB)
             {
                 DrawText(GRID_LM, gy,
-                    "128MB: 2 chips/bank  Chunks 0-7=CHIP1  8-15=CHIP2",
+                    "128MB: Chunks 0-7=CHIP1  8-15=CHIP2",
                     1.1f, COL_CYAN);
             }
             else
             {
                 DrawText(GRID_LM, gy,
-                    "64MB: 1 chip/bank  Any fail = that bank chip suspect",
+                    "64MB: 1 chip/bank  Fail=chip suspect",
                     1.1f, COL_CYAN);
             }
             gy += SLH + 2.f;
             DrawText(GRID_LM, gy,
-                "[WHITE] Chip Help  -- bank locations and diagnosis guide",
+                "[WHITE] Chip help  --  bank map + diag",
                 1.05f, COL_YELLOW);
         }
     }

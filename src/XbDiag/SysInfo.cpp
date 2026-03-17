@@ -279,16 +279,17 @@ static DWORD MeasureCpuMHz()
 
     if (fsb_div == 0 || fsb_mult == 0) return 733;
 
-    // FSB_kHz = 16,666,667 Hz * mult / div / 1000
-    DWORD fsb_kHz = (DWORD)(16666667UL * fsb_mult / fsb_div / 1000UL);
+    // Crystal = 50000000/3 Hz (16.666... MHz) — matches reference implementation exactly.
+    // Use double throughout to avoid integer truncation error (up to 1 MHz on 800MHz configs).
+    double fsb_hz = (50000000.0 / 3.0) * ((double)fsb_mult / (double)fsb_div);
+    double fsb_mhz = fsb_hz / 1.0e6;
 
     DWORD ratio = CpuRatioX10FromMsr();
     if (ratio == 0) return 733;
 
-    // CPU MHz = FSB_kHz * ratio / 10 / 1000
-    DWORD cpu_mhz = fsb_kHz * ratio / 10000UL;
+    double cpu_mhz_d = fsb_mhz * ((double)ratio / 10.0);
+    DWORD  cpu_mhz = (DWORD)(cpu_mhz_d + 0.5);  // round to nearest
 
-    // Sanity: 400–1600 MHz covers all Xbox and Tualatin upgrade variants
     if (cpu_mhz < 400 || cpu_mhz > 1600) return 733;
     return cpu_mhz;
 }
@@ -323,10 +324,11 @@ static DWORD ReadGpuMHz()
     if (M == 0) return 233;   // fallback - avoid div zero
     if (N == 0) return 233;
 
-    // Crystal = 16666667 Hz (16.666... MHz)
-    // F_out (KHz) = (16666667 * N) / (M * (1 << P)) / 1000
-    DWORD fKHz = (DWORD)(16666667UL * N / (M * (1UL << P)) / 1000UL);
-    DWORD mhz = fKHz / 1000;
+    // Crystal = 50000000/3 Hz (16.666... MHz) — exact, matches reference.
+    // F_out = (N * crystal) / (M * 2^P)
+    // Use double to avoid integer truncation on GPU frequencies.
+    double gpu_hz = ((double)N * (50000000.0 / 3.0)) / ((double)M * (double)(1u << P));
+    DWORD  mhz = (DWORD)(gpu_hz / 1.0e6 + 0.5);  // round to nearest
 
     // Sanity check - NV2A should be 200-300 MHz
     if (mhz < 150 || mhz > 400) return 233;

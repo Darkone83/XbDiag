@@ -20,6 +20,7 @@
 #include "DiagMenu.h"
 #include "font.h"
 #include "input.h"
+#include "Update.h"
 
 #include <xtl.h>
 
@@ -42,6 +43,7 @@ enum
     MSTATE_STRESS = 10,
     MSTATE_FILES = 11,
     MSTATE_XBSET = 12,
+    MSTATE_UPDATE = 14,
     MSTATE_EXIT = 13,
 };
 
@@ -69,7 +71,8 @@ static const MenuItem k_items[] =
     { "08", "CONTROLLER TEST",  "Buttons, analog sticks, triggers, and rumble motor test",      MSTATE_CTRL    },
     { "09", "STRESS TEST",      "Sustained CPU and RAM load test with thermal monitoring",      MSTATE_STRESS  },
     { "10", "FILE EXPLORER",    "Browse Xbox partitions - C: E: F: G: and MU slots",            MSTATE_FILES   },
-    { "11", "ABOUT",            "Version info, credits, and hardware compatibility notes",       MSTATE_ABOUT   },
+    { "11", "UPDATE CHECK",     "Check GitHub for a newer version and download if available",    MSTATE_UPDATE  },
+    { "12", "ABOUT",            "Version info, credits, and hardware compatibility notes",       MSTATE_ABOUT   },
 };
 
 static const int k_itemCount = sizeof(k_items) / sizeof(k_items[0]);
@@ -92,7 +95,7 @@ static const float IDX_X = 12.f;   // index number X
 static const float LABEL_X = 52.f;   // label text X
 static const float BADGE_RX = SW - 12.f; // READY badge right edge
 static const float TS = 1.4f;   // row text scale
-static const float INFO_Y = LIST_TOP + (float)11 * ROW_H + 10.f; // info panel Y
+static const float INFO_Y = LIST_TOP + (float)12 * ROW_H + 10.f; // info panel Y
 
 // ============================================================================
 // OnEnter
@@ -161,7 +164,7 @@ static void Render(const DiagLogo& logo)
     g_pDevice->BeginScene();
 
     DrawPageChrome(logo,
-        "XbDiag v1.0.1 Beta -  Hardware Diagnostic Suite",
+        "XbDiag v1.0.2 Beta -  Hardware Diagnostic Suite",
         "[Up/Down] Navigate    [A] Select    [Start] Exit to Dashboard");
 
     // -------------------------------------------------------------------------

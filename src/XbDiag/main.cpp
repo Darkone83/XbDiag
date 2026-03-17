@@ -35,6 +35,7 @@
 #include "StressTest.h"
 #include "FileExplorer.h"
 #include "XbSet.h"
+#include "Update.h"
 #include "lcd.h"
 
 #include <xtl.h>
@@ -68,6 +69,7 @@ enum AppState
     STATE_STRESS,
     STATE_FILES,
     STATE_XBSET,
+    STATE_UPDATE,
     STATE_EXIT,
 };
 
@@ -174,12 +176,13 @@ static VideoMode DetectVideoMode()
         m.refreshHz = 50;
         StrCopy(g_videoModeStr, sizeof(g_videoModeStr), "576i PAL");
         g_isHD = false;
+        g_isTrueInterlaced = true;  // 576i PAL50 — scanline safety on
     }
     else
     {
-        // NTSC 480i baseline — also used for:
-        //   PAL-I + PAL60 flag (480i 60Hz on a PAL console)
-        //   PAL-M (Brazil: PAL colour, NTSC timing, 480i 60Hz)
+        // 480i baseline — NTSC, PAL-M, and PAL60 all land here.
+        // NTSC 480i is true interlaced; PAL60 and PAL-M run at 60Hz like NTSC
+        // so they do NOT get the scanline-safety treatment.
         m.width = 640;
         m.height = 480;
         m.presentFlags = D3DPRESENTFLAG_INTERLACED;
@@ -188,7 +191,10 @@ static VideoMode DetectVideoMode()
         else if (isPAL_M)
             StrCopy(g_videoModeStr, sizeof(g_videoModeStr), "480i PAL-M");
         else
+        {
             StrCopy(g_videoModeStr, sizeof(g_videoModeStr), "480i");
+            g_isTrueInterlaced = true;  // NTSC 480i only
+        }
         g_isHD = false;
     }
 
@@ -277,6 +283,12 @@ void __cdecl main()
 {
     if (!InitD3D()) return;
 
+    // Tell the font engine whether we're on a true interlaced SD display.
+    // Only 480i NTSC and 576i PAL50 qualify — PAL60 and PAL-M run at 60Hz
+    // and don't suffer the same scanline flicker, so they stay at HD advance.
+    // Must be called after InitD3D() — that's where g_isTrueInterlaced is set.
+    Font_SetSD(g_isTrueInterlaced);
+
     InitInput();
 
     // Detect and initialise physical LCD display (if fitted at SMBus 0x3C).
@@ -319,8 +331,31 @@ void __cdecl main()
             XbSet_AutoRun(g_logo);
     }
 
-    // Initial state
-    g_state = STATE_MENU;
+    // ---- Boot-time update check ----------------------------------------
+    // Kick off the background version check immediately after autorun.
+    // The result is polled below before entering the main game loop.
+    Update_StartBootCheck();
+
+    // Poll the update check while rendering a holding frame.
+    // The check is fast (DNS + one TCP round trip) but non-blocking,
+    // so we drive it to completion here before the first menu frame.
+    {
+        DWORD checkStart = GetTickCount();
+        while (!Update_IsCheckComplete())
+        {
+            // Keep the screen alive with a minimal present so the watchdog
+            // doesn't trip on hardware with strict frame deadlines.
+            if (GetTickCount() - checkStart > 8000) break;  // hard safety cap
+            PumpInput();
+            g_pDevice->BeginScene();
+            DrawPageChrome(g_logo, "XbDiag", "Checking for updates...");
+            g_pDevice->EndScene();
+            g_pDevice->Present(NULL, NULL, NULL, NULL);
+        }
+    }
+
+    // Initial state — jump straight to Update screen if a newer version was found
+    g_state = Update_BootFoundUpdate() ? STATE_UPDATE : STATE_MENU;
     g_prevState = STATE_MENU;
 
     // Notify the menu it's the first entry
@@ -348,6 +383,7 @@ void __cdecl main()
             case STATE_STRESS:  StressTest_OnEnter();     break;
             case STATE_FILES:   FileExplorer_OnEnter();   break;
             case STATE_XBSET:   XbSet_OnEnter();          break;
+            case STATE_UPDATE:  Update_OnEnter();          break;
             case STATE_EXIT:    ExitToDashboard();     break;
             default:            break;
             }
@@ -384,6 +420,7 @@ void __cdecl main()
         case STATE_STRESS:  StressTest_Tick(g_logo);     break;
         case STATE_FILES:   FileExplorer_Tick(g_logo);   break;
         case STATE_XBSET:   XbSet_Tick(g_logo);          break;
+        case STATE_UPDATE:  Update_Tick(g_logo);          break;
         default:            break;
         }
 

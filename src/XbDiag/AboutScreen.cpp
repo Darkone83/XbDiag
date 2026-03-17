@@ -16,6 +16,7 @@
 //     Rotating Xbox trivia ticker above the bot bar.
 
 #include "AboutScreen.h"
+#include "Update.h"
 #include "font.h"
 #include "input.h"
 #include <xtl.h>
@@ -206,7 +207,7 @@ static void Render(const DiagLogo& logo)
     const float TITLE_S = 2.2f;
     const float VER_S = 1.5f;
     const char* k_title = "XbDiag";
-    const char* k_ver = "v1.0";
+    const char* k_ver = Update_GetLocalVersion();
 
     float titleW = TW(k_title, TITLE_S);
     float blockW = titleW + 14.f + TW(k_ver, VER_S);
@@ -247,9 +248,11 @@ static void Render(const DiagLogo& logo)
     y += LINE_H;
 
     DrawText(LM, y, "MODULES         :", LS, COL_GRAY);
-    DrawText(VM2, y, "SysInfo  RAM Test  SMBus Scan  Temp Monitor  HDD Info", LS, COL_WHITE);
+    DrawText(VM2, y, "SysInfo  RAM Test  SMBus Scan  Temp Monitor", LS, COL_WHITE);
     y += LINE_H;
-    DrawText(VM2, y, "EEPROM  Video Out  Stress Test  File Explorer", LS, COL_WHITE);
+    DrawText(VM2, y, "HDD Info  EEPROM  Video Out  Stress Test", LS, COL_WHITE);
+    y += LINE_H;
+    DrawText(VM2, y, "File Explorer  Controller Test  Update Check", LS, COL_WHITE);
 
     // -------------------------------------------------------------------------
     // Divider + logo panel background

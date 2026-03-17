@@ -15,11 +15,18 @@
     <ClCompile Include="ControllerTest.cpp" />
     <ClCompile Include="DiagCommon.cpp" />
     <ClCompile Include="DiagMenu.cpp" />
+    <ClCompile Include="EepromRepair.cpp" />
+    <ClCompile Include="EepromSettings.cpp" />
     <ClCompile Include="EepromView.cpp" />
+    <ClCompile Include="EepromCrypto.cpp" />
+    <ClCompile Include="FileExplorerOps.cpp" />
     <ClCompile Include="FileExplorer.cpp" />
+    <ClCompile Include="FileExplorerMU.cpp" />
     <ClCompile Include="font.cpp" />
     <ClCompile Include="FtpServ.cpp" />
+    <ClCompile Include="HddBench.cpp" />
     <ClCompile Include="HddInfo.cpp" />
+    <ClCompile Include="HddSmart.cpp" />
     <ClCompile Include="input.cpp" />
     <ClCompile Include="Lcd.cpp" />
     <ClCompile Include="main.cpp" />
@@ -27,8 +34,11 @@
     <ClCompile Include="SmBusScan.cpp" />
     <ClCompile Include="StressMath.cpp" />
     <ClCompile Include="StressTest.cpp" />
+    <ClCompile Include="StressTestCPU.cpp" />
+    <ClCompile Include="StressTestRAM.cpp" />
     <ClCompile Include="SysInfo.cpp" />
     <ClCompile Include="TempMonitor.cpp" />
+    <ClCompile Include="Update.cpp" />
     <ClCompile Include="VideoInfo.cpp" />
     <ClCompile Include="XbSet.cpp" />
   </ItemGroup>
@@ -40,19 +50,29 @@
     <ClInclude Include="ControllerTest.h" />
     <ClInclude Include="DiagCommon.h" />
     <ClInclude Include="DiagMenu.h" />
+    <ClInclude Include="EepromCrypto.h" />
+    <ClInclude Include="EepromRepair.h" />
+    <ClInclude Include="EepromSettings.h" />
     <ClInclude Include="EepromView.h" />
     <ClInclude Include="FileExplorer.h" />
+    <ClInclude Include="FileExplorerMU.h" />
+    <ClInclude Include="FileExplorerOps.h" />
     <ClInclude Include="font.h" />
     <ClInclude Include="FtpServ.h" />
+    <ClInclude Include="HddBench.h" />
     <ClInclude Include="HddInfo.h" />
+    <ClInclude Include="HddSmart.h" />
     <ClInclude Include="input.h" />
     <ClInclude Include="Lcd.h" />
     <ClInclude Include="RamTest.h" />
     <ClInclude Include="SmBusScan.h" />
     <ClInclude Include="StressMath.h" />
     <ClInclude Include="StressTest.h" />
+    <ClInclude Include="StressTestCPU.h" />
+    <ClInclude Include="StressTestRAM.h" />
     <ClInclude Include="SysInfo.h" />
     <ClInclude Include="TempMonitor.h" />
+    <ClInclude Include="Update.h" />
     <ClInclude Include="VideoInfo.h" />
     <ClInclude Include="XbSet.h" />
   </ItemGroup>
@@ -60,6 +80,9 @@
     <Image Include="Media\tex\DC.dds" />
     <Image Include="Media\tex\tr.dds" />
     <Image Include="Media\tex\xb.dds" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Media\XbDiag.ver" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>16.0</VCProjectVersion>

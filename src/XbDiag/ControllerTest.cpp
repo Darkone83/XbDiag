@@ -99,6 +99,15 @@ static int  s_driftWarmup = 0;   // frames to discard before sampling (settle de
 static int  s_driftAvgLX = 0, s_driftAvgLY = 0;
 static int  s_driftAvgRX = 0, s_driftAvgRY = 0;
 
+
+// Trigger dead-zone card state
+static const int TRIG_DZ_THRESHOLD = 30;   // Xbox trigger dead-zone (0-255 range)
+static int  s_trigLT = 0;    // current raw LT value
+static int  s_trigRT = 0;    // current raw RT value
+static int  s_trigMinLT = 255, s_trigMaxLT = 0;
+static int  s_trigMinRT = 255, s_trigMaxRT = 0;
+static bool s_trigHasData = false;
+
 // Per-port disconnect tracking.
 // s_wasConn:    connection state from the previous tick (for edge detection).
 // s_discCount:  running count of disconnect events seen this session.
@@ -543,7 +552,7 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
 {
     g_pDevice->BeginScene();
 
-    const char* testNames[3] = { "DEAD-ZONE", "CIRCULARITY", "DRIFT" };
+    const char* testNames[4] = { "DEAD-ZONE", "CIRCULARITY", "DRIFT", "TRIGGERS" };
     const char* hint = "[Left/Right] Switch test    [B] Exit";
     DrawPageChrome(logo, "STICK TEST", hint);
 
@@ -551,12 +560,12 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
 
     // ── Tab strip ──────────────────────────────────────────────────────────
     {
-        const float TW2 = 100.f;
+        const float TW2 = 88.f;
         const float TH = 16.f;
         const float TG = 4.f;
-        float tx = X_MID - (TW2 * 3.f + TG * 2.f) * 0.5f;
+        float tx = X_MID - (TW2 * 4.f + TG * 3.f) * 0.5f;
         float ty = B;
-        for (int i = 0; i < 3; ++i)
+        for (int i = 0; i < 4; ++i)
         {
             bool sel = (i == s_stickTest);
             float x0 = tx + (TW2 + TG) * (float)i;
@@ -724,7 +733,7 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
     // ── DRIFT test ─────────────────────────────────────────────────────────
     // Uses raw unfiltered stick values — deadzone filtering would mask real
     // sub-threshold drift and give false OK readings.
-    else
+    else if (s_stickTest == 2)
     {
         // Warmup: discard first 60 frames so the sticks settle before we measure
         if (s_driftWarmup > 0)
@@ -856,6 +865,177 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
             contentY + 272.f, "Release both sticks and hold still", 1.05f, COL_DIM);
         DrawText(X_MID - TW("[X] Reset samples", 1.05f) * 0.5f,
             contentY + 286.f, "[X] Reset samples", 1.05f, COL_DIM);
+    }
+
+    else if (s_stickTest == 3)
+    {
+        // ── Trigger Dead-Zone card ─────────────────────────────────────────
+        // Two large trigger bars spanning most of the content area.
+        // Dead-zone band highlighted in red at the bottom of each bar.
+        // Min/max recorded values shown. Prompt to squeeze slowly.
+
+        float contentY = B + 36.f;
+
+        // Large bar geometry — wider and taller than the main view trigger bars
+        float LBW = 80.f;   // bar width
+        float LBH = 240.f;  // bar height
+        float lcx = X_MID - 110.f;  // LT center X
+        float rcx = X_MID + 110.f;  // RT center X
+        float bcy = contentY + 130.f; // bar center Y
+
+        float x0L = lcx - LBW * 0.5f;
+        float x1L = lcx + LBW * 0.5f;
+        float x0R = rcx - LBW * 0.5f;
+        float x1R = rcx + LBW * 0.5f;
+        float yTop = bcy - LBH * 0.5f;
+        float yBot = bcy + LBH * 0.5f;
+
+        // ── Draw each bar ──────────────────────────────────────────────────
+
+        // ── Draw LT bar ────────────────────────────────────────────────
+        {
+            float x0 = x0L;
+            float x1 = x1L;
+            int   val = s_trigLT;
+            int   vMin = s_trigMinLT;
+            int   vMax = s_trigMaxLT;
+            char* lbl = "LT";
+            char* dzLbl = "DZ";
+            float dzH = LBH * ((float)TRIG_DZ_THRESHOLD / 255.f);
+            float fillH = LBH * ((float)val / 255.f);
+            char  vStr[6];
+            IntToStr(val, vStr, sizeof(vStr));
+
+            FillRect(x0, yTop, x1, yBot, D3DCOLOR_XRGB(10, 14, 32));
+            FillRectGrad(x0, yBot - dzH, x1, yBot,
+                D3DCOLOR_XRGB(80, 18, 18), D3DCOLOR_XRGB(50, 10, 10));
+            HLine(yBot - dzH, x0, x1, D3DCOLOR_XRGB(200, 50, 50));
+            DrawText(x0 + (x1 - x0) * 0.5f - TW(dzLbl, 1.0f) * 0.5f,
+                yBot - dzH * 0.5f - 5.f, dzLbl, 1.0f, D3DCOLOR_XRGB(200, 80, 80));
+            if (fillH > 0.5f)
+            {
+                DWORD fc = val < 128 ? D3DCOLOR_XRGB(28, 170, 55) :
+                    val < 210 ? D3DCOLOR_XRGB(200, 175, 20) :
+                    D3DCOLOR_XRGB(210, 55, 30);
+                FillRect(x0 + 1.f, yBot - fillH, x1 - 1.f, yBot, fc);
+            }
+            HLine(yTop + LBH * 0.25f, x0, x1, D3DCOLOR_XRGB(25, 35, 65));
+            HLine(yTop + LBH * 0.50f, x0, x1, D3DCOLOR_XRGB(25, 35, 65));
+            HLine(yTop + LBH * 0.75f, x0, x1, D3DCOLOR_XRGB(25, 35, 65));
+            HLine(yTop, x0, x1, COL_BORDER);
+            HLine(yBot, x0, x1, COL_BORDER);
+            VLine(x0, yTop, yBot, COL_BORDER);
+            VLine(x1, yTop, yBot, COL_BORDER);
+            DrawText(x0 + (x1 - x0) * 0.5f - TW(lbl, 1.4f) * 0.5f,
+                yTop - 20.f, lbl, 1.4f, COL_YELLOW);
+            DrawText(x0 + (x1 - x0) * 0.5f - TW(vStr, 1.2f) * 0.5f,
+                yBot + 6.f, vStr, 1.2f, COL_WHITE);
+            if (s_trigHasData)
+            {
+                char mmStr[24];
+                char tmp[6];
+                StrCopy(mmStr, sizeof(mmStr), "Min:");
+                IntToStr(vMin, tmp, sizeof(tmp));
+                StrCat2(mmStr, sizeof(mmStr), mmStr, tmp);
+                DrawText(x0, yBot + 22.f, mmStr, 1.0f, COL_DIM);
+                StrCopy(mmStr, sizeof(mmStr), "Max:");
+                IntToStr(vMax, tmp, sizeof(tmp));
+                StrCat2(mmStr, sizeof(mmStr), mmStr, tmp);
+                DrawText(x0, yBot + 36.f, mmStr, 1.0f, COL_DIM);
+                if (vMin <= TRIG_DZ_THRESHOLD && vMax > TRIG_DZ_THRESHOLD)
+                {
+                    char* w = "PASSES DZ";
+                    DrawText(x0 + (x1 - x0) * 0.5f - TW(w, 1.0f) * 0.5f,
+                        yBot + 52.f, w, 1.0f, D3DCOLOR_XRGB(28, 200, 28));
+                }
+                else if (vMax <= TRIG_DZ_THRESHOLD)
+                {
+                    char* w = "IN DZ";
+                    DrawText(x0 + (x1 - x0) * 0.5f - TW(w, 1.0f) * 0.5f,
+                        yBot + 52.f, w, 1.0f, D3DCOLOR_XRGB(200, 80, 80));
+                }
+            }
+        }
+
+        // ── Draw RT bar ────────────────────────────────────────────────
+        {
+            float x0 = x0R;
+            float x1 = x1R;
+            int   val = s_trigRT;
+            int   vMin = s_trigMinRT;
+            int   vMax = s_trigMaxRT;
+            char* lbl = "RT";
+            char* dzLbl = "DZ";
+            float dzH = LBH * ((float)TRIG_DZ_THRESHOLD / 255.f);
+            float fillH = LBH * ((float)val / 255.f);
+            char  vStr[6];
+            IntToStr(val, vStr, sizeof(vStr));
+
+            FillRect(x0, yTop, x1, yBot, D3DCOLOR_XRGB(10, 14, 32));
+            FillRectGrad(x0, yBot - dzH, x1, yBot,
+                D3DCOLOR_XRGB(80, 18, 18), D3DCOLOR_XRGB(50, 10, 10));
+            HLine(yBot - dzH, x0, x1, D3DCOLOR_XRGB(200, 50, 50));
+            DrawText(x0 + (x1 - x0) * 0.5f - TW(dzLbl, 1.0f) * 0.5f,
+                yBot - dzH * 0.5f - 5.f, dzLbl, 1.0f, D3DCOLOR_XRGB(200, 80, 80));
+            if (fillH > 0.5f)
+            {
+                DWORD fc = val < 128 ? D3DCOLOR_XRGB(28, 170, 55) :
+                    val < 210 ? D3DCOLOR_XRGB(200, 175, 20) :
+                    D3DCOLOR_XRGB(210, 55, 30);
+                FillRect(x0 + 1.f, yBot - fillH, x1 - 1.f, yBot, fc);
+            }
+            HLine(yTop + LBH * 0.25f, x0, x1, D3DCOLOR_XRGB(25, 35, 65));
+            HLine(yTop + LBH * 0.50f, x0, x1, D3DCOLOR_XRGB(25, 35, 65));
+            HLine(yTop + LBH * 0.75f, x0, x1, D3DCOLOR_XRGB(25, 35, 65));
+            HLine(yTop, x0, x1, COL_BORDER);
+            HLine(yBot, x0, x1, COL_BORDER);
+            VLine(x0, yTop, yBot, COL_BORDER);
+            VLine(x1, yTop, yBot, COL_BORDER);
+            DrawText(x0 + (x1 - x0) * 0.5f - TW(lbl, 1.4f) * 0.5f,
+                yTop - 20.f, lbl, 1.4f, COL_YELLOW);
+            DrawText(x0 + (x1 - x0) * 0.5f - TW(vStr, 1.2f) * 0.5f,
+                yBot + 6.f, vStr, 1.2f, COL_WHITE);
+            if (s_trigHasData)
+            {
+                char mmStr[24];
+                char tmp[6];
+                StrCopy(mmStr, sizeof(mmStr), "Min:");
+                IntToStr(vMin, tmp, sizeof(tmp));
+                StrCat2(mmStr, sizeof(mmStr), mmStr, tmp);
+                DrawText(x0, yBot + 22.f, mmStr, 1.0f, COL_DIM);
+                StrCopy(mmStr, sizeof(mmStr), "Max:");
+                IntToStr(vMax, tmp, sizeof(tmp));
+                StrCat2(mmStr, sizeof(mmStr), mmStr, tmp);
+                DrawText(x0, yBot + 36.f, mmStr, 1.0f, COL_DIM);
+                if (vMin <= TRIG_DZ_THRESHOLD && vMax > TRIG_DZ_THRESHOLD)
+                {
+                    char* w = "PASSES DZ";
+                    DrawText(x0 + (x1 - x0) * 0.5f - TW(w, 1.0f) * 0.5f,
+                        yBot + 52.f, w, 1.0f, D3DCOLOR_XRGB(28, 200, 28));
+                }
+                else if (vMax <= TRIG_DZ_THRESHOLD)
+                {
+                    char* w = "IN DZ";
+                    DrawText(x0 + (x1 - x0) * 0.5f - TW(w, 1.0f) * 0.5f,
+                        yBot + 52.f, w, 1.0f, D3DCOLOR_XRGB(200, 80, 80));
+                }
+            }
+        }
+
+        // Centre info
+        char dzValStr[24];
+        char tmp2[6];
+        DrawText(X_MID - TW("Squeeze triggers slowly from rest", 1.05f) * 0.5f,
+            contentY + 272.f, "Squeeze triggers slowly from rest", 1.05f, COL_DIM);
+        DrawText(X_MID - TW("[X] Reset stats", 1.05f) * 0.5f,
+            contentY + 286.f, "[X] Reset stats", 1.05f, COL_DIM);
+
+        // Dead-zone threshold label at centre
+        StrCopy(dzValStr, sizeof(dzValStr), "Dead-zone threshold: ");
+        IntToStr(TRIG_DZ_THRESHOLD, tmp2, sizeof(tmp2));
+        StrCat2(dzValStr, sizeof(dzValStr), dzValStr, tmp2);
+        DrawText(X_MID - TW(dzValStr, 1.0f) * 0.5f,
+            contentY + 300.f, dzValStr, 1.0f, D3DCOLOR_XRGB(200, 80, 80));
     }
 
     g_pDevice->EndScene();
@@ -1122,9 +1302,9 @@ void ControllerTest_Tick(const DiagLogo& logo)
             return;
         }
         if (Edge(cur, s_prev, BTN_DPAD_RIGHT))
-            s_stickTest = (s_stickTest + 1) % 3;
+            s_stickTest = (s_stickTest + 1) % 4;
         if (Edge(cur, s_prev, BTN_DPAD_LEFT))
-            s_stickTest = (s_stickTest + 2) % 3;
+            s_stickTest = (s_stickTest + 3) % 4;
         if (Edge(cur, s_prev, BTN_X))
         {
             if (s_stickTest == 1)
@@ -1141,6 +1321,24 @@ void ControllerTest_Tick(const DiagLogo& logo)
                 s_driftAvgLX = 0; s_driftAvgLY = 0;
                 s_driftAvgRX = 0; s_driftAvgRY = 0;
             }
+            else if (s_stickTest == 3)
+            {
+                // Reset trigger dead-zone stats
+                s_trigMinLT = 255; s_trigMaxLT = 0;
+                s_trigMinRT = 255; s_trigMaxRT = 0;
+                s_trigHasData = false;
+            }
+        }
+        // Update trigger dead-zone card live values
+        if (s_stickTest == 3)
+        {
+            s_trigLT = lt;
+            s_trigRT = rt;
+            if (s_trigLT > 0 || s_trigRT > 0) s_trigHasData = true;
+            if (s_trigLT < s_trigMinLT) s_trigMinLT = s_trigLT;
+            if (s_trigLT > s_trigMaxLT) s_trigMaxLT = s_trigLT;
+            if (s_trigRT < s_trigMinRT) s_trigMinRT = s_trigRT;
+            if (s_trigRT > s_trigMaxRT) s_trigMaxRT = s_trigRT;
         }
         s_prev = cur;
         RenderStickTest(logo, lx, ly, rx, ry, rawLX, rawLY, rawRX, rawRY);
@@ -1191,6 +1389,9 @@ void ControllerTest_Tick(const DiagLogo& logo)
         s_driftHead = 0; s_driftCount = 0; s_driftWarmup = 60;
         s_driftAvgLX = 0; s_driftAvgLY = 0;
         s_driftAvgRX = 0; s_driftAvgRY = 0;
+        s_trigMinLT = 255; s_trigMaxLT = 0;
+        s_trigMinRT = 255; s_trigMaxRT = 0;
+        s_trigHasData = false;
         s_prev = cur;
         return;
     }

@@ -1,76 +1,113 @@
-﻿#include "font.h"
+﻿// font.cpp
+// XbDiag 5x7 bitmap font renderer.
+//
+// SD readability improvements (active when Font_SetSD(true) is called):
+//
+//   1. Scanline-safe pixel height
+//      On 480i/576i each bitmap dot is rendered as a quad that is 1.5x taller
+//      than it is wide.  This spreads every lit pixel across both interlaced
+//      fields, preventing single-pixel horizontal strokes from flickering on/off
+//      with the field rate.  The vertical overlap is intentional - it reads as
+//      slightly bolder text on a CRT rather than a visible smear.
+//
+//   2. Wider letter spacing
+//      Advance widens from 6.0 to 6.5 design pixels per character at scale 1.0.
+//      Half a design pixel of breathing room at SD makes words significantly
+//      easier to parse.  Font_GetAdvance() lets TW() in DiagCommon stay in sync
+//      so right-aligned and centered text does not drift.
+//
+//   3. Separated, alpha-blended drop shadow
+//      Shadow offset increases from 0.9x to 1.5x scale in SD mode so the shadow
+//      actually separates from the glyph rather than merging into mud.
+//      Shadow alpha drops to 160/255 (was fully opaque) and is drawn with
+//      D3DRS_ALPHABLENDENABLE so it reads as a soft halo instead of a hard ghost.
+//      Alpha blend state is restored to FALSE after the shadow pass to stay
+//      compatible with the rest of the renderer which expects blend off.
+//
+// None of these changes affect the glyph bitmaps, DrawText signature, font.h
+// public API (beyond the two new functions), or any call site.
+
+#include "font.h"
 #include <xtl.h>
 
-// This matches the VERTEX layout used in renderer, but is local to this TU.
 struct VERTEX
 {
     float x, y, z, rhw;
     DWORD color;
 };
 
-// Use the D3D device defined in renderer.cpp / main.cpp
 extern LPDIRECT3DDEVICE8 g_pDevice;
 
-// 5x7 bitmap font data and renderer
+// ============================================================================
+// SD mode flag - set once by Font_SetSD() after video mode detection
+// ============================================================================
+
+static bool  s_isSD = false;  // true = 480i or 576i PAL
+static float s_advance = 6.0f;   // design pixels per character at scale 1.0
+
+void Font_SetSD(bool isSD)
+{
+    s_isSD = isSD;
+    s_advance = isSD ? 6.5f : 6.0f;
+}
+
+float Font_GetAdvance()
+{
+    return s_advance;
+}
+
+// ============================================================================
+// Glyph data  (5x7 bitmap, uppercase only - FindGlyph maps a-z to A-Z)
+// ============================================================================
 
 struct Glyph
 {
-    char           ch;
-    unsigned char  r[7];
+    char          ch;
+    unsigned char r[7];
 };
-
-// NOTE:
-//  - a-z are mapped to A-Z in FindGlyph() so we only store uppercase.
-//  - Unknown characters fall back to space.
-//  - Geometric/sci-fi style: 5x7 bitmap, uppercase only, shadow via DrawChar.
-//    but still 5x7 and compatible with the rest of the project.
 
 static Glyph g_font[] =
 {
-    // Space
     { ' ',{0x00,0x00,0x00,0x00,0x00,0x00,0x00} },
 
-    // A-Z
-    { 'A',{0x0E,0x11,0x11,0x1F,0x11,0x11,0x11} }, // A
-    { 'B',{0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E} }, // B
-    { 'C',{0x0E,0x11,0x10,0x10,0x10,0x11,0x0E} }, // C
-    { 'D',{0x1E,0x11,0x11,0x11,0x11,0x11,0x1E} }, // D (more rounded)
-    { 'E',{0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F} }, // E
-    { 'F',{0x1F,0x10,0x10,0x1E,0x10,0x10,0x10} }, // F
-    { 'G',{0x0E,0x11,0x10,0x17,0x11,0x11,0x0F} }, // G (open mouth)
-    { 'H',{0x11,0x11,0x11,0x1F,0x11,0x11,0x11} }, // H
-    { 'I',{0x1F,0x04,0x04,0x04,0x04,0x04,0x1F} }, // I (framed)
-    { 'J',{0x07,0x02,0x02,0x02,0x12,0x12,0x0C} }, // J (more sci-fi)
-    { 'K',{0x11,0x12,0x14,0x18,0x14,0x12,0x11} }, // K
-    { 'L',{0x10,0x10,0x10,0x10,0x10,0x10,0x1F} }, // L
-    { 'M',{0x11,0x1B,0x15,0x11,0x11,0x11,0x11} }, // M
-    { 'N',{0x11,0x19,0x15,0x13,0x11,0x11,0x11} }, // N
-    { 'O',{0x0E,0x11,0x11,0x11,0x11,0x11,0x0E} }, // O
-    { 'P',{0x1E,0x11,0x11,0x1E,0x10,0x10,0x10} }, // P
-    { 'Q',{0x0E,0x11,0x11,0x11,0x15,0x12,0x0D} }, // Q (tail)
-    { 'R',{0x1E,0x11,0x11,0x1E,0x14,0x12,0x11} }, // R
-    { 'S',{0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E} }, // S
-    { 'T',{0x1F,0x04,0x04,0x04,0x04,0x04,0x04} }, // T
-    { 'U',{0x11,0x11,0x11,0x11,0x11,0x11,0x0E} }, // U
-    { 'V',{0x11,0x11,0x11,0x11,0x0A,0x0A,0x04} }, // V (tighter bottom)
-    { 'W',{0x11,0x11,0x11,0x15,0x15,0x1B,0x11} }, // W (chunkier mid)
-    { 'X',{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11} }, // X
-    { 'Y',{0x11,0x11,0x0A,0x04,0x04,0x04,0x04} }, // Y
-    { 'Z',{0x1F,0x01,0x02,0x04,0x08,0x10,0x1F} }, // Z
+    { 'A',{0x0E,0x11,0x11,0x1F,0x11,0x11,0x11} },
+    { 'B',{0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E} },
+    { 'C',{0x0E,0x11,0x10,0x10,0x10,0x11,0x0E} },
+    { 'D',{0x1E,0x11,0x11,0x11,0x11,0x11,0x1E} },
+    { 'E',{0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F} },
+    { 'F',{0x1F,0x10,0x10,0x1E,0x10,0x10,0x10} },
+    { 'G',{0x0E,0x11,0x10,0x17,0x11,0x11,0x0F} },
+    { 'H',{0x11,0x11,0x11,0x1F,0x11,0x11,0x11} },
+    { 'I',{0x1F,0x04,0x04,0x04,0x04,0x04,0x1F} },
+    { 'J',{0x07,0x02,0x02,0x02,0x12,0x12,0x0C} },
+    { 'K',{0x11,0x12,0x14,0x18,0x14,0x12,0x11} },
+    { 'L',{0x10,0x10,0x10,0x10,0x10,0x10,0x1F} },
+    { 'M',{0x11,0x1B,0x15,0x11,0x11,0x11,0x11} },
+    { 'N',{0x11,0x19,0x15,0x13,0x11,0x11,0x11} },
+    { 'O',{0x0E,0x11,0x11,0x11,0x11,0x11,0x0E} },
+    { 'P',{0x1E,0x11,0x11,0x1E,0x10,0x10,0x10} },
+    { 'Q',{0x0E,0x11,0x11,0x11,0x15,0x12,0x0D} },
+    { 'R',{0x1E,0x11,0x11,0x1E,0x14,0x12,0x11} },
+    { 'S',{0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E} },
+    { 'T',{0x1F,0x04,0x04,0x04,0x04,0x04,0x04} },
+    { 'U',{0x11,0x11,0x11,0x11,0x11,0x11,0x0E} },
+    { 'V',{0x11,0x11,0x11,0x11,0x0A,0x0A,0x04} },
+    { 'W',{0x11,0x11,0x11,0x15,0x15,0x1B,0x11} },
+    { 'X',{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11} },
+    { 'Y',{0x11,0x11,0x0A,0x04,0x04,0x04,0x04} },
+    { 'Z',{0x1F,0x01,0x02,0x04,0x08,0x10,0x1F} },
 
-    // Digits (cleaned up a bit)
-    { '0',{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E} }, // 0
-    { '1',{0x04,0x0C,0x14,0x04,0x04,0x04,0x1F} }, // 1
-    { '2',{0x0E,0x11,0x01,0x02,0x04,0x08,0x1F} }, // 2
-    { '3',{0x0E,0x11,0x01,0x06,0x01,0x11,0x0E} }, // 3
-    { '4',{0x02,0x06,0x0A,0x12,0x1F,0x02,0x02} }, // 4
-    { '5',{0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E} }, // 5
-    { '6',{0x06,0x08,0x10,0x1E,0x11,0x11,0x0E} }, // 6
-    { '7',{0x1F,0x01,0x02,0x04,0x08,0x08,0x08} }, // 7
-    { '8',{0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E} }, // 8
-    { '9',{0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C} }, // 9
+    { '0',{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E} },
+    { '1',{0x04,0x0C,0x14,0x04,0x04,0x04,0x1F} },
+    { '2',{0x0E,0x11,0x01,0x02,0x04,0x08,0x1F} },
+    { '3',{0x0E,0x11,0x01,0x06,0x01,0x11,0x0E} },
+    { '4',{0x02,0x06,0x0A,0x12,0x1F,0x02,0x02} },
+    { '5',{0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E} },
+    { '6',{0x06,0x08,0x10,0x1E,0x11,0x11,0x0E} },
+    { '7',{0x1F,0x01,0x02,0x04,0x08,0x08,0x08} },
+    { '8',{0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E} },
+    { '9',{0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C} },
 
-    // Core punctuation (mostly unchanged, already readable)
     { ':',{0x00,0x04,0x04,0x00,0x04,0x04,0x00} },
     { '.',{0x00,0x00,0x00,0x00,0x00,0x06,0x06} },
     { ',',{0x00,0x00,0x00,0x00,0x06,0x06,0x02} },
@@ -78,7 +115,6 @@ static Glyph g_font[] =
     { '!',{0x04,0x04,0x04,0x04,0x04,0x00,0x04} },
     { '?',{0x0E,0x11,0x01,0x02,0x04,0x00,0x04} },
 
-    // Math / separators
     { '-',{0x00,0x00,0x00,0x0E,0x00,0x00,0x00} },
     { '_',{0x00,0x00,0x00,0x00,0x00,0x00,0x1F} },
     { '+',{0x00,0x04,0x04,0x1F,0x04,0x04,0x00} },
@@ -86,17 +122,14 @@ static Glyph g_font[] =
     { '/',{0x01,0x01,0x02,0x04,0x08,0x10,0x10} },
     { '\\',{0x10,0x10,0x08,0x04,0x02,0x01,0x01} },
 
-    // Brackets / grouping
     { '(',{0x02,0x04,0x08,0x08,0x08,0x04,0x02} },
     { ')',{0x08,0x04,0x02,0x02,0x02,0x04,0x08} },
     { '[',{0x0E,0x08,0x08,0x08,0x08,0x08,0x0E} },
     { ']',{0x0E,0x02,0x02,0x02,0x02,0x02,0x0E} },
 
-    // Quotes
     { '\'',{0x04,0x04,0x04,0x00,0x00,0x00,0x00} },
-    { '"',{0x0A,0x0A,0x0A,0x00,0x00,0x00,0x00} },
+    { '"', {0x0A,0x0A,0x0A,0x00,0x00,0x00,0x00} },
 
-    // Symbols
     { '#',{0x0A,0x0A,0x1F,0x0A,0x1F,0x0A,0x0A} },
     { '%',{0x18,0x19,0x02,0x04,0x08,0x13,0x03} },
     { '@',{0x0E,0x11,0x17,0x15,0x17,0x10,0x0E} },
@@ -107,43 +140,43 @@ static Glyph g_font[] =
 
 static const int g_fontCount = sizeof(g_font) / sizeof(g_font[0]);
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Glyph lookup
-// -----------------------------------------------------------------------------
+// ============================================================================
+
 static const Glyph* FindGlyph(char c)
 {
-    // Force lowercase into uppercase
     if (c >= 'a' && c <= 'z')
         c = char(c - 'a' + 'A');
-
     for (int i = 0; i < g_fontCount; ++i)
-    {
-        if (g_font[i].ch == c)
-            return &g_font[i];
-    }
-    // default to space
+        if (g_font[i].ch == c) return &g_font[i];
     return &g_font[0];
 }
 
-// -----------------------------------------------------------------------------
-// Low-level raw char draw: single pass, no effects
-// -----------------------------------------------------------------------------
+// ============================================================================
+// DrawCharRaw - single pass, no effects
+//
+// SD mode: ph = scale * 1.5f so each dot spans 1.5 scanlines vertically.
+//          Row positions still step by 'scale' so glyph proportions are
+//          preserved - only the rendered height of each dot is bloated.
+// HD mode: ph = scale (square dots, normal rendering).
+// ============================================================================
+
 static void DrawCharRaw(float x, float y, char c, float scale, DWORD color)
 {
     const Glyph* g = FindGlyph(c);
     float pw = scale;
-    float ph = scale;
+    float ph = s_isSD ? scale * 1.5f : scale;
 
     for (int row = 0; row < 7; ++row)
     {
         unsigned char bits = g->r[row];
         for (int col = 0; col < 5; ++col)
         {
-            int bitIndex = 4 - col;
-            if ((bits >> bitIndex) & 1)
+            if ((bits >> (4 - col)) & 1)
             {
                 float px = x + col * pw;
-                float py = y + row * ph;
+                float py = y + row * scale;  // position steps by scale, not ph
 
                 VERTEX v[4] =
                 {
@@ -159,29 +192,45 @@ static void DrawCharRaw(float x, float y, char c, float scale, DWORD color)
     }
 }
 
-// -----------------------------------------------------------------------------
-// Stylized char: simple drop-shadow + main glyph
-// -----------------------------------------------------------------------------
+// ============================================================================
+// DrawChar - shadow + main glyph
+//
+// HD: opaque black shadow, 0.9x offset, no alpha blend overhead.
+// SD: semi-transparent shadow (alpha 160), 1.5x offset, alpha blend on for
+//     shadow pass only, restored off immediately after.
+// ============================================================================
+
 static void DrawChar(float x, float y, char c, float scale, DWORD color)
 {
-    // Slight offset for the shadow (scaled so it looks good at any size)
-    float off = scale * 0.9f;
-    DWORD shadowColor = D3DCOLOR_XRGB(0, 0, 0);
+    if (s_isSD)
+    {
+        float off = scale * 1.5f;
+        DWORD shadowColor = D3DCOLOR_ARGB(160, 0, 0, 0);
 
-    // Shadow pass (behind, down-right)
-    DrawCharRaw(x + off, y + off, c, scale, shadowColor);
+        g_pDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        g_pDevice->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        g_pDevice->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
 
-    // Main pass
+        DrawCharRaw(x + off, y + off, c, scale, shadowColor);
+
+        g_pDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    }
+    else
+    {
+        DrawCharRaw(x + scale * 0.9f, y + scale * 0.9f, c, scale, D3DCOLOR_XRGB(0, 0, 0));
+    }
+
     DrawCharRaw(x, y, c, scale, color);
 }
 
-// -----------------------------------------------------------------------------
-// Public text draw
-// -----------------------------------------------------------------------------
+// ============================================================================
+// DrawText - public entry point, signature unchanged
+// ============================================================================
+
 void DrawText(float x, float y, const char* text, float scale, DWORD color)
 {
     float cx = x;
-    const float advance = 6.0f * scale; // 5px glyph + 1px gap
+    const float advance = s_advance * scale;
 
     while (*text)
     {

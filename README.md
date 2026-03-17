@@ -42,7 +42,8 @@ Power draw during the CPU stress test is lower than during the RAM stress test, 
 | 08 | **Controller Test** | Port connection status strip (all 4 ports), digital buttons, analog sticks, triggers, Black/White — live visualizer with stick sub-tests and rumble motor subcard |
 | 09 | **Stress Test** | CPU and RAM stress tests with live temperature monitoring, fan speed readback, and configurable thermal auto-abort |
 | 10 | **File Explorer** | Full file manager with FTP server, file copy/move/delete, multi-select, and XBE launcher |
-| 11 | **About** | Version info, credits, and rotating Xbox hardware facts ticker |
+| 11 | **Update** | GitHub OTA updater — checks latest release tag, downloads, and overwrites `D:\XbDiag.xbe` in place |
+| 12 | **About** | Version info, credits, and rotating Xbox hardware facts ticker |
 
 ---
 
@@ -476,13 +477,25 @@ Displays all digital buttons (A, B, X, Y, Black, White, Start, Back, D-pad, thum
 <img src="https://github.com/Darkone83/XbDiag/blob/main/img/Controllertest_dead.png">
 </div>
 
-Three sub-tests selectable with `[DPad Left]` / `[DPad Right]`:
+Four sub-tests selectable with `[DPad Left]` / `[DPad Right]`:
 
 - **Dead-zone** — raw XY scatter plot with configurable dead-zone ring
 - **Circularity** — traces the stick gate path vs an ideal circle. `[X]` clears the trace.
 - **Drift** — samples at-rest position over ~3 seconds and reports average XY offset for both sticks. `[X]` resets the sample buffer.
+- **Triggers** — dedicated trigger dead-zone card (see below)
 
 Press `[B]` to exit back to the main visualizer.
+
+### Trigger Dead-Zone Card
+
+Two large vertical bars display live LT and RT pressure (0–255). The bottom portion of each bar is highlighted in red to show the dead-zone band (threshold: 30/255). Squeeze each trigger from rest to record min/max values for the session.
+
+| Indicator | Meaning |
+|-----------|---------|
+| **PASSES DZ** (green) | Recorded minimum was inside dead-zone; maximum broke through cleanly |
+| **IN DZ** (red) | Maximum never exceeded the threshold — trigger does not actuate fully |
+
+`[X]` resets the min/max stats. Stats also reset on re-entry to the Stick Test card.
 
 ### Rumble Subcard `[START+A]`
 
@@ -514,7 +527,7 @@ Before the test begins, a threshold picker allows adjusting the thermal abort li
 
 ### CPU Stress `[A]`
 
-Sustained FPU/integer burn using a Prime95-derived eight-real FFT kernel. Live CPU and board temperatures are shown throughout with a scrolling history graph, min/max statistics, and fan speed readback (where PIC register 0x10 responds). A CPU load bar shows core utilization.
+Sustained FPU burn using a dual-chain SSE1 `MULPS`/`ADDPS` kernel targeting both FP execution ports simultaneously. A 16KB working set fits entirely in L1 cache. A secondary x87 FFT pass and integer chain run alongside to exercise all three execution domains. Live CPU and board temperatures are shown throughout with a scrolling history graph, min/max statistics, and fan speed readback (where PIC register 0x10 responds). A CPU load bar shows core utilization.
 
 ### RAM Stress `[Right]`
 
@@ -585,6 +598,12 @@ Marked items are shown in **green**. Marks persist while you navigate to your de
 
 Copy and move operations run as a tick-driven background task so large transfers show a live progress widget and keep the UI responsive throughout.
 
+### Memory Unit Support
+
+Plugged-in Memory Units appear in the drive list as lettered drives (A–H, mapped by controller port and slot). Insertion and removal are detected every frame — the drive list reloads automatically on hotplug.
+
+To format a Memory Unit as FATX: navigate to its entry in the drive list and press `[Back+Black]`. A confirmation overlay appears — press `[A]` to format or `[B]` to cancel.
+
 ### FTP Server
 
 <div align=center>
@@ -597,6 +616,24 @@ Copy and move operations run as a tick-driven background task so large transfers
 - **Supported commands:** USER, PASS, SYST, TYPE, FEAT, PWD, CWD, CDUP, LIST, NLST, RETR, STOR, DELE, MKD, RMD, RNFR, RNTO, SIZE, OPTS, NOOP, QUIT
 - Fully non-blocking — polled every frame, never stalls the UI
 - Compatible with FlashFXP, FileZilla, and standard FTP clients
+
+---
+
+## Update
+
+XbDiag includes a built-in OTA updater that fetches the latest release from GitHub over raw TCP HTTP/1.0 and writes it directly to `D:\XbDiag.xbe`.
+
+1. Connects to `raw.githubusercontent.com` and reads `xbe/XbDiag.ver` to check the latest version tag
+2. If a newer version is available, displays the tag and prompts for confirmation
+3. Downloads the release XBE and overwrites `D:\XbDiag.xbe`
+4. Reports success or failure with a status message
+
+Requires a network connection and DHCP. Reports `NO LINK` if no IP address is available at entry.
+
+| Button | Action |
+|--------|--------|
+| `[A]` | Confirm update and begin download |
+| `[B]` | Cancel and return to menu |
 
 ---
 
@@ -699,6 +736,7 @@ When the FTP server is active, the display locks to an FTP status page mirroring
 - **LBA48 capacity** is displayed correctly for drives over 137GB. Drives over 2TB will display a `+` suffix indicating the upper 32 address bits are non-zero.
 - **Video mode switching** (`[WHITE]` in Video Info) switches the D3D device via `Reset()`. Modes unsupported by the connected AV pack will be rejected silently by the NV2A encoder — the hardware verify readout will show `MISMATCH` in that case. The original mode is always restored cleanly on exit.
 - **FTP passive mode only** — active mode (PORT) is not supported. Configure your FTP client to use passive mode.
+- **OTA Update** connects over plain HTTP to `raw.githubusercontent.com`. No TLS certificate verification is performed. Do not use on untrusted networks.
 
 ---
 

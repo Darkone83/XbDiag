@@ -45,6 +45,7 @@ static const float VM = 200.0f;
 
 // Video mode info - set by DetectVideoMode() in main.cpp
 extern bool g_isHD;
+extern bool g_isTrueInterlaced;  // true ONLY for 480i NTSC and 576i PAL50 — drives Font_SetSD
 extern char g_videoModeStr[16];  // "480i" / "480p" / "720p" / "1080i" / "576i PAL" / "480i PAL60" / "480i PAL-M"
 
 // ============================================================================

@@ -582,14 +582,17 @@ void TempMonitor_Tick(const DiagLogo& logo)
 
     DrawGraph();
 
-    // Bottom hint - show sensor address and poll rate
-    // Rendered by DrawPageChrome already, but we can add a right-side note
+    // Bottom hint — show sensor address and poll rate.
+    // Right-aligned left of the badge so they don't overlap.
+    // TW(g_videoModeStr) accounts for badge width at current advance.
     {
         const char* pollHint = (s_path == PATH_PIC_16)
             ? "500ms poll  PIC 0x20 (10-sample avg)"
             : "500ms poll  ADM1032 0x98";
-        DrawTextR(SW - LM, BOT_BAR_Y + (BOT_BAR_H - LINE_H) * 0.5f,
-            pollHint, 1.05f, COL_DIM);
+        float badgeW = TW(g_videoModeStr, 1.3f);
+        float hintRX = SW - LM - badgeW - 10.f;
+        float hintY = BOT_BAR_Y + (BOT_BAR_H - LINE_H) * 0.5f;
+        DrawTextR(hintRX, hintY, pollHint, 1.05f, COL_DIM);
     }
 
     g_pDevice->EndScene();

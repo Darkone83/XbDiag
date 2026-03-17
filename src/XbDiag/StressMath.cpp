@@ -134,14 +134,14 @@ static void EightRealsSweep()
             fxch    st(4);; R7, R4, R6, R2, R1, R5, R8, R3
             fadd    st(6), st;; R8 = R7 + R8(final R6)
 
-            fstp    QWORD PTR[eax + 56];; ->R8
-            fstp    QWORD PTR[eax + 40];; ->R6
-            fstp    QWORD PTR[eax + 16];; ->R3
-            fstp    QWORD PTR[eax + 0];; ->R1
-            fstp    QWORD PTR[eax + 32];; ->R5
-            fstp    QWORD PTR[eax + 24];; ->R4
-            fstp    QWORD PTR[eax + 48];; ->R7
-            fstp    QWORD PTR[eax + 8];; ->R2
+            fstp    QWORD PTR[eax + 56];;->R8
+            fstp    QWORD PTR[eax + 40];;->R6
+            fstp    QWORD PTR[eax + 16];;->R3
+            fstp    QWORD PTR[eax + 0];;->R1
+            fstp    QWORD PTR[eax + 32];;->R5
+            fstp    QWORD PTR[eax + 24];;->R4
+            fstp    QWORD PTR[eax + 48];;->R7
+            fstp    QWORD PTR[eax + 8];;->R2
 
             lea     eax, [eax + 64]
             cmp     eax, ecx
@@ -288,10 +288,7 @@ static void FourComplexSquareSweep()
         mov     ecx, end_ptr
 
         fcs_loop :
-
-        fninit;; clear FPU before each block — contains any stack leak to one iteration
-
-            ;; ----forward twiddle : build rotated inputs------------------------ -
+        ;; ----forward twiddle : build rotated inputs------------------------ -
 
             fld     QWORD PTR[eax + 8]
             fmul    QWORD PTR[edi + 0];; A2 = R2 * sin2
@@ -654,122 +651,158 @@ static bool sm_sseOK = false;
 // On the Coppermine PIII the SSE execution unit is independent from the x87
 // FPU — running SSESweep between x87 passes keeps both units loaded.
 //
-// Working set: sm_sse[8192] = 32KB floats — matches x87 buffer footprint,
-// fits Coppermine L1. Values seeded in [0.5, 1.5] to avoid denormals.
-// xmm0-xmm3 = accumulators, xmm4-xmm7 = constants. 2048 iterations × 64 bytes.
 // =============================================================================
 
-static const int SM_SSE_N = (32 * 1024) / sizeof(float);  // 8192 floats = 32KB
-static __declspec(align(16)) float sm_sse[SM_SSE_N];
+static const int SM_SSE_PASS = (16 * 1024) / sizeof(float); // 4096 floats = 16KB
+static const int SM_SSE_OUTER = 128;  // passes before deadline re-check
+static __declspec(align(16)) float sm_sse[SM_SSE_PASS];
+
+// ============================================================================
+// SSESweep
+//
+// Pure SSE1 dual-chain MULPS/ADDPS kernel.
+// Targets both FP execution ports simultaneously on Coppermine PIII:
+//
+//   FP-MUL port:  MULPS xmm0,xmm4  (chain A)  MULPS xmm1,xmm5  (chain B)
+//   FP-ADD port:  ADDPS xmm2,xmm6  (chain C)  ADDPS xmm3,xmm7  (chain D)
+//
+// Chains A/B and C/D are fully independent — the OOO engine dispatches one
+// MUL and one ADD every 2 cycles.  Three rounds of 4 ops per block hides the
+// 5-cycle MULPS latency across the next chain iteration.
+//
+// Working set: SM_SSE_PASS = 16KB — exactly half Coppermine's 32KB L1.
+// xmm4..xmm7 hold constants loaded once before the loop.
+// xmm0..xmm3 are accumulators loaded, operated on, and stored per 64-byte block.
+//
+// Inner loop performs 12 FP ops (MULPS+ADDPS) per 64-byte block.
+// Throughput target: 1 MULPS + 1 ADDPS per 2 cycles = ~2 FLOPS/cycle per lane
+// * 4 lanes * 2 (MUL+ADD) = ~16 FLOPS/cycle  vs x87 ~2-4 FLOPS/cycle.
+// ============================================================================
 
 static void SSESweep()
 {
-    float* end_ptr = sm_sse + SM_SSE_N;
+    float* end_ptr = sm_sse + SM_SSE_PASS;
     __asm
     {
         lea     eax, sm_sse
         mov     ecx, end_ptr
 
-        // Load xmm4..xmm7 with multiply constants from first 64 bytes
-        // movaps xmm4, [eax]
+        // Load constant registers xmm4..xmm7 — held for entire loop
         _emit 0x0F
         _emit 0x28
-        _emit 0x20
-        // movaps xmm5, [eax+16]
+        _emit 0x20  // movaps xmm4, [eax]
         _emit 0x0F
         _emit 0x28
         _emit 0x68
-        _emit 0x10
-        // movaps xmm6, [eax+32]
+        _emit 0x10  // movaps xmm5, [eax+16]
         _emit 0x0F
         _emit 0x28
         _emit 0x70
-        _emit 0x20
-        // movaps xmm7, [eax+48]
+        _emit 0x20  // movaps xmm6, [eax+32]
         _emit 0x0F
         _emit 0x28
         _emit 0x78
-        _emit 0x30
+        _emit 0x30  // movaps xmm7, [eax+48]
 
-        sse_loop:
-        // movaps xmm0, [eax]
+        sse_burn:
+        // Load accumulators
         _emit 0x0F
             _emit 0x28
-            _emit 0x00
-            // movaps xmm1, [eax+16]
+            _emit 0x00  // movaps xmm0, [eax]
             _emit 0x0F
             _emit 0x28
             _emit 0x48
-            _emit 0x10
-            // movaps xmm2, [eax+32]
+            _emit 0x10  // movaps xmm1, [eax+16]
             _emit 0x0F
             _emit 0x28
             _emit 0x50
-            _emit 0x20
-            // movaps xmm3, [eax+48]
+            _emit 0x20  // movaps xmm2, [eax+32]
             _emit 0x0F
             _emit 0x28
             _emit 0x58
-            _emit 0x30
+            _emit 0x30  // movaps xmm3, [eax+48]
 
-            // mulps xmm0, xmm4
+            // Round 1: MUL-port and ADD-port targeted simultaneously
+            // MULPS xmm0,xmm4 -> FP-MUL   ADDPS xmm2,xmm6 -> FP-ADD  (same cycle)
+            _emit 0x0F
+            _emit 0x59
+            _emit 0xC4  // mulps xmm0, xmm4  (chain A)
+            _emit 0x0F
+            _emit 0x58
+            _emit 0xD6  // addps xmm2, xmm6  (chain C)
+            _emit 0x0F
+            _emit 0x59
+            _emit 0xCD  // mulps xmm1, xmm5  (chain B)
+            _emit 0x0F
+            _emit 0x58
+            _emit 0xDF  // addps xmm3, xmm7  (chain D)
+
+            // Round 2: second pass hides 5-cycle MULPS latency
             _emit 0x0F
             _emit 0x59
             _emit 0xC4
-            // mulps xmm1, xmm5
+            _emit 0x0F
+            _emit 0x58
+            _emit 0xD6
             _emit 0x0F
             _emit 0x59
             _emit 0xCD
-            // mulps xmm2, xmm6
             _emit 0x0F
-            _emit 0x59
-            _emit 0xD6
-            // mulps xmm3, xmm7
-            _emit 0x0F
-            _emit 0x59
+            _emit 0x58
             _emit 0xDF
 
-            // addps xmm0, xmm1
+            // Round 3: third pass — OOO finds independent ops in both chains
+            _emit 0x0F
+            _emit 0x59
+            _emit 0xC4
             _emit 0x0F
             _emit 0x58
-            _emit 0xC1
-            // addps xmm2, xmm3
+            _emit 0xD6
+            _emit 0x0F
+            _emit 0x59
+            _emit 0xCD
             _emit 0x0F
             _emit 0x58
-            _emit 0xD3
-            // addps xmm0, xmm2
-            _emit 0x0F
-            _emit 0x58
-            _emit 0xC2
+            _emit 0xDF
 
-            // movaps [eax], xmm0
+            // Reduce: mix all four chains so stores are non-trivial (anti-elision)
+            _emit 0x0F
+            _emit 0x58
+            _emit 0xC1  // addps xmm0, xmm1
+            _emit 0x0F
+            _emit 0x58
+            _emit 0xD3  // addps xmm2, xmm3
+            _emit 0x0F
+            _emit 0x58
+            _emit 0xC2  // addps xmm0, xmm2
+
+            // Store all four registers back
             _emit 0x0F
             _emit 0x29
-            _emit 0x00
-            // movaps [eax+16], xmm1
+            _emit 0x00  // movaps [eax],    xmm0
             _emit 0x0F
             _emit 0x29
             _emit 0x48
-            _emit 0x10
-            // movaps [eax+32], xmm2
+            _emit 0x10  // movaps [eax+16], xmm1
             _emit 0x0F
             _emit 0x29
             _emit 0x50
-            _emit 0x20
-            // movaps [eax+48], xmm3
+            _emit 0x20  // movaps [eax+32], xmm2
             _emit 0x0F
             _emit 0x29
             _emit 0x58
-            _emit 0x30
+            _emit 0x30  // movaps [eax+48], xmm3
 
             add     eax, 64
             cmp     eax, ecx
-            jb      sse_loop
+            jb      sse_burn
     }
 }
 
 
-// =============================================================================
+
+
+// ============================================================================
 // MemFlood_Timed
 //
 // Rotates through three memory access patterns until deadline to maximise
@@ -927,7 +960,7 @@ void StressMath_Init()
     if (sm_sseOK)
     {
         DWORD lcg = sm_sink;
-        for (int i = 0; i < SM_SSE_N; ++i)
+        for (int i = 0; i < SM_SSE_PASS; ++i)
         {
             lcg = lcg * 1664525UL + 1013904223UL;
             sm_sse[i] = 0.5f + (float)(lcg >> 1) * (1.0f / (float)0x80000000UL);
@@ -1009,37 +1042,52 @@ static void IntegerStress()
 // All three execution domains (FPU, XMM, integer) loaded simultaneously.
 // =============================================================================
 
-static const int INNER_CYCLES = 8;
-
 void CPUStress(DWORD deadline)
 {
-    int cycle = 0;
+    // Structure: each outer iteration runs SM_SSE_OUTER SSE passes back-to-back
+    // plus one x87 FFT cycle and one integer stress pass, then checks deadline.
+    // SSE passes dominate the budget (~85%), x87 keeps the FPU state exercised,
+    // integer keeps the ALU loaded. GetTickCount is called only once per outer
+    // iteration to avoid integer pipeline stalls inside the FP burn.
+    int reseedCount = 0;
     while (GetTickCount() < deadline)
     {
-        for (int inner = 0; inner < INNER_CYCLES; ++inner)
+        // ── SSE burn block: SM_SSE_OUTER passes, no deadline check inside ──
+        if (sm_sseOK)
         {
+            for (int p = 0; p < SM_SSE_OUTER; ++p)
+                SSESweep();
+        }
+        else
+        {
+            // SSE unavailable (shouldn't happen on any Xbox) — fall back to x87
             EightRealsSweep();
-            IntegerStress();
             FourComplexSweep();
-            if (sm_sseOK) SSESweep();
             FourComplexSquareSweep();
-            IntegerStress();
-            if (sm_sseOK) SSESweep();
             FourComplexUnfftSweep();
-            IntegerStress();
+        }
 
-            // Anti-elision: 8 samples spread across 64KB buffer
-            {
-                volatile DWORD* raw = (volatile DWORD*)sm_data;
-                sm_sink ^= raw[0] ^ raw[2048] ^ raw[4096] ^ raw[6144]
-                    ^ raw[8192] ^ raw[10240] ^ raw[12288] ^ raw[14336];
-            }
+        // ── x87 pass: one complete FFT cycle ─────────────────────────────────
+        EightRealsSweep();
+        FourComplexSweep();
+        FourComplexSquareSweep();
+        FourComplexUnfftSweep();
 
-            if (++cycle >= RESEED_CYCLES)
-            {
-                Reseed();
-                cycle = 0;
-            }
+        // ── Integer pass ──────────────────────────────────────────────────────
+        IntegerStress();
+
+        // ── Anti-elision: touch both buffers ─────────────────────────────────
+        {
+            volatile DWORD* raw = (volatile DWORD*)sm_data;
+            volatile DWORD* sse = (volatile DWORD*)sm_sse;
+            sm_sink ^= raw[0] ^ raw[4096] ^ sse[0] ^ sse[2048];
+        }
+
+        // ── Periodic reseed ───────────────────────────────────────────────────
+        if (++reseedCount >= RESEED_CYCLES)
+        {
+            Reseed();
+            reseedCount = 0;
         }
     }
 }

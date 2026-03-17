@@ -18,6 +18,7 @@ extern LPDIRECT3DDEVICE8 g_pDevice;
 
 // Video mode info
 bool g_isHD = false;
+bool g_isTrueInterlaced = false;  // 480i NTSC or 576i PAL50 only
 char g_videoModeStr[16] = "480i";
 
 // Resolution scale factors (1.0 = 640x480 design space)
@@ -201,8 +202,8 @@ void HexByte(unsigned char b, char* out2)
 float TW(const char* s, float scale)
 {
     if (!s) return 0.f;
-    // 6 design-pixels per char * scale gives width in design space
-    return (float)StrLen(s) * 6.0f * scale;
+    // Use Font_GetAdvance() so SD mode's wider spacing is reflected in layout math.
+    return (float)StrLen(s) * Font_GetAdvance() * scale;
 }
 
 void ScaledDrawText(float x, float y, const char* text, float scale, DWORD color)
@@ -463,13 +464,53 @@ void DrawPageChrome(const DiagLogo& logo,
     float barTextY = (TOP_BAR_H - 7.f * TS) * 0.5f;
     DrawTextR(SW - 10.f, barTextY, title, TS, COL_WHITE);
 
-    // --- Hints in bottom bar (left) ---
+    // --- Hints in bottom bar ---
+    // Badge is drawn right-aligned at SW-LM. Measure it first so we know
+    // exactly how much horizontal space is available for the hint string.
+    // If the hint is too wide we truncate it with "..." rather than letting
+    // it collide with the badge — this handles 576i PAL whose badge string
+    // "576i PAL" is twice as wide as "480i".
     float botY = BOT_BAR_Y + (BOT_BAR_H - 7.f * 1.3f) * 0.5f;
-    DrawText(LM, botY, hints, 1.3f, COL_YELLOW);
+
+    DWORD badgeCol = g_isHD ? COL_CYAN : COL_GRAY;
+    float badgeTW = TW(g_videoModeStr, 1.3f);
+    float badgeX = SW - LM - badgeTW;          // left edge of badge in design space
+
+    // Safe right edge for hints: leave at least 8px gap before the badge
+    float hintMax = badgeX - 8.f;
+    float hintTW = TW(hints, 1.3f);
+
+    if (hintTW <= hintMax)
+    {
+        // Fits cleanly — draw as-is
+        DrawText(LM, botY, hints, 1.3f, COL_YELLOW);
+    }
+    else
+    {
+        // Truncate with "..." to fit within hintMax design pixels.
+        // Each char = Font_GetAdvance() * 1.3 design px.
+        // Reserve space for 3 trailing dots (same width as "...").
+        float charW = Font_GetAdvance() * 1.3f;
+        float dotsTW = charW * 3.f;
+        float bodyMax = hintMax - dotsTW;
+        int   maxChars = 0;
+        if (bodyMax > 0.f)
+            maxChars = Ftoi(bodyMax / charW);
+
+        // Build truncated string into a local buffer (longest hint is ~70 chars)
+        char truncBuf[80];
+        int  srcLen = StrLen(hints);
+        int  copy = maxChars < srcLen ? maxChars : srcLen;
+        for (int i = 0; i < copy; ++i) truncBuf[i] = hints[i];
+        truncBuf[copy] = '.';
+        truncBuf[copy + 1] = '.';
+        truncBuf[copy + 2] = '.';
+        truncBuf[copy + 3] = '\0';
+
+        DrawText(LM, botY, truncBuf, 1.3f, COL_YELLOW);
+    }
 
     // --- SD / HD badge (bottom bar, right) ---
-    // Badge color: cyan for HD modes, gray for SD
-    DWORD badgeCol = g_isHD ? COL_CYAN : COL_GRAY;
     DrawTextR(SW - LM, botY, g_videoModeStr, 1.3f, badgeCol);
 }
 
