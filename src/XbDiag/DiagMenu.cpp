@@ -18,6 +18,7 @@
 //   (reserved for future "N/A" states on specific hardware)
 
 #include "DiagMenu.h"
+#include "DiagCommon.h"
 #include "font.h"
 #include "input.h"
 #include "Update.h"
@@ -163,8 +164,12 @@ static void Render(const DiagLogo& logo)
 {
     g_pDevice->BeginScene();
 
+    char titleBuf[80];
+    StrCopy(titleBuf, sizeof(titleBuf), "XbDiag ");
+    StrCat2(titleBuf, sizeof(titleBuf), titleBuf, Update_GetLocalVersion());
+    StrCat2(titleBuf, sizeof(titleBuf), titleBuf, " -  Hardware Diagnostic Suite");
     DrawPageChrome(logo,
-        "XbDiag v1.0.2 Beta -  Hardware Diagnostic Suite",
+        titleBuf,
         "[Up/Down] Navigate    [A] Select    [Start] Exit to Dashboard");
 
     // -------------------------------------------------------------------------
