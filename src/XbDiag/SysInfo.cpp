@@ -223,75 +223,59 @@ static void DoCpuid(DWORD leaf,
 }
 
 // ============================================================================
-// PLL-based CPU frequency — exact, instantaneous, no timing window.
+// Pure PLL-based CPU frequency — no MSR, no CPUID, no timing window.
 //
-// MCPX CPUMPLL: PCI Bus 0, Dev 3, Fun 0, Offset 0x6C
-//   Byte 0 = FSB divider
-//   Byte 1 = FSB multiplier
-//   FSB Hz = 16,666,667 * (mult / div)
-//
-// CPU multiplier from MSR 0x2A bits [27:22] masked 0x2F.
-// Table matches MCPX/PrometheOS ratio encoding exactly.
-//
-// CPU MHz = FSB_kHz * ratio / 10 / 1000
+// CPUMPLL  offset 0x6C:  FSB divider (byte 0) + multiplier (byte 1)
+// CPUCTL   offset 0x68:  bits [21:17] = 5-bit ratio index (bootloader-programmed)
 // ============================================================================
 
-static DWORD CpuRatioX10FromMsr()
+static DWORD CpuRatioX10FromCpuctl(DWORD cpuctl)
 {
-    DWORD lo = 0;
-    __asm
-    {
-        mov  ecx, 0x2A
-        rdmsr
-        mov  lo, eax
-    }
-    BYTE pat = (BYTE)((lo >> 22) & 0x2F);
-    switch (pat)
+    BYTE idx = (BYTE)((cpuctl >> 17) & 0x1F);
+    switch (idx)
     {
     case 0x01: return 30;
     case 0x05: return 35;
     case 0x02: return 40;
     case 0x06: return 45;
     case 0x00: return 50;
-    case 0x04: return 55;   // retail 733 / 800 MHz
+    case 0x04: return 55;
     case 0x0B: return 60;
     case 0x0F: return 65;
     case 0x09: return 70;
     case 0x0D: return 75;
     case 0x0A: return 80;
-    case 0x26: return 85;
-    case 0x20: return 90;
-    case 0x24: return 95;
-    case 0x2B: return 100;
-    case 0x2F: return 105;
-    case 0x2A: return 130;
-    case 0x2C: return 140;
+    case 0x16: return 85;
+    case 0x10: return 90;
+    case 0x14: return 95;
+    case 0x1B: return 100;
+    case 0x1F: return 105;
+    case 0x1A: return 130;
+    case 0x1C: return 140;
     default:   return 0;
     }
 }
 
 static DWORD MeasureCpuMHz()
 {
-    // MCPX CPUMPLL: Bus 0, Dev 3, Fun 0, Offset 0x6C
     DWORD cpumpll = PciRead32(0, 3, 0, 0x6C);
+    DWORD cpuctl = PciRead32(0, 3, 0, 0x68);
+
     DWORD fsb_div = cpumpll & 0xFF;
     DWORD fsb_mult = (cpumpll >> 8) & 0xFF;
 
     if (fsb_div == 0 || fsb_mult == 0) return 733;
 
-    // Crystal = 50000000/3 Hz (16.666... MHz) — matches reference implementation exactly.
-    // Use double throughout to avoid integer truncation error (up to 1 MHz on 800MHz configs).
     double fsb_hz = (50000000.0 / 3.0) * ((double)fsb_mult / (double)fsb_div);
-    double fsb_mhz = fsb_hz / 1.0e6;
 
-    DWORD ratio = CpuRatioX10FromMsr();
+    DWORD ratio = CpuRatioX10FromCpuctl(cpuctl);
     if (ratio == 0) return 733;
 
-    double cpu_mhz_d = fsb_mhz * ((double)ratio / 10.0);
-    DWORD  cpu_mhz = (DWORD)(cpu_mhz_d + 0.5);  // round to nearest
+    double cpu_mhz = (fsb_hz * ((double)ratio / 10.0)) / 1.0e6;
+    DWORD  result = (DWORD)(cpu_mhz + 0.5);
 
-    if (cpu_mhz < 400 || cpu_mhz > 1600) return 733;
-    return cpu_mhz;
+    if (result < 400 || result > 1600) return 733;
+    return result;
 }
 
 // ============================================================================
@@ -803,15 +787,18 @@ static void ReadSysData()
     }
     else
     {
-        // Re-use the values already read from leaf 1 in the hypervisor check above.
-        // We call DoCpuid(1) once more here rather than storing all four regs up
-        // there — avoids growing the hypervisor block and the cost is negligible.
         DWORD ea1, eb1, ec1, ed1;
         DoCpuid(1, ea1, eb1, ec1, ed1);
-        BYTE cpuFamily = (BYTE)((ea1 >> 8) & 0x0F);
-        BYTE cpuModel = (BYTE)((ea1 >> 4) & 0x0F);
 
-        // Scan brand string for "Celeron"
+        BYTE baseFamily = (BYTE)((ea1 >> 8) & 0x0F);
+        BYTE baseModel = (BYTE)((ea1 >> 4) & 0x0F);
+        BYTE extModel = (BYTE)((ea1 >> 16) & 0x0F);
+        BYTE extFamily = (BYTE)((ea1 >> 20) & 0xFF);
+
+        BYTE cpuFamily = baseFamily + (baseFamily == 0x0F ? extFamily : 0);
+        BYTE cpuModel = baseModel + ((baseFamily == 6 || baseFamily == 0x0F)
+            ? (extModel << 4) : 0);
+
         bool isCeleron = false;
         {
             const char* needle = "Celeron";
@@ -847,7 +834,13 @@ static void ReadSysData()
         }
         else
         {
-            StrCopy(d.cpuIC, sizeof(d.cpuIC), "Unknown CPU");
+            char ft[4], mt[4];
+            IntToHex(cpuFamily, 2, ft, sizeof(ft));
+            IntToHex(cpuModel, 2, mt, sizeof(mt));
+            StrCopy(d.cpuIC, sizeof(d.cpuIC), "Fam 0x");
+            StrCat2(d.cpuIC, sizeof(d.cpuIC), d.cpuIC, ft);
+            StrCat2(d.cpuIC, sizeof(d.cpuIC), d.cpuIC, " Mod 0x");
+            StrCat2(d.cpuIC, sizeof(d.cpuIC), d.cpuIC, mt);
         }
     }
 
@@ -1364,7 +1357,7 @@ static void DumpBios()
     ULONG padSize = fullSize - readSize;  // always 512 bytes
 
     // ---- Open output file BEFORE mapping ROM (avoids heap corruption risk) ----
-    HANDLE hf = CreateFileA("D:\\bios.bin", GENERIC_WRITE, 0, NULL,
+    HANDLE hf = CreateFileA("\\bios.bin", GENERIC_WRITE, 0, NULL,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hf == INVALID_HANDLE_VALUE)
     {
@@ -1847,19 +1840,6 @@ static void Render(const DiagLogo& logo)
 
     // ---- LEFT: CPU ----
     DrawSection(C1, y1, RULEW, "CPU");                          y1 += LH + 4.f;
-    // Only show the CPU identifier row when we have a useful value.
-    // "Unknown CPU" and "P6 model 0x.." are suppressed — they add no
-    // diagnostic value and would just confuse users on unrecognised silicon.
-    {
-        bool icKnown = (d.cpuIC[0] != '\0')
-            && (d.cpuIC[0] != 'U')   // "Unknown CPU"
-            && (d.cpuIC[0] != 'P');  // "P6 model 0x.."
-        if (icKnown)
-        {
-            DrawRow(C1, y1, V1, "CPU    :", d.cpuIC,
-                d.isXemu ? COL_YELLOW : COL_CYAN);              y1 += LH;
-        }
-    }
     DrawRow(C1, y1, V1, "SPEED  :", d.cpuSpeedMHz, COL_WHITE); y1 += LH;
     DrawRow(C1, y1, V1, "BRAND  :", d.cpuBrand, COL_DIM);      y1 += LH;
     DrawRow(C1, y1, V1, "CPUID  :", d.cpuLeaf1, COL_DIM);      y1 += LH + GAP;

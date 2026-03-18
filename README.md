@@ -39,9 +39,9 @@ Power draw during the CPU stress test is lower than during the RAM stress test, 
 | 05 | **EEPROM Viewer** | Full 256-byte EEPROM decode with hex view, field editor, checksum repair, and backup restore |
 | 06 | **Video Info** | Encoder type and chip ID, AV pack type, NV2A GPU/memory/pixel clocks, VRAM size, HD mod detection, NTSC/PAL color bar patterns, and live video mode switching test |
 | 07 | **HDD Info** | ATA IDENTIFY — model, serial, firmware, capacity, RPM/SSD, UDMA mode, partition sizes, SMART, HDD benchmark, and DVD drive detection |
-| 08 | **Controller Test** | Port connection status strip (all 4 ports), digital buttons, analog sticks, triggers, Black/White — live visualizer with stick sub-tests and rumble motor subcard |
+| 08 | **Controller Test** | Port connection status strip (all 4 ports), digital buttons, analog sticks, triggers, Black/White — live visualizer with stick sub-tests (dead-zone, circularity, drift, trigger dead-zone card) and rumble motor subcard |
 | 09 | **Stress Test** | CPU and RAM stress tests with live temperature monitoring, fan speed readback, and configurable thermal auto-abort |
-| 10 | **File Explorer** | Full file manager with FTP server, file copy/move/delete, multi-select, and XBE launcher |
+| 10 | **File Explorer** | Full file manager with FTP server, file copy/move/delete, multi-select, new folder creation, file viewer, and XBE launcher |
 | 11 | **Update** | GitHub OTA updater — checks latest release tag, downloads, and overwrites `D:\XbDiag.xbe` in place |
 | 12 | **About** | Version info, credits, and rotating Xbox hardware facts ticker |
 
@@ -578,6 +578,8 @@ A full single-pane file manager for navigating and managing files on your Xbox H
 | `[A]` | Enter directory / open drive |
 | `[B]` | Go up one level (at drive list returns to menu) |
 | `[X]` | Launch selected XBE via XLaunchNewImage |
+| `[R3]` | Create new folder (opens virtual keyboard to enter name) |
+| `[L3]` | Open selected `.txt` or `.csv` file in the file viewer |
 | `[Start]` | Toggle FTP server on / off |
 
 ### File Operations
@@ -597,6 +599,16 @@ A full single-pane file manager for navigating and managing files on your Xbox H
 Marked items are shown in **green**. Marks persist while you navigate to your destination — mark your files, navigate to the target folder, then paste.
 
 Copy and move operations run as a tick-driven background task so large transfers show a live progress widget and keep the UI responsive throughout.
+
+### File Viewer `[L3]`
+
+Opens `.txt` and `.csv` files directly in the explorer. The viewer reads up to 512KB, wraps long lines automatically, and displays a scroll bar and line counter. A truncation warning is shown if the file exceeds the 512KB limit.
+
+| Button | Action |
+|--------|--------|
+| `[DPad Up/Down]` | Scroll one line |
+| `[LT / RT]` | Page up / page down |
+| `[B]` | Close and return to explorer |
 
 ### Memory Unit Support
 

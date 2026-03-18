@@ -9,6 +9,7 @@ void FE_Ops_Snap(FileOpType op);            // snapshot marked items to clipboar
 void FE_Ops_StartTo(const char* destDir);   // start op to specific dest dir
 void FE_Ops_Start(FileOpType op);           // start op into current directory
 void FE_Ops_Tick();                         // advance one tick of active op
+void FE_Ops_MkDir(const char* name);        // create folder in current directory, reload, reposition cursor
 
 void FE_Ops_PickLoadDriveList();            // load drive list into picker
 void FE_Ops_PickLoadDir(const char* path);  // load directory into picker

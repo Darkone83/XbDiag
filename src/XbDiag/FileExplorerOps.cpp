@@ -540,3 +540,36 @@ void FE_Ops_PickLoadDir(const char* path) { PickLoadDirectory(path); }
 void FE_Ops_DrawPicker() { DrawDestPicker(); }
 void FE_Ops_EnterSelected() { EnterSelected(); }
 bool FE_Ops_DeleteRecursive(const char* path, bool dir) { return FileDeleteRecursive(path, dir); }
+
+void FE_Ops_MkDir(const char* name)
+{
+    if (!name || !name[0]) return;
+
+    // Build full path: s_path + '\' + name
+    char fullPath[MAX_PATH_LEN];
+    StrCopy(fullPath, sizeof(fullPath), s_path);
+    int pl = 0; while (fullPath[pl]) pl++;
+    if (pl > 0 && fullPath[pl - 1] != '\\') { fullPath[pl++] = '\\'; fullPath[pl] = '\0'; }
+    FE_AppendStr(fullPath, sizeof(fullPath), name);
+
+    CreateDirectoryA(fullPath, NULL);
+
+    // Reload directory so the new folder appears
+    FileExplorer_LoadDirectory(s_path);
+
+    // Reposition cursor to the newly created folder
+    for (int i = 0; i < s_entryCount; ++i)
+    {
+        const char* a = s_entries[i].name;
+        const char* b = name;
+        int k = 0;
+        while (a[k] && b[k] && a[k] == b[k]) k++;
+        if (!a[k] && !b[k])
+        {
+            s_cursor = i;
+            s_scroll = s_cursor - ROWS_VISIBLE / 2;
+            if (s_scroll < 0) s_scroll = 0;
+            break;
+        }
+    }
+}

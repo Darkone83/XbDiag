@@ -108,6 +108,12 @@
     <ClCompile Include="StressTestRAM.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Keyboard.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="FileViewer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Text Include="Media\Copy Assets Here.txt">
@@ -200,6 +206,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="StressTestRAM.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Keyboard.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="FileViewer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

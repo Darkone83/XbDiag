@@ -72,6 +72,8 @@
 #include "FileExplorer.h"
 #include "FileExplorerMU.h"
 #include "FileExplorerOps.h"
+#include "Keyboard.h"
+#include "FileViewer.h"
 #include "font.h"
 #include "input.h"
 #include <xtl.h>
@@ -96,6 +98,11 @@ bool      s_atRoot = true;
 char      s_path[MAX_PATH_LEN] = {};
 static bool s_skipFirstTick = true;
 static WORD s_prevBtns = 0;
+
+// ── New Folder via keyboard ────────────────────────────────────────────────
+static char s_mkdirBuf[MAX_NAME_LEN];
+static void OnMkdirDone(const char* name) { FE_Ops_MkDir(name); }
+static void OnMkdirCancel() {}
 
 char      s_ipStr[20] = {};
 bool      s_ipOK = false;
@@ -409,11 +416,11 @@ static void Render(const DiagLogo& logo)
         ? "[A] Open  [B] Back  [Start] FTP Off  [Back+Black] Format MU"
         : "[A] Open  [B] Back  [Start] FTP On   [Back+Black] Format MU";
     else if (g_ftp.state != FTP_OFF)
-        hints = canLaunch ? "[A] Open  [B] Back  [X] Launch  [Y] Mark  [Start] FTP Off"
-        : "[A] Open  [B] Back  [Y] Mark  [Start] FTP Off";
+        hints = canLaunch ? "[A] Open  [B] Back  [X] Launch  [Y] Mark  [R3] New Folder  [Start] FTP Off"
+        : "[A] Open  [B] Back  [Y] Mark  [R3] New Folder  [L3] View  [Start] FTP Off";
     else
-        hints = canLaunch ? "[A] Open  [B] Back  [X] Launch  [Y] Mark  [Start] FTP On"
-        : "[A] Open  [B] Back  [Y] Mark  [Start] FTP On";
+        hints = canLaunch ? "[A] Open  [B] Back  [X] Launch  [Y] Mark  [R3] New Folder  [Start] FTP On"
+        : "[A] Open  [B] Back  [Y] Mark  [R3] New Folder  [L3] View  [Start] FTP On";
 
     DrawPageChrome(logo, "FILE EXPLORER", hints);
 
@@ -705,6 +712,10 @@ void FileExplorer_Tick(const DiagLogo& logo)
     // Service FTP and file ops every tick regardless of input skip
     FtpServ_Tick();
     FE_Ops_Tick();
+
+    // Keyboard and FileViewer intercept all input while open
+    if (Keyboard_IsActive()) { Keyboard_Tick(logo);  return; }
+    if (FileViewer_IsActive()) { FileViewer_Tick(logo); return; }
 
 
     // ---- MU hotplug polling -----------------------------------------------
@@ -1189,6 +1200,38 @@ void FileExplorer_Tick(const DiagLogo& logo)
                         // Never returns
                     }
                 }
+            }
+        }
+    }
+
+    // [R3] — new folder (only inside a directory, not during any op)
+    if (FE_EdgeDown(cur, s_prevBtns, BTN_RTHUMB))
+    {
+        if (!s_atRoot && s_fosState == FOS_IDLE && !s_opRunning)
+        {
+            s_mkdirBuf[0] = '\0';
+            Keyboard_Open("NEW FOLDER", s_mkdirBuf, MAX_NAME_LEN - 1,
+                OnMkdirDone, OnMkdirCancel);
+        }
+    }
+
+    // [L3] — open file viewer for .txt / .csv files
+    if (FE_EdgeDown(cur, s_prevBtns, BTN_LTHUMB))
+    {
+        if (!s_atRoot && s_entryCount > 0 && s_fosState == FOS_IDLE && !s_opRunning)
+        {
+            FileEntry& e = s_entries[s_cursor];
+            if (!e.isDir && FileViewer_CanOpen(e.name))
+            {
+                char fullPath[MAX_PATH_LEN];
+                StrCopy(fullPath, sizeof(fullPath), s_path);
+                int pl = 0; while (fullPath[pl]) pl++;
+                if (pl > 0 && fullPath[pl - 1] != '\\')
+                {
+                    fullPath[pl++] = '\\'; fullPath[pl] = '\0';
+                }
+                FE_AppendStr(fullPath, sizeof(fullPath), e.name);
+                FileViewer_Open(fullPath, e.name);
             }
         }
     }

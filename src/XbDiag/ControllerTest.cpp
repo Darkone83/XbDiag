@@ -255,11 +255,57 @@ static void RenderRumble(const DiagLogo& logo, int lt, int rt)
         "[LT] Left motor   [RT] Right motor   [B] Exit");
 
     float B = CONTENT_Y;
-    float cY = B + 160.f;   // vertical center of the card
+    float cY = B + 185.f;   // vertical center of the card (shifted down to clear port strip)
+
+    // ── Port status strip (mirrors main page) ──────────────────────────────
+    {
+        const float PBW = 46.f;
+        const float PBH = 20.f;
+        const float PGAP = 6.f;
+        const float totalW = PBW * 4.f + PGAP * 3.f;
+        float px = X_MID - totalW * 0.5f;
+        float py = B + 8.f;
+
+        const char* portLabels[4] = { "1", "2", "3", "4" };
+        for (int p = 0; p < 4; ++p)
+        {
+            bool conn = IsPortConnected(p);
+            float x0 = px + (PBW + PGAP) * (float)p;
+            float x1 = x0 + PBW;
+            float y0 = py;
+            float y1 = py + PBH;
+            float cx = (x0 + x1) * 0.5f;
+            float cy = (y0 + y1) * 0.5f;
+
+            DWORD fill = conn ? D3DCOLOR_XRGB(10, 40, 18) : D3DCOLOR_XRGB(10, 14, 32);
+            DWORD border = conn ? D3DCOLOR_XRGB(80, 255, 110) : COL_BORDER;
+            DWORD tc = conn ? COL_GREEN : COL_DIM;
+
+            FillRect(x0, y0, x1, y1, fill);
+            HLine(y0, x0, x1, border);
+            HLine(y1, x0, x1, border);
+            VLine(x0, y0, y1, border);
+            VLine(x1, y0, y1, border);
+            DrawText(cx - TW(portLabels[p], 1.2f) * 0.5f, cy - 5.f,
+                portLabels[p], 1.2f, tc);
+        }
+
+        // Disconnects row
+        float discY = py + PBH + 4.f;
+        DrawText(px - 84.f, discY, "Disconnects:", 1.1f, COL_GRAY);
+        for (int p = 0; p < 4; ++p)
+        {
+            float cx = px + (PBW + PGAP) * (float)p + PBW * 0.5f;
+            char buf[8];
+            IntToStr(s_discCount[p], buf, sizeof(buf));
+            DWORD cc = s_discCount[p] > 0 ? COL_RED : COL_DIM;
+            DrawText(cx - TW(buf, 1.2f) * 0.5f, discY, buf, 1.2f, cc);
+        }
+    }
 
     // ── Section header ──
     const char* hdr = "RUMBLE MOTORS";
-    DrawText(X_MID - TW(hdr, 1.4f) * 0.5f, B + 30.f, hdr, 1.4f, COL_YELLOW);
+    DrawText(X_MID - TW(hdr, 1.4f) * 0.5f, B + 58.f, hdr, 1.4f, COL_YELLOW);
 
     // ── Two large trigger bars, wider and taller than normal ──
     const float RBW = 40.f;   // rumble bar width

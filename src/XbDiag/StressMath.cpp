@@ -134,14 +134,14 @@ static void EightRealsSweep()
             fxch    st(4);; R7, R4, R6, R2, R1, R5, R8, R3
             fadd    st(6), st;; R8 = R7 + R8(final R6)
 
-            fstp    QWORD PTR[eax + 56];;->R8
-            fstp    QWORD PTR[eax + 40];;->R6
-            fstp    QWORD PTR[eax + 16];;->R3
-            fstp    QWORD PTR[eax + 0];;->R1
-            fstp    QWORD PTR[eax + 32];;->R5
-            fstp    QWORD PTR[eax + 24];;->R4
-            fstp    QWORD PTR[eax + 48];;->R7
-            fstp    QWORD PTR[eax + 8];;->R2
+            fstp    QWORD PTR[eax + 56];; ->R8
+            fstp    QWORD PTR[eax + 40];; ->R6
+            fstp    QWORD PTR[eax + 16];; ->R3
+            fstp    QWORD PTR[eax + 0];; ->R1
+            fstp    QWORD PTR[eax + 32];; ->R5
+            fstp    QWORD PTR[eax + 24];; ->R4
+            fstp    QWORD PTR[eax + 48];; ->R7
+            fstp    QWORD PTR[eax + 8];; ->R2
 
             lea     eax, [eax + 64]
             cmp     eax, ecx
@@ -1049,7 +1049,15 @@ void CPUStress(DWORD deadline)
     // SSE passes dominate the budget (~85%), x87 keeps the FPU state exercised,
     // integer keeps the ALU loaded. GetTickCount is called only once per outer
     // iteration to avoid integer pipeline stalls inside the FP burn.
+    //
+    // Every MEM_BURST_CYCLES compute iterations a 50ms MemFlood_Timed burst is
+    // injected to pressure the FSB, MCPX northbridge, and DRAM controller.
+    // This broadens the thermal soak from core-local to whole-platform without
+    // shifting the test away from CPU heat soak (compute still ~70% of runtime).
+    // Tune MEM_BURST_CYCLES in StressMath.h: lower = more memory pressure,
+    // higher = more compute-dominant.
     int reseedCount = 0;
+    int memBurstCount = 0;
     while (GetTickCount() < deadline)
     {
         // ── SSE burn block: SM_SSE_OUTER passes, no deadline check inside ──
@@ -1088,6 +1096,16 @@ void CPUStress(DWORD deadline)
         {
             Reseed();
             reseedCount = 0;
+        }
+
+        // ── Memory flood burst — every MEM_BURST_CYCLES compute iterations ───
+        // Fires a 50ms MemFlood_Timed pass to pressure FSB/DRAM/northbridge.
+        // Broadens thermal soak beyond core-local compute without dominating
+        // the test budget (~25-35% of total runtime at default MEM_BURST_CYCLES).
+        if (++memBurstCount >= MEM_BURST_CYCLES)
+        {
+            MemFlood_Timed(GetTickCount() + MEM_BURST_MS);
+            memBurstCount = 0;
         }
     }
 }

@@ -207,13 +207,13 @@ static void ExportBench()
         ? "XbDiag HDD Benchmark (SSD)\r\n===========================\r\n"
         "FS WR:  buffered preallocated write+flush\r\n"
         "RAW WR: FILE_FLAG_NO_BUFFERING overwrite\r\n"
-        "SEQ RD: FILE_FLAG_NO_BUFFERING sequential\r\n"
+        "SEQ RD: FILE_FLAG_SEQUENTIAL_SCAN (buffered practical read)\r\n"
         "4K RND: 2048x 4KB random reads (IOPS)\r\n"
         "SEEK:   1024 random 512-byte reads\r\n\r\n"
         : "XbDiag HDD Benchmark (HDD)\r\n===========================\r\n"
         "FS WR:  buffered preallocated write+flush\r\n"
         "RAW WR: FILE_FLAG_NO_BUFFERING overwrite\r\n"
-        "SEQ RD: FILE_FLAG_NO_BUFFERING sequential\r\n"
+        "SEQ RD: FILE_FLAG_SEQUENTIAL_SCAN (buffered practical read)\r\n"
         "CACHE:  512KB x64 passes (platter buffer bandwidth)\r\n"
         "SEEK:   1024 random 512-byte reads\r\n\r\n";
     WriteFile(hf, hdr, StrLen(hdr), &w, NULL);
@@ -287,7 +287,7 @@ static void ExportBench()
     else
     {
         FmtFloat(s_bench.cacheMBs, val, sizeof(val));
-        StrCopy(line, sizeof(line), "Cache Read:  ");
+        StrCopy(line, sizeof(line), "Buf Read:    ");
         StrCat2(line, sizeof(line), line, val);
         StrCat2(line, sizeof(line), line, " MB/s\r\n");
         WriteFile(hf, line, StrLen(line), &w, NULL);
@@ -484,7 +484,8 @@ static void BenchTick()
             s_bench.seekMs = 0.f; s_bench.state = BENCH_DONE;
             if (s_bench.tmpExists)
             {
-                DeleteFileA(BENCH_FILE); s_bench.tmpExists = false;
+                DeleteFileA(s_bench.readSrc[0] ? s_bench.readSrc : BENCH_FILE);
+                s_bench.tmpExists = false;
             }
         }
         else
@@ -534,7 +535,8 @@ static void BenchTick()
                 s_bench.seekMs = 0.f; s_bench.state = BENCH_DONE;
                 if (s_bench.tmpExists)
                 {
-                    DeleteFileA(BENCH_FILE); s_bench.tmpExists = false;
+                    DeleteFileA(s_bench.readSrc[0] ? s_bench.readSrc : BENCH_FILE);
+                    s_bench.tmpExists = false;
                 }
             }
             else
@@ -583,7 +585,8 @@ static void BenchTick()
 
             if (s_bench.tmpExists)
             {
-                DeleteFileA(BENCH_FILE); s_bench.tmpExists = false;
+                DeleteFileA(s_bench.readSrc[0] ? s_bench.readSrc : BENCH_FILE);
+                s_bench.tmpExists = false;
             }
 
             s_bench.state = BENCH_DONE;
@@ -733,7 +736,12 @@ static void RenderBench(const DiagLogo& logo)
     DrawText(LM, y, "SEQ RD:", 1.2f, COL_GRAY);
     if (s_bench.state == BENCH_READ)
     {
-        DWORD pct = s_bench.readTotal * 100 / BENCH_FILE_SIZE;
+        DWORD readDenom = (s_bench.hRead && s_bench.hRead != INVALID_HANDLE_VALUE)
+            ? GetFileSize(s_bench.hRead, NULL) : (DWORD)BENCH_FILE_SIZE;
+        if (readDenom == INVALID_FILE_SIZE || readDenom == 0 ||
+            readDenom > (DWORD)BENCH_FILE_SIZE)
+            readDenom = (DWORD)BENCH_FILE_SIZE;
+        DWORD pct = readDenom > 0 ? s_bench.readTotal * 100 / readDenom : 0;
         char prog[12]; IntToStr((int)pct, prog, sizeof(prog));
         StrCat2(prog, sizeof(prog), prog, "%");
         DrawText(VX, y, prog, 1.2f, COL_YELLOW);
@@ -776,7 +784,7 @@ static void RenderBench(const DiagLogo& logo)
     }
     else
     {
-        DrawText(LM, y, "CACHE :", 1.2f, COL_GRAY);
+        DrawText(LM, y, "BUF RD:", 1.2f, COL_GRAY);
         if (s_bench.state == BENCH_CACHE_RD)
         {
             char cprog[16]; IntToStr(s_bench.cachePass, cprog, sizeof(cprog));
