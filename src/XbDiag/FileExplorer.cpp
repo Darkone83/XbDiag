@@ -10,8 +10,8 @@
 //  [Back]        Cancel delete confirm / clear all marks and clipboard
 //  [X]           Launch selected XBE via XLaunchNewImage (one-way, no return)
 //  [Y]           Mark / unmark current item (advances cursor after mark)
-//  [Black]       Copy marked items to picker destination (or paste clipboard here)
-//  [White]       Move marked items to picker destination (or paste clipboard here)
+//  [Black]       With marks: open destination picker (copy). With clipboard: paste here.
+//  [White]       With marks: open destination picker (move). With clipboard: move here.
 //  [DPad Up/Dn]  Move cursor
 //  [LT / RT]     Page up / page down
 //  [Start]       Toggle FTP server on / off
@@ -129,6 +129,8 @@ int            s_pickScroll = 0;
 char           s_pickPath[MAX_PATH_LEN] = {};
 bool           s_pickAtRoot = true;
 FileOpType     s_pendingOp = FILEOP_NONE;
+char           s_overwriteFileName[MAX_NAME_LEN] = {};
+int            s_overwriteResponse = 0;
 int            s_expandIdx = 0;
 char           s_expandDstRoot[MAX_PATH_LEN] = {};
 WorkItem       s_work[MAX_WORK_ITEMS] = {};
@@ -337,6 +339,13 @@ static void ResolveIP()
 
 // Recursively expand srcPath into s_work[], building a flat list of
 // WI_MKDIR and WI_FILE entries.
+// Snap then start — overwrite prompts handled per-file inside FileOpTick
+static void SnapAndStart(FileOpType op, const char* destDir)
+{
+    FE_Ops_Snap(op);
+    FE_Ops_StartTo(destDir);
+}
+
 void FileExplorer_OnEnter()
 {
     s_prevBtns = 0;
@@ -350,6 +359,8 @@ void FileExplorer_OnEnter()
     s_workCount = 0;
     s_workOp = FILEOP_NONE;
     s_pendingOp = FILEOP_NONE;
+    s_overwriteFileName[0] = '\0';
+    s_overwriteResponse = 0;
     s_cursor = 0;
 
     // Start network stack (ref-counted — safe if SysInfo already called it)
@@ -405,6 +416,8 @@ static void Render(const DiagLogo& logo)
         s_entries[s_cursor].sizeLow <= (DWORD)'H';
     if (s_fosState == FOS_CONFIRM_DELETE)
         hints = "[B] Confirm Delete  [Back] Cancel";
+    else if (s_fosState == FOS_CONFIRM_OVERWRITE)
+        hints = "[A] Overwrite  [X] Skip  [Back] Cancel all";
     else if (s_fosState == FOS_PICK_DEST)
         hints = "[A] Enter  [Black/White] Confirm  [B] Up / Cancel";
     else if (s_markedCount > 0)
@@ -650,6 +663,25 @@ static void Render(const DiagLogo& logo)
         DrawText(DX + 10.f, DY + 46.f, "[Back] Cancel", 1.05f, COL_GRAY);
     }
 
+    // ---- Confirm overwrite overlay ----------------------------------------
+    if (s_fosState == FOS_CONFIRM_OVERWRITE)
+    {
+        const float DW = 340.f;
+        const float DH = 96.f;
+        const float DX = (SW - DW) * 0.5f;
+        const float DY = 192.f;
+
+        FillRect(DX, DY, DX + DW, DY + DH, D3DCOLOR_ARGB(240, 20, 20, 8));
+        HLine(DY, DX, DX + DW, D3DCOLOR_XRGB(200, 180, 50));
+        HLine(DY + DH, DX, DX + DW, D3DCOLOR_XRGB(200, 180, 50));
+
+        DrawText(DX + 10.f, DY + 8.f, "File already exists:", 1.1f, COL_GRAY);
+        DrawText(DX + 10.f, DY + 24.f, s_overwriteFileName, 1.15f, COL_WHITE);
+        DrawText(DX + 10.f, DY + 46.f, "[A] Overwrite", 1.05f, COL_GREEN);
+        DrawText(DX + 10.f, DY + 62.f, "[X] Skip file", 1.05f, COL_YELLOW);
+        DrawText(DX + 10.f, DY + 78.f, "[Back] Cancel all", 1.05f, COL_GRAY);
+    }
+
     // ---- Destination picker overlay --------------------------------------
     if (s_fosState == FOS_PICK_DEST)
         FE_Ops_DrawPicker();
@@ -813,7 +845,7 @@ void FileExplorer_Tick(const DiagLogo& logo)
     }
 
     // Block navigation input while file op running
-    if (s_opRunning) { s_prevBtns = cur; Render(logo); return; }
+    if (s_opRunning && s_fosState != FOS_CONFIRM_OVERWRITE) { s_prevBtns = cur; Render(logo); return; }
 
     // ---- Destination picker input ----------------------------------------
     if (s_fosState == FOS_PICK_DEST)
@@ -872,22 +904,32 @@ void FileExplorer_Tick(const DiagLogo& logo)
                 }
                 else
                 {
-                    // No subfolders — confirm current path
-                    FE_Ops_Snap(s_pendingOp);
-                    FE_Ops_StartTo(s_pickPath);
+                    // No subfolders — confirm current path as destination
+                    FileOpType opToRun = s_pendingOp;
                     s_fosState = FOS_IDLE;
                     s_pendingOp = FILEOP_NONE;
+                    SnapAndStart(opToRun, s_pickPath);
                 }
             }
         }
         // [Black] or [White] — confirm current picker path as destination
-        if ((FE_EdgeDown(cur, s_prevBtns, BTN_BLACK) || FE_EdgeDown(cur, s_prevBtns, BTN_WHITE))
-            && !s_pickAtRoot)
+        if (FE_EdgeDown(cur, s_prevBtns, BTN_BLACK) || FE_EdgeDown(cur, s_prevBtns, BTN_WHITE))
         {
-            FE_Ops_Snap(s_pendingOp);
-            FE_Ops_StartTo(s_pickPath);
+            const char* destPath = s_pickPath;
+            char driveFallback[8];
+            if (s_pickAtRoot && s_pickEntryCount > 0)
+            {
+                // At root — use the selected drive as destination
+                driveFallback[0] = s_pickEntries[s_pickCursor].name[0];
+                driveFallback[1] = ':'; driveFallback[2] = '\\'; driveFallback[3] = '\0';
+                destPath = driveFallback;
+            }
+            // Close picker first so FOS_EXPANDING render works correctly
+            FileOpType opToRun = s_pendingOp;
             s_fosState = FOS_IDLE;
             s_pendingOp = FILEOP_NONE;
+            if (destPath[0] != '\0')
+                SnapAndStart(opToRun, destPath);
         }
         // [B] — go up one level, or cancel if at root
         if (FE_EdgeDown(cur, s_prevBtns, BTN_B))
@@ -1014,39 +1056,60 @@ void FileExplorer_Tick(const DiagLogo& logo)
         }
     }
 
-    // [Black] — copy marked items: open destination picker
+    // [Black] — with marks: open destination picker for copy
+    //           with clipboard: paste into current directory
     if (FE_EdgeDown(cur, s_prevBtns, BTN_BLACK))
     {
-        if (s_fosState == FOS_IDLE && !s_atRoot && s_markedCount > 0)
+        if (s_fosState == FOS_IDLE && !s_atRoot)
         {
-            s_pendingOp = FILEOP_COPY;
-            FE_Ops_PickLoadDriveList();
-            s_pickCursor = 0;
-            s_pickScroll = 0;
-            s_fosState = FOS_PICK_DEST;
-        }
-        else if (s_fosState == FOS_IDLE && !s_atRoot && s_clipCount > 0)
-        {
-            // No marks but clipboard present — paste here (original behaviour)
-            FE_Ops_Start(s_clipOp == FILEOP_NONE ? FILEOP_COPY : s_clipOp);
+            if (s_markedCount > 0)
+            {
+                s_pendingOp = FILEOP_COPY;
+                FE_Ops_PickLoadDriveList();
+                s_pickCursor = 0;
+                s_pickScroll = 0;
+                s_fosState = FOS_PICK_DEST;
+            }
+            else if (s_clipCount > 0)
+            {
+                FE_Ops_Start(s_clipOp == FILEOP_NONE ? FILEOP_COPY : s_clipOp);
+            }
         }
     }
 
-    // [White] — move marked items: open destination picker
+    // [White] — with marks: open destination picker for move
+    //           with clipboard: move into current directory
     if (FE_EdgeDown(cur, s_prevBtns, BTN_WHITE))
     {
-        if (s_fosState == FOS_IDLE && !s_atRoot && s_markedCount > 0)
+        if (s_fosState == FOS_IDLE && !s_atRoot)
         {
-            s_pendingOp = FILEOP_MOVE;
-            FE_Ops_PickLoadDriveList();
-            s_pickCursor = 0;
-            s_pickScroll = 0;
-            s_fosState = FOS_PICK_DEST;
+            if (s_markedCount > 0)
+            {
+                s_pendingOp = FILEOP_MOVE;
+                FE_Ops_PickLoadDriveList();
+                s_pickCursor = 0;
+                s_pickScroll = 0;
+                s_fosState = FOS_PICK_DEST;
+            }
+            else if (s_clipCount > 0)
+            {
+                FE_Ops_Start(FILEOP_MOVE);
+            }
         }
-        else if (s_fosState == FOS_IDLE && !s_atRoot && s_clipCount > 0)
-        {
-            FE_Ops_Start(FILEOP_MOVE);
-        }
+    }
+    // ---- Overwrite confirm input -----------------------------------------
+    if (s_fosState == FOS_CONFIRM_OVERWRITE)
+    {
+        if (FE_EdgeDown(cur, s_prevBtns, BTN_A))
+            s_overwriteResponse = 1;  // overwrite this file
+        else if (FE_EdgeDown(cur, s_prevBtns, BTN_X))
+            s_overwriteResponse = 2;  // skip this file
+        else if (FE_EdgeDown(cur, s_prevBtns, BTN_BACK))
+            s_overwriteResponse = 3;  // cancel entire op
+
+        s_prevBtns = cur;
+        Render(logo);
+        return;
     }
 
     // [B] — confirm delete if pending, else go up / back to menu

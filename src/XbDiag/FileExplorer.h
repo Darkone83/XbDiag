@@ -42,7 +42,7 @@ struct FileEntry
 };
 
 enum FileOpType { FILEOP_NONE = 0, FILEOP_COPY, FILEOP_MOVE };
-enum FileOpState { FOS_IDLE = 0, FOS_CONFIRM_DELETE, FOS_EXPANDING, FOS_RUNNING, FOS_PICK_DEST };
+enum FileOpState { FOS_IDLE = 0, FOS_CONFIRM_DELETE, FOS_EXPANDING, FOS_RUNNING, FOS_PICK_DEST, FOS_CONFIRM_OVERWRITE };
 enum WorkItemType { WI_MKDIR = 0, WI_FILE };
 
 struct ClipboardEntry
@@ -125,6 +125,10 @@ extern bool           s_workTruncated;
 extern int            s_opSkipCount;
 extern int            s_opDelFail;
 extern bool           s_opCopyOK;
+
+// Per-file overwrite handshake (ops sets, explorer reads/clears)
+extern char           s_overwriteFileName[MAX_NAME_LEN]; // filename to show in prompt
+extern int            s_overwriteResponse;  // 0=pending, 1=overwrite, 2=skip, 3=cancel all
 extern HANDLE         s_opSrcHandle;
 extern HANDLE         s_opDstHandle;
 

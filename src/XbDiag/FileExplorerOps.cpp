@@ -226,6 +226,23 @@ static void ExpandToWorkList(const char* srcPath, const char* dstPath, bool isDi
 
     if (!isDir)
     {
+        // Skip if source and destination are the same file
+        {
+            const char* a = srcPath;
+            const char* b = dstPath;
+            int k = 0;
+            while (a[k] && b[k])
+            {
+                char ca = a[k]; if (ca >= 'a' && ca <= 'z') ca -= 32;
+                char cb = b[k]; if (cb >= 'a' && cb <= 'z') cb -= 32;
+                if (ca != cb) break;
+                ++k;
+            }
+            char ca = a[k]; if (ca >= 'a' && ca <= 'z') ca -= 32;
+            char cb = b[k]; if (cb >= 'a' && cb <= 'z') cb -= 32;
+            if (ca == cb) { s_opSkipCount++; return; }  // identical paths
+        }
+
         WorkItem& wi = s_work[s_workCount++];
         wi.type = WI_FILE;
         StrCopy(wi.src, sizeof(wi.src), srcPath);
@@ -341,6 +358,12 @@ static void FileOpStartTo(const char* destDir)
     s_opCopyOK = true;
 
     StrCopy(s_expandDstRoot, sizeof(s_expandDstRoot), destDir);
+    // Strip trailing backslash — expansion loop adds its own separator
+    {
+        int el = 0; while (s_expandDstRoot[el]) el++;
+        if (el > 3 && s_expandDstRoot[el - 1] == '\\')
+            s_expandDstRoot[el - 1] = '\0';
+    }
     s_expandIdx = 0;
     s_opRunning = (s_clipCount > 0);
     s_fosState = s_opRunning ? FOS_EXPANDING : FOS_IDLE;
@@ -360,6 +383,12 @@ static void FileOpStart(FileOpType op)
     s_opCopyOK = true;
 
     StrCopy(s_expandDstRoot, sizeof(s_expandDstRoot), s_path);
+    // Strip trailing backslash — expansion loop adds its own separator
+    {
+        int el = 0; while (s_expandDstRoot[el]) el++;
+        if (el > 3 && s_expandDstRoot[el - 1] == '\\')
+            s_expandDstRoot[el - 1] = '\0';
+    }
     s_expandIdx = 0;
     s_opRunning = (s_clipCount > 0);
     s_fosState = s_opRunning ? FOS_EXPANDING : FOS_IDLE;
@@ -420,6 +449,49 @@ static void FileOpTick()
         // WI_FILE — open handles on first access
         if (s_opSrcHandle == INVALID_HANDLE_VALUE)
         {
+            // Check for collision — if dst exists, pause for user confirmation
+            DWORD dstAttr = GetFileAttributesA(wi.dst);
+            if (dstAttr != 0xFFFFFFFF)
+            {
+                if (s_overwriteResponse == 0)
+                {
+                    // Not yet answered — extract filename and enter confirm state
+                    int sl2 = 0; while (wi.dst[sl2]) sl2++;
+                    int sep2 = -1;
+                    for (int k = sl2 - 1; k >= 0; --k)
+                        if (wi.dst[k] == '\\') { sep2 = k; break; }
+                    FE_TruncName(sep2 >= 0 ? wi.dst + sep2 + 1 : wi.dst,
+                        s_overwriteFileName, MAX_NAME_LEN - 1, MAX_NAME_LEN);
+                    s_fosState = FOS_CONFIRM_OVERWRITE;
+                    return;  // yield — wait for response next tick
+                }
+                else if (s_overwriteResponse == 2)
+                {
+                    // Skip this file
+                    s_overwriteResponse = 0;
+                    s_overwriteFileName[0] = '\0';
+                    s_fosState = FOS_RUNNING;
+                    s_opSkipCount++;
+                    s_opItemDone++; s_workIdx++;
+                    continue;
+                }
+                else if (s_overwriteResponse == 3)
+                {
+                    // Cancel all — abort the entire op
+                    s_overwriteResponse = 0;
+                    s_overwriteFileName[0] = '\0';
+                    s_opRunning = false;
+                    s_fosState = FOS_IDLE;
+                    s_clipCount = 0;
+                    s_clipOp = FILEOP_NONE;
+                    return;
+                }
+                // response == 1: overwrite — fall through to open normally
+                s_overwriteResponse = 0;
+                s_overwriteFileName[0] = '\0';
+                s_fosState = FOS_RUNNING;
+            }
+
             s_opSrcHandle = CreateFile(wi.src, GENERIC_READ, FILE_SHARE_READ,
                 NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
             if (s_opSrcHandle == INVALID_HANDLE_VALUE)
@@ -455,12 +527,15 @@ static void FileOpTick()
         DWORD nr = 0;
         if (!ReadFile(s_opSrcHandle, s_copyBuf, sizeof(s_copyBuf), &nr, NULL) || nr == 0)
         {
-            // EOF or error — close handles and advance
+            // EOF or error — if source had data but we wrote nothing, mark failed
+            if (s_opTotal > 0 && s_opDone == 0)
+                s_opCopyOK = false;
+
             CloseHandle(s_opSrcHandle); s_opSrcHandle = INVALID_HANDLE_VALUE;
             FlushFileBuffers(s_opDstHandle);
             CloseHandle(s_opDstHandle); s_opDstHandle = INVALID_HANDLE_VALUE;
             s_opItemDone++; s_workIdx++;
-            break;  // yield — render this frame
+            break;
         }
 
         DWORD nw = 0;
@@ -519,7 +594,9 @@ static void SnapMarkedToClipboard(FileOpType op)
         ClipboardEntry& ce = s_clipboard[s_clipCount++];
         StrCopy(ce.path, sizeof(ce.path), s_path);
         int pl = 0; while (ce.path[pl]) pl++;
-        if (pl > 0 && ce.path[pl - 1] != '\\') { ce.path[pl++] = '\\'; ce.path[pl] = '\0'; }
+        // Ensure exactly one trailing backslash before appending name
+        if (pl > 0 && ce.path[pl - 1] == '\\') --pl;
+        ce.path[pl++] = '\\'; ce.path[pl] = '\0';
         FE_AppendStr(ce.path, sizeof(ce.path), s_entries[i].name);
         ce.isDir = s_entries[i].isDir;
     }
@@ -540,6 +617,39 @@ void FE_Ops_PickLoadDir(const char* path) { PickLoadDirectory(path); }
 void FE_Ops_DrawPicker() { DrawDestPicker(); }
 void FE_Ops_EnterSelected() { EnterSelected(); }
 bool FE_Ops_DeleteRecursive(const char* path, bool dir) { return FileDeleteRecursive(path, dir); }
+
+bool FE_Ops_AnyDestExists(const char* destDir)
+{
+    // Build dest root without trailing backslash
+    char root[MAX_PATH_LEN];
+    StrCopy(root, sizeof(root), destDir);
+    int rl = 0; while (root[rl]) rl++;
+    if (rl > 3 && root[rl - 1] == '\\') root[--rl] = '\0';
+
+    for (int i = 0; i < s_clipCount; ++i)
+    {
+        const char* srcPath = s_clipboard[i].path;
+        // Extract filename from source path
+        int srcLen = 0; while (srcPath[srcLen]) srcLen++;
+        int lastSep = -1;
+        for (int k = srcLen - 1; k >= 0; --k)
+            if (srcPath[k] == '\\') { lastSep = k; break; }
+        const char* fname = (lastSep >= 0) ? srcPath + lastSep + 1 : srcPath;
+
+        // Build candidate destination path
+        char dst[MAX_PATH_LEN];
+        StrCopy(dst, sizeof(dst), root);
+        int dl = 0; while (dst[dl]) dl++;
+        dst[dl++] = '\\'; dst[dl] = '\0';
+        FE_AppendStr(dst, sizeof(dst), fname);
+
+        // Check if it exists
+        DWORD attr = GetFileAttributesA(dst);
+        if (attr != 0xFFFFFFFF)
+            return true;
+    }
+    return false;
+}
 
 void FE_Ops_MkDir(const char* name)
 {

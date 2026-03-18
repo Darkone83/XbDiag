@@ -23,7 +23,81 @@
 extern void RequestState(int newState);
 static const int MSTATE_MENU = 0;
 
-static void FetchChangelog(); // forward declaration
+static void Utf8ToAsciiInPlace(char* buf, int* ioLen)
+{
+    // di <= si always: multibyte sequences (2-3 bytes) map to 1-3 ASCII chars,
+    // so writing back into buf ahead of the read pointer is safe in-place.
+    int si = 0, di = 0;
+    int srcLen = *ioLen;
+
+    while (si < srcLen)
+    {
+        unsigned char c = (unsigned char)buf[si];
+
+        if (c < 0x80) { buf[di++] = (char)c; ++si; continue; }
+
+        if (si + 2 < srcLen)
+        {
+            unsigned char c1 = (unsigned char)buf[si + 1];
+            unsigned char c2 = (unsigned char)buf[si + 2];
+
+            // EN DASH / EM DASH : E2 80 93 / E2 80 94
+            if (c == 0xE2 && c1 == 0x80 && (c2 == 0x93 || c2 == 0x94))
+            {
+                buf[di++] = '-'; si += 3; continue;
+            }
+
+            // ELLIPSIS : E2 80 A6
+            if (c == 0xE2 && c1 == 0x80 && c2 == 0xA6)
+            {
+                buf[di++] = '.'; buf[di++] = '.'; buf[di++] = '.'; si += 3; continue;
+            }
+
+            // RIGHT ARROW : E2 86 92
+            if (c == 0xE2 && c1 == 0x86 && c2 == 0x92)
+            {
+                buf[di++] = '-'; buf[di++] = '>'; si += 3; continue;
+            }
+
+            // Single curly quotes : E2 80 98 / E2 80 99
+            if (c == 0xE2 && c1 == 0x80 && (c2 == 0x98 || c2 == 0x99))
+            {
+                buf[di++] = '\''; si += 3; continue;
+            }
+
+            // Double curly quotes : E2 80 9C / E2 80 9D
+            if (c == 0xE2 && c1 == 0x80 && (c2 == 0x9C || c2 == 0x9D))
+            {
+                buf[di++] = '"'; si += 3; continue;
+            }
+        }
+
+        if (si + 1 < srcLen)
+        {
+            unsigned char c1 = (unsigned char)buf[si + 1];
+
+            // MULTIPLICATION SIGN : C3 97
+            if (c == 0xC3 && c1 == 0x97)
+            {
+                buf[di++] = 'x'; si += 2; continue;
+            }
+
+            // NO-BREAK SPACE : C2 A0
+            if (c == 0xC2 && c1 == 0xA0)
+            {
+                buf[di++] = ' '; si += 2; continue;
+            }
+        }
+
+        // Unknown multibyte — replace with space
+        buf[di++] = ' '; ++si;
+    }
+
+    buf[di] = '\0';
+    *ioLen = di;
+}
+
+static void FetchChangelog();
 
 static const char* k_host = "darkone83.myddns.me";
 static const char* k_verPath = "/xbdiag/XbDiag.ver";
@@ -74,6 +148,8 @@ static int         s_changelogLen = 0;
 static bool        s_changelogFetched = false;
 static float       s_changelogScroll = 0.f;
 static DWORD       s_changelogLastTick = 0;
+
+static bool IsWrapSpace(char c) { return c == ' ' || c == '\t'; }
 
 // ============================================================================
 // String helpers
@@ -553,39 +629,128 @@ static void Render(const DiagLogo& logo)
                     s_changelogLastTick = now;
                 }
 
+                const float textX = CX + 6.f;
+                const float maxW = CW - 12.f;
+
                 // Draw lines clipped to frame
-                float lineY = CT + 10.f - s_changelogScroll;
+                float lineY = CT + LINE_H - s_changelogScroll;
                 const char* p = s_changelog;
                 float totalH = 0.f;
 
-                // Count total height to loop scroll
+                // Count total rendered height (accounting for word wrap) to loop scroll
                 const char* pp = s_changelog;
                 while (*pp)
                 {
-                    while (*pp && *pp != '\n') ++pp;
-                    totalH += LINE_H;
+                    const char* ls = pp;
+                    int llen = 0;
+                    while (*pp && *pp != '\n' && *pp != '\r') { ++pp; ++llen; }
+                    if (*pp == '\r') ++pp;
                     if (*pp == '\n') ++pp;
+
+                    if (llen == 0)
+                    {
+                        totalH += LINE_H;
+                        continue;
+                    }
+                    // Count wrap rows for this source line
+                    int pos2 = 0;
+
+                    // Same normalization as render pass
+                    while (pos2 < llen)
+                    {
+                        char c = ls[pos2];
+                        if (c == '>' || c == '#' || c == ' ') ++pos2;
+                        else break;
+                    }
+                    do
+                    {
+                        int fit = 0;
+                        float w = 0.f;
+                        while (pos2 + fit < llen)
+                        {
+                            // Measure next word + trailing whitespace
+                            int wl = 0;
+                            while (pos2 + fit + wl < llen && !IsWrapSpace(ls[pos2 + fit + wl])) ++wl;
+                            int tl = wl;
+                            while (pos2 + fit + tl < llen && IsWrapSpace(ls[pos2 + fit + tl])) ++tl;
+                            char temp[64];
+                            int cp = tl < 63 ? tl : 63;
+                            for (int i = 0; i < cp; ++i) temp[i] = ls[pos2 + fit + i];
+                            temp[cp] = '\0';
+                            float tw = TW(temp, 1.0f);
+                            if (w + tw > maxW) break;
+                            w += tw;
+                            fit += tl;
+                        }
+                        if (fit == 0) fit = 1;
+                        totalH += LINE_H;
+                        pos2 += fit;
+                        while (pos2 < llen && IsWrapSpace(ls[pos2])) ++pos2;
+                    } while (pos2 < llen);
                 }
                 if (s_changelogScroll > totalH) s_changelogScroll = 0.f;
 
-                // Draw each line
+                // Draw each line with word wrap clipped to frame
                 while (*p)
                 {
+                    // Collect one source line (up to \n)
                     const char* lineStart = p;
                     int len = 0;
                     while (*p && *p != '\n' && *p != '\r') { ++p; ++len; }
                     if (*p == '\r') ++p;
                     if (*p == '\n') ++p;
 
-                    if (lineY + LINE_H > CT + LINE_H + 2.f && lineY < CT + CH - LINE_H)
+                    // Word-wrap the source line into display rows
+                    int pos = 0;
+
+                    // Strip all leading markers and spaces
+                    while (pos < len)
                     {
-                        char lineBuf[128];
-                        int copy = len < 127 ? len : 127;
-                        for (int i = 0; i < copy; ++i) lineBuf[i] = lineStart[i];
-                        lineBuf[copy] = '\0';
-                        DrawText(CX + 6.f, lineY, lineBuf, 1.0f, COL_WHITE);
+                        char c = lineStart[pos];
+                        if (c == '>' || c == '#' || c == ' ') ++pos;
+                        else break;
                     }
-                    lineY += LINE_H;
+                    do
+                    {
+                        // Find how many complete words fit within maxW
+                        int fit = 0;
+                        float w = 0.f;
+                        while (pos + fit < len)
+                        {
+                            int wl = 0;
+                            while (pos + fit + wl < len && !IsWrapSpace(lineStart[pos + fit + wl])) ++wl;
+                            int tl = wl;
+                            while (pos + fit + tl < len && IsWrapSpace(lineStart[pos + fit + tl])) ++tl;
+                            char temp[64];
+                            int cp = tl < 63 ? tl : 63;
+                            for (int i = 0; i < cp; ++i) temp[i] = lineStart[pos + fit + i];
+                            temp[cp] = '\0';
+                            float tw = TW(temp, 1.0f);
+                            if (w + tw > maxW) break;
+                            w += tw;
+                            fit += tl;
+                        }
+                        if (fit == 0) fit = 1;
+
+                        // Draw this segment left-aligned if visible
+                        if (lineY + LINE_H > CT + LINE_H && lineY < CT + CH - 2.f)
+                        {
+                            char seg[128];
+                            int copy = fit < 127 ? fit : 127;
+                            for (int i = 0; i < copy; ++i) seg[i] = lineStart[pos + i];
+                            seg[copy] = '\0';
+                            DrawText(textX, lineY, seg, 1.0f, COL_WHITE);
+                        }
+                        lineY += LINE_H;
+
+                        // Advance past this segment and any trailing whitespace
+                        pos += fit;
+                        while (pos < len && IsWrapSpace(lineStart[pos])) ++pos;
+
+                    } while (pos < len);
+
+                    // Empty source line still advances one row
+                    if (len == 0) lineY += LINE_H;
                 }
             }
             else
@@ -665,6 +830,97 @@ static void FetchChangelog()
     }
     s_changelog[s_changelogLen] = '\0';
     closesocket(sock);
+
+    // Sanitize UTF-8 punctuation to ASCII before reflow/render
+    Utf8ToAsciiInPlace(s_changelog, &s_changelogLen);
+
+    // Reflow: join consecutive non-blank lines into single lines so the
+    // renderer's word-wrap can fill the full frame width. Two consecutive
+    // newlines (blank line) are preserved as paragraph breaks.
+    {
+        static char reflowed[4096];
+        int ri = 0;
+        const char* src = s_changelog;
+        while (*src && ri < (int)sizeof(reflowed) - 2)
+        {
+            if (*src == '\r') { ++src; continue; }
+            if (*src == '\n')
+            {
+                ++src;
+                if (*src == '\r') ++src;
+
+                // Count consecutive newlines to detect paragraph breaks
+                int nlCount = 1;
+                while (*src == '\n' || *src == '\r')
+                {
+                    if (*src == '\n') ++nlCount;
+                    ++src;
+                }
+
+                if (nlCount >= 2)
+                {
+                    reflowed[ri++] = '\n';
+                    reflowed[ri++] = '\n';
+                }
+                else
+                {
+                    // Single newline — join as space
+                    if (ri > 0 && reflowed[ri - 1] != ' ' && reflowed[ri - 1] != '\n')
+                        reflowed[ri++] = ' ';
+                }
+                continue;
+            }
+            else
+            {
+                reflowed[ri++] = *src++;
+            }
+        }
+        reflowed[ri] = '\0';
+        for (int i = 0; i <= ri; ++i) s_changelog[i] = reflowed[i];
+        s_changelogLen = ri;
+    }
+
+    // Collapse multiple consecutive whitespace (spaces/tabs) into one space.
+    // Tabs are normalized to spaces first.
+    {
+        static char cleaned[4096];
+        int ci = 0;
+        bool lastSpace = false;
+        for (int i = 0; s_changelog[i] && ci < (int)sizeof(cleaned) - 1; ++i)
+        {
+            char c = s_changelog[i];
+            if (c == '\t') c = ' ';
+            if (IsWrapSpace(c))
+            {
+                if (!lastSpace) { cleaned[ci++] = ' '; lastSpace = true; }
+            }
+            else
+            {
+                cleaned[ci++] = c;
+                lastSpace = (c == '\n');
+            }
+        }
+        cleaned[ci] = '\0';
+        for (int i = 0; i <= ci; ++i) s_changelog[i] = cleaned[i];
+        s_changelogLen = ci;
+    }
+
+    // Strip leading heading line ("XbDiag Changelog" or similar) — the frame
+    // already has a CHANGE LOG title so the first # heading is redundant.
+    {
+        char* p = s_changelog;
+        // Skip past the first newline-terminated line if it starts with '#' or
+        // is the known title string, then skip any blank lines after it.
+        while (*p && *p != '\n') ++p;
+        if (*p == '\n') ++p;
+        while (*p == '\n') ++p;
+        if (p > s_changelog)
+        {
+            int newLen = s_changelogLen - (int)(p - s_changelog);
+            for (int i = 0; i <= newLen; ++i) s_changelog[i] = p[i];
+            s_changelogLen = newLen;
+        }
+    }
 }
 
 // ============================================================================
