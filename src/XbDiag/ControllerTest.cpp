@@ -99,6 +99,17 @@ static int  s_driftWarmup = 0;   // frames to discard before sampling (settle de
 static int  s_driftAvgLX = 0, s_driftAvgLY = 0;
 static int  s_driftAvgRX = 0, s_driftAvgRY = 0;
 
+// ADC jitter null-out: after warmup, capture a short baseline then clamp
+// samples within ±ADC_JITTER of that baseline to the baseline value.
+// Xbox ADC has 2-4% noise at rest (~655-1310 counts) — clamp covers that floor.
+static const int ADC_JITTER = 655;  // 2% of 32767 — nulls expected ADC noise
+static const int BASELINE_FRAMES = 10;  // frames to average for the baseline
+static int  s_driftBaselineLX = 0, s_driftBaselineLY = 0;
+static int  s_driftBaselineRX = 0, s_driftBaselineRY = 0;
+static int  s_driftBaselineCount = 0;   // 0 = not yet captured
+static int  s_driftBaselineAccLX = 0, s_driftBaselineAccLY = 0;
+static int  s_driftBaselineAccRX = 0, s_driftBaselineAccRY = 0;
+
 
 // Trigger dead-zone card state
 static const int TRIG_DZ_THRESHOLD = 30;   // Xbox trigger dead-zone (0-255 range)
@@ -232,9 +243,9 @@ void ControllerTest_OnEnter()
     s_circHasData = false;
     s_circHasDataR = false;
     for (int i = 0; i < CIRC_BUCKETS; ++i) { s_circMaxR[i] = 0.f; s_circMaxRR[i] = 0.f; }
-    s_driftHead = 0; s_driftCount = 0; s_driftWarmup = 60;
+    s_driftHead = 0; s_driftCount = 0; s_driftWarmup = 60; s_driftBaselineCount = 0; s_driftBaselineAccLX = 0; s_driftBaselineAccLY = 0; s_driftBaselineAccRX = 0; s_driftBaselineAccRY = 0;
     s_driftAvgLX = 0; s_driftAvgLY = 0;
-    s_driftAvgRX = 0; s_driftAvgRY = 0;
+    s_driftAvgRX = 0; s_driftAvgRY = 0; s_driftBaselineLX = 0; s_driftBaselineLY = 0; s_driftBaselineRX = 0; s_driftBaselineRY = 0;
     for (int p = 0; p < 4; ++p)
     {
         s_wasConn[p] = IsPortConnected(p);
@@ -788,12 +799,38 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
         }
         else
         {
-            s_driftLX[s_driftHead] = rawLX;
-            s_driftLY[s_driftHead] = rawLY;
-            s_driftRX[s_driftHead] = rawRX;
-            s_driftRY[s_driftHead] = rawRY;
-            s_driftHead = (s_driftHead + 1) % DRIFT_SAMPLES;
-            if (s_driftCount < DRIFT_SAMPLES) s_driftCount++;
+            // Phase 1: accumulate baseline over first BASELINE_FRAMES samples
+            if (s_driftBaselineCount < BASELINE_FRAMES)
+            {
+                s_driftBaselineAccLX += rawLX; s_driftBaselineAccLY += rawLY;
+                s_driftBaselineAccRX += rawRX; s_driftBaselineAccRY += rawRY;
+                s_driftBaselineCount++;
+                if (s_driftBaselineCount == BASELINE_FRAMES)
+                {
+                    s_driftBaselineLX = s_driftBaselineAccLX / BASELINE_FRAMES;
+                    s_driftBaselineLY = s_driftBaselineAccLY / BASELINE_FRAMES;
+                    s_driftBaselineRX = s_driftBaselineAccRX / BASELINE_FRAMES;
+                    s_driftBaselineRY = s_driftBaselineAccRY / BASELINE_FRAMES;
+                }
+            }
+            else
+            {
+                // Phase 2: sample with jitter nulling — values within ADC_JITTER
+                // of the captured baseline are clamped to baseline so ±1 ADC
+                // oscillation doesn't inflate the drift average.
+                int sLX = rawLX, sLY = rawLY, sRX = rawRX, sRY = rawRY;
+                if (sLX >= s_driftBaselineLX - ADC_JITTER && sLX <= s_driftBaselineLX + ADC_JITTER) sLX = s_driftBaselineLX;
+                if (sLY >= s_driftBaselineLY - ADC_JITTER && sLY <= s_driftBaselineLY + ADC_JITTER) sLY = s_driftBaselineLY;
+                if (sRX >= s_driftBaselineRX - ADC_JITTER && sRX <= s_driftBaselineRX + ADC_JITTER) sRX = s_driftBaselineRX;
+                if (sRY >= s_driftBaselineRY - ADC_JITTER && sRY <= s_driftBaselineRY + ADC_JITTER) sRY = s_driftBaselineRY;
+
+                s_driftLX[s_driftHead] = sLX;
+                s_driftLY[s_driftHead] = sLY;
+                s_driftRX[s_driftHead] = sRX;
+                s_driftRY[s_driftHead] = sRY;
+                s_driftHead = (s_driftHead + 1) % DRIFT_SAMPLES;
+                if (s_driftCount < DRIFT_SAMPLES) s_driftCount++;
+            }
         }
 
         // Recompute averages
@@ -812,10 +849,10 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
         }
 
         const float PR = 70.f;
-        // DRIFT_WARN: 2% of 32767 = ~655. Most tools flag drift above 1-3%.
-        // Xbox dashboard deadzone is ~13% (~4259). We warn at 2% so mild
-        // hardware drift is visible before it becomes a gameplay problem.
-        const int DRIFT_WARN = 655;
+        // DRIFT_WARN: 4% of 32767 = ~1310. ADC noise floor is 2-4% so we warn
+        // only above that — genuine hardware drift on worn sticks typically
+        // starts at 5-15% and causes visible input creep in games.
+        const int DRIFT_WARN = 1310;
 
         // Helper: format axis value + percentage for display
         // e.g. "1234 (3.8%)"
@@ -880,12 +917,15 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
             (s_driftAvgRY > DRIFT_WARN || s_driftAvgRY < -DRIFT_WARN) ? COL_RED : COL_GREEN);
 
         // Centre status + instruction
-        if (s_driftWarmup > 0)
+        if (s_driftWarmup > 0 || s_driftBaselineCount < BASELINE_FRAMES)
         {
-            // Still settling — show countdown
-            char cdBuf[4]; IntToStr(s_driftWarmup, cdBuf, sizeof(cdBuf));
-            char cdStr[24];
-            StrCopy(cdStr, sizeof(cdStr), "Settling... ");
+            // Still settling or capturing baseline
+            char cdBuf[4];
+            int remaining = s_driftWarmup > 0 ? s_driftWarmup : (BASELINE_FRAMES - s_driftBaselineCount);
+            IntToStr(remaining, cdBuf, sizeof(cdBuf));
+            const char* phase = s_driftWarmup > 0 ? "Settling... " : "Calibrating... ";
+            char cdStr[28];
+            StrCopy(cdStr, sizeof(cdStr), phase);
             StrCat2(cdStr, sizeof(cdStr), cdStr, cdBuf);
             DrawText(X_MID - TW(cdStr, 1.3f) * 0.5f, contentY + 240.f,
                 cdStr, 1.3f, COL_GRAY);
@@ -1363,9 +1403,9 @@ void ControllerTest_Tick(const DiagLogo& logo)
             else if (s_stickTest == 2)
             {
                 // Reset drift samples
-                s_driftHead = 0; s_driftCount = 0; s_driftWarmup = 60;
+                s_driftHead = 0; s_driftCount = 0; s_driftWarmup = 60; s_driftBaselineCount = 0; s_driftBaselineAccLX = 0; s_driftBaselineAccLY = 0; s_driftBaselineAccRX = 0; s_driftBaselineAccRY = 0;
                 s_driftAvgLX = 0; s_driftAvgLY = 0;
-                s_driftAvgRX = 0; s_driftAvgRY = 0;
+                s_driftAvgRX = 0; s_driftAvgRY = 0; s_driftBaselineLX = 0; s_driftBaselineLY = 0; s_driftBaselineRX = 0; s_driftBaselineRY = 0;
             }
             else if (s_stickTest == 3)
             {
@@ -1432,9 +1472,9 @@ void ControllerTest_Tick(const DiagLogo& logo)
         s_circHasData = false;
         s_circHasDataR = false;
         for (int i = 0; i < CIRC_BUCKETS; ++i) { s_circMaxR[i] = 0.f; s_circMaxRR[i] = 0.f; }
-        s_driftHead = 0; s_driftCount = 0; s_driftWarmup = 60;
+        s_driftHead = 0; s_driftCount = 0; s_driftWarmup = 60; s_driftBaselineCount = 0; s_driftBaselineAccLX = 0; s_driftBaselineAccLY = 0; s_driftBaselineAccRX = 0; s_driftBaselineAccRY = 0;
         s_driftAvgLX = 0; s_driftAvgLY = 0;
-        s_driftAvgRX = 0; s_driftAvgRY = 0;
+        s_driftAvgRX = 0; s_driftAvgRY = 0; s_driftBaselineLX = 0; s_driftBaselineLY = 0; s_driftBaselineRX = 0; s_driftBaselineRY = 0;
         s_trigMinLT = 255; s_trigMaxLT = 0;
         s_trigMinRT = 255; s_trigMaxRT = 0;
         s_trigHasData = false;
