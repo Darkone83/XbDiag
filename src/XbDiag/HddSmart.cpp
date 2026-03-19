@@ -252,10 +252,17 @@ void HddSmart_Render(const DiagLogo& logo)
         bool isCrit = SmartAttrCritical(id);
         bool rawNonZero = false;
         for (int j = 0; j < 6; ++j) if (raw[j]) { rawNonZero = true; break; }
-        DWORD nameCol = (isCrit && rawNonZero) ? COL_RED : COL_WHITE;
+        bool highlight = isCrit && rawNonZero;
+
+        // Point-of-interest: grey background behind the entire row
+        if (highlight)
+            FillRect(LM - 2.f, y - 1.f, SW - LM + 2.f, y + LH2 - 2.f,
+                D3DCOLOR_XRGB(38, 38, 44));
+
+        DWORD nameCol = COL_WHITE;
         DrawText(CX_NAME, y, nameBuf, 1.1f, nameCol);
 
-        DWORD valCol = (cur <= thr && thr > 0) ? COL_RED : COL_CYAN;
+        DWORD valCol = COL_CYAN;
         char curStr[4]; IntToStr(cur, curStr, sizeof(curStr));
         char wstStr[4]; IntToStr(wst, wstStr, sizeof(wstStr));
         char thrStr[4]; IntToStr(thr, thrStr, sizeof(thrStr));

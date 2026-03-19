@@ -375,18 +375,66 @@ static void StripVersionSuffix(const char* src, char* dst, int dstLen)
     dst[i] = '\0';
 }
 
+// Center a string within LCD_COLS characters.
+// Fills out (must be >= LCD_COLS+1 bytes) with left-pad spaces, the text,
+// then right-pad spaces to exactly LCD_COLS chars, null-terminated.
+static void LCDCenter(char* out, const char* s)
+{
+    int len = 0; while (s[len]) ++len;
+    if (len >= LCD_COLS)
+    {
+        for (int i = 0; i < LCD_COLS; ++i) out[i] = s[i];
+        out[LCD_COLS] = '\0';
+        return;
+    }
+    int total = LCD_COLS - len;
+    int lPad = total / 2;
+    int rPad = total - lPad;
+    int pos = 0;
+    for (int i = 0; i < lPad; ++i) out[pos++] = ' ';
+    for (int i = 0; i < len; ++i) out[pos++] = s[i];
+    for (int i = 0; i < rPad; ++i) out[pos++] = ' ';
+    out[pos] = '\0';
+}
+
 static void DrawPageSplash()
 {
+    // Build "XbDiag v1.0.1" and center it within "** ... **" borders.
+    // Inner field = LCD_COLS - 4 (two '*' each side).
     char verNum[16];
     StripVersionSuffix(Update_GetLocalVersion(), verNum, sizeof(verNum));
+    char title[17];
+    StrCopy(title, sizeof(title), "XbDiag v");
+    StrCat2(title, sizeof(title), title, verNum);
+
     char line0[21];
-    StrCopy(line0, sizeof(line0), "* XbDiag v");
-    StrCat2(line0, sizeof(line0), line0, verNum);
-    StrCat2(line0, sizeof(line0), line0, " *");
+    int tlen = 0; while (title[tlen]) ++tlen;
+    int inner = LCD_COLS - 4;
+    if (tlen <= inner)
+    {
+        int total = inner - tlen;
+        int lPad = total / 2;
+        int rPad = total - lPad;
+        int pos = 0;
+        line0[pos++] = '*'; line0[pos++] = '*';
+        for (int i = 0; i < lPad; ++i) line0[pos++] = ' ';
+        for (int i = 0; i < tlen; ++i) line0[pos++] = title[i];
+        for (int i = 0; i < rPad; ++i) line0[pos++] = ' ';
+        line0[pos++] = '*'; line0[pos++] = '*';
+        line0[pos] = '\0';
+    }
+    else
+    {
+        LCDCenter(line0, title);
+    }
+
+    char line1[21]; LCDCenter(line1, "Team Resurgent");
+    char line2[21]; LCDCenter(line2, "Darkone83");
+
     LCDGoto(0, 0); LCDPuts(line0, LCD_COLS);
-    LCDGoto(1, 0); LCDPuts(" Team  Resurgent   ", LCD_COLS);
-    LCDGoto(2, 0); LCDPuts("    Darkone83      ", LCD_COLS);
-    LCDGoto(3, 0); LCDPuts("                   ", LCD_COLS);
+    LCDGoto(1, 0); LCDPuts(line1, LCD_COLS);
+    LCDGoto(2, 0); LCDPuts(line2, LCD_COLS);
+    LCDGoto(3, 0); LCDPuts("                    ", LCD_COLS);
 }
 
 static void DrawPageThermal()
@@ -522,10 +570,10 @@ void LCD_Begin()
     s_dataReady = false;
     s_page = 1;
 
-    // Check CerBIOS INI before touching the bus.
-    // LCD_ADDR is 8-bit shifted (0x78); CerBIOS stores 7-bit (0x3C).
-    if (CerBiosOwnsLCD((BYTE)(LCD_ADDR >> 1)))
-        return;
+    // CerBIOS InAppLCDEnable only drives the LCD during game/app execution
+    // under CerBIOS. When XbDiag is the running XBE, CerBIOS's in-app
+    // overlay is not active, so there is no SMBus conflict. We do not
+    // yield to it here.
 
     BYTE dummy = 0;
     if (!SMBusRead(LCD_ADDR, 0x00, dummy))

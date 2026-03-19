@@ -445,10 +445,14 @@ void StressTest_Tick(const DiagLogo& logo)
         // burnUntil is the end of the current (not yet closed) window.
         // CPUStress runs x87 + SSE kernels for the bulk of the window.
         // MemFlood_Timed follows as a tail to exercise FSB/DRAM.
+        //
+        // burnStart is captured here — after any window-close that may have
+        // already fired above — so s_burnAccumMs never spans more than one
+        // window and the load calculation can't exceed 100%.
         {
+            DWORD burnStart = GetTickCount();
             DWORD burnUntil = s_windowStartMs + SAMPLE_INTERVAL_BURN_MS - 2;
             static const DWORD MEM_SLICE_MS = 300;  // 4 memory patterns need more time
-            DWORD burnStart = GetTickCount();
             if (burnStart < burnUntil)
             {
                 DWORD cpuDeadline = burnUntil - MEM_SLICE_MS;

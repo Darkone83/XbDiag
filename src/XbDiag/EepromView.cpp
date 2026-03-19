@@ -725,7 +725,7 @@ static void RenderDecoded(const DiagLogo& logo)
     if (s_binExists)
     {
         StrCopy(s_decHint, sizeof(s_decHint), hint);
-        StrCat2(s_decHint, sizeof(s_decHint), s_decHint, "  [White]");
+        StrCat2(s_decHint, sizeof(s_decHint), s_decHint, "  [White] Restore");
         hint = s_decHint;
     }
 

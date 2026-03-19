@@ -223,16 +223,20 @@ static void DoCpuid(DWORD leaf,
 }
 
 // ============================================================================
-// Pure PLL-based CPU frequency — no MSR, no CPUID, no timing window.
+// Pure PLL-based CPU frequency — no CPUID, no timing window.
 //
 // CPUMPLL  offset 0x6C:  FSB divider (byte 0) + multiplier (byte 1)
-// CPUCTL   offset 0x68:  bits [21:17] = 5-bit ratio index (bootloader-programmed)
+// MSR 0x2A bits [27:22] masked 0x2F: CPU ratio index written by the CPU
+//   itself during init — authoritative on Tualatin upgrades where CPUCTL
+//   (0x68, bootloader-written) may not reflect the correct multiplier.
+//
+// Matches StressTestCPU ReadCPUMHz() exactly so both modules always agree.
 // ============================================================================
 
-static DWORD CpuRatioX10FromCpuctl(DWORD cpuctl)
+static DWORD CpuRatioX10FromMsr(DWORD msr_lo)
 {
-    BYTE idx = (BYTE)((cpuctl >> 17) & 0x1F);
-    switch (idx)
+    BYTE pat = (BYTE)((msr_lo >> 22) & 0x2F);
+    switch (pat)
     {
     case 0x01: return 30;
     case 0x05: return 35;
@@ -245,13 +249,13 @@ static DWORD CpuRatioX10FromCpuctl(DWORD cpuctl)
     case 0x09: return 70;
     case 0x0D: return 75;
     case 0x0A: return 80;
-    case 0x16: return 85;
-    case 0x10: return 90;
-    case 0x14: return 95;
-    case 0x1B: return 100;
-    case 0x1F: return 105;
-    case 0x1A: return 130;
-    case 0x1C: return 140;
+    case 0x26: return 85;
+    case 0x20: return 90;
+    case 0x24: return 95;
+    case 0x2B: return 100;
+    case 0x2F: return 105;
+    case 0x2A: return 130;
+    case 0x2C: return 140;
     default:   return 0;
     }
 }
@@ -259,7 +263,6 @@ static DWORD CpuRatioX10FromCpuctl(DWORD cpuctl)
 static DWORD MeasureCpuMHz()
 {
     DWORD cpumpll = PciRead32(0, 3, 0, 0x6C);
-    DWORD cpuctl = PciRead32(0, 3, 0, 0x68);
 
     DWORD fsb_div = cpumpll & 0xFF;
     DWORD fsb_mult = (cpumpll >> 8) & 0xFF;
@@ -268,7 +271,15 @@ static DWORD MeasureCpuMHz()
 
     double fsb_hz = (50000000.0 / 3.0) * ((double)fsb_mult / (double)fsb_div);
 
-    DWORD ratio = CpuRatioX10FromCpuctl(cpuctl);
+    DWORD msr_lo = 0;
+    __asm
+    {
+        mov  ecx, 0x2A
+        rdmsr
+        mov  msr_lo, eax
+    }
+
+    DWORD ratio = CpuRatioX10FromMsr(msr_lo);
     if (ratio == 0) return 733;
 
     double cpu_mhz = (fsb_hz * ((double)ratio / 10.0)) / 1.0e6;

@@ -448,17 +448,17 @@ static float StickRadius(int x, int y)
 
 // Angle bucket 0-35 from raw axes (0=East, CCW, 10° each).
 // 36 buckets (10° per bucket) — wide enough that a full rotation cleanly
-// fills every bucket even with natural stick wobble. Each sample also smears
-// into ±1 neighbors at the call site to handle boundary edge cases.
+// fills every bucket even with natural stick wobble.
+// Y is negated so bucket angle matches screen convention (stick up = top of plot).
 static int AngleBucket(int x, int y)
 {
     if (x == 0 && y == 0) return 0;
     float fx = (float)x;
-    float fy = (float)y;
+    float fy = -(float)y;   // negate: Xbox Y+ is up, screen Y+ is down
     float ang;
     __asm { fld fy }
     __asm { fld fx }
-    __asm { fpatan }
+    __asm { fpatan }        // atan2(ST1, ST0) = atan2(fy, fx)
     __asm { fstp ang }
 
     // Convert -pi..pi to 0..2pi
@@ -468,16 +468,13 @@ static int AngleBucket(int x, int y)
         ang = ang + twopi;
     }
 
-    // Scale to 0..36. Subtract a small epsilon before fistp so values sitting
-    // exactly on a boundary (e.g. 18.0000) floor down rather than rounding up.
-    // fistp uses round-to-nearest; subtracting 0.0001 shifts exact boundaries
-    // safely below the integer without affecting any other value.
+    // Scale to 0..36. Subtract small epsilon so exact boundaries floor down.
     float bucketF = ang * (36.f / 6.2831853f) - 0.0001f;
     if (bucketF < 0.f) bucketF = 0.f;
     int bucket;
     __asm { fld bucketF }
     __asm { fistp bucket }
-    if (bucket < 0)  bucket = 0;
+    if (bucket < 0)   bucket = 0;
     if (bucket >= 36) bucket = 0;   // wrap: 2*pi rounds to exactly 36
     return bucket;
 }
@@ -535,39 +532,42 @@ static void CircPlot(float cx, float cy, float PR,
     // Background square
     FillRect(cx - PR, cy - PR, cx + PR, cy + PR, D3DCOLOR_XRGB(10, 14, 32));
 
-    // Draw circular boundary using 48-segment approximation (HLines between adjacent points)
-    const int SEGS = 48;
-    float prevX = cx + PR;
-    float prevY = cy;
-    for (int s = 1; s <= SEGS; ++s)
+    // Boundary ring — midpoint circle algorithm, 1x1 pixel dots.
     {
-        float ang = s * (6.2831853f / (float)SEGS);
-        float cosA, sinA;
-        __asm { fld ang }
-        __asm { fcos }
-        __asm { fstp cosA }
-        __asm { fld ang }
-        __asm { fsin }
-        __asm { fstp sinA }
-        float nx = cx + cosA * PR;
-        float ny = cy - sinA * PR;
-        // Draw a short HLine between adjacent points to approximate the arc
-        if (ny >= prevY - 1.f && ny <= prevY + 1.f)
-            HLine(ny, (prevX < nx ? prevX : nx), (prevX < nx ? nx : prevX), COL_BORDER);
-        else
-            VLine(nx, (prevY < ny ? prevY : ny), (prevY < ny ? ny : prevY), COL_BORDER);
-        prevX = nx;
-        prevY = ny;
+        float _prf = PR + 0.5f;
+        int ir;
+        __asm { fld _prf }
+        __asm { fistp ir }
+        int px2 = ir, py2 = 0, err = 1 - ir;
+        while (px2 >= py2)
+        {
+            float pts[8][2] = {
+                { cx + (float)px2, cy - (float)py2 },
+                { cx + (float)py2, cy - (float)px2 },
+                { cx - (float)py2, cy - (float)px2 },
+                { cx - (float)px2, cy - (float)py2 },
+                { cx - (float)px2, cy + (float)py2 },
+                { cx - (float)py2, cy + (float)px2 },
+                { cx + (float)py2, cy + (float)px2 },
+                { cx + (float)px2, cy + (float)py2 },
+            };
+            for (int i = 0; i < 8; ++i)
+                FillRect(pts[i][0], pts[i][1], pts[i][0] + 1.f, pts[i][1] + 1.f, COL_BORDER);
+            py2++;
+            if (err < 0) err += 2 * py2 + 1;
+            else { px2--; err += 2 * (py2 - px2) + 1; }
+        }
     }
 
     // Crosshairs
     HLine(cy, cx - PR + 1.f, cx + PR - 1.f, D3DCOLOR_XRGB(25, 35, 65));
     VLine(cx, cy - PR + 1.f, cy + PR - 1.f, D3DCOLOR_XRGB(25, 35, 65));
 
-    // Bucket dots — each placed at maxR * PR from centre along its angle
+    // Bucket dots — primary bucket only, no smear.
+    // Green = gate reached (>= 0.7), amber = partial contact.
     for (int b = 0; b < CIRC_BUCKETS; ++b)
     {
-        if (maxR[b] < 0.01f) continue;
+        if (maxR[b] < 0.05f) continue;
         float angF = ((float)b + 0.5f) * (6.2831853f / (float)CIRC_BUCKETS);
         float cosA, sinA;
         __asm { fld angF }
@@ -576,22 +576,20 @@ static void CircPlot(float cx, float cy, float PR,
         __asm { fld angF }
         __asm { fsin }
         __asm { fstp sinA }
-        // Cap bucket dot at PR-2 so it never clips outside the circle
         float reach = maxR[b];
         if (reach > 1.f) reach = 1.f;
         float px2 = cx + cosA * reach * (PR - 2.f);
         float py2 = cy - sinA * reach * (PR - 2.f);
-        DWORD dc = reach > 0.65f ? COL_GREEN : D3DCOLOR_XRGB(200, 140, 0);
+        DWORD dc = reach >= 0.7f ? COL_GREEN : D3DCOLOR_XRGB(200, 140, 0);
         FillRect(px2 - 2.f, py2 - 2.f, px2 + 2.f, py2 + 2.f, dc);
     }
 
-    // Live dot — map raw axes to circle, clamp to radius so it can't escape
+    // Live dot — normalised to unit circle, clamped
     float dxf = (float)vx / 32767.f;
     float dyf = -((float)vy / 32767.f);
     float dotDist = dxf * dxf + dyf * dyf;
     if (dotDist > 1.f)
     {
-        // Normalise to unit circle
         float inv;
         __asm { fld dotDist }
         __asm { fsqrt }
@@ -708,20 +706,14 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
     // ── CIRCULARITY test ───────────────────────────────────────────────────
     else if (s_stickTest == 1)
     {
-        // Update left stick buckets
+        // Update left stick buckets — primary bucket only, no neighbour smear.
         if (lx != 0 || ly != 0)
         {
             float r = StickRadius(lx, ly);
             if (r > 0.05f)
             {
                 int b = AngleBucket(lx, ly);
-                // Smear into center bucket and both neighbours so boundary
-                // wobble at cardinals can't leave a gap.
                 if (r > s_circMaxR[b]) s_circMaxR[b] = r;
-                int bm = (b + CIRC_BUCKETS - 1) % CIRC_BUCKETS;
-                int bp = (b + 1) % CIRC_BUCKETS;
-                if (r > s_circMaxR[bm]) s_circMaxR[bm] = r;
-                if (r > s_circMaxR[bp]) s_circMaxR[bp] = r;
                 s_circHasData = true;
             }
         }
@@ -733,10 +725,6 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
             {
                 int b = AngleBucket(rx, ry);
                 if (r > s_circMaxRR[b]) s_circMaxRR[b] = r;
-                int bm = (b + CIRC_BUCKETS - 1) % CIRC_BUCKETS;
-                int bp = (b + 1) % CIRC_BUCKETS;
-                if (r > s_circMaxRR[bm]) s_circMaxRR[bm] = r;
-                if (r > s_circMaxRR[bp]) s_circMaxRR[bp] = r;
                 s_circHasDataR = true;
             }
         }
@@ -746,45 +734,84 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
         float rcx = X_MID + 130.f;
         float cy = contentY + 110.f;
 
-        // Left plot
+        // ── Left plot ──
         CircPlot(lcx, cy, PR, s_circMaxR, lx, ly);
         DrawText(lcx - TW("LEFT STICK", 1.15f) * 0.5f, cy - PR - 16.f,
             "LEFT STICK", 1.15f, COL_YELLOW);
 
+        // Coverage: buckets that reached gate (>= 0.7)
         int lcov = 0;
+        float lminR = 2.f;
         for (int b = 0; b < CIRC_BUCKETS; ++b)
-            if (s_circMaxR[b] > 0.05f) lcov++;
-        char lcovbuf[8]; IntToStr(lcov * 100 / CIRC_BUCKETS, lcovbuf, sizeof(lcovbuf));
-        char lcovstr[16];
-        StrCopy(lcovstr, sizeof(lcovstr), lcovbuf);
-        StrCat2(lcovstr, sizeof(lcovstr), lcovstr, "% covered");
-        DrawText(lcx - TW(lcovstr, 1.1f) * 0.5f, cy + PR + 8.f, lcovstr, 1.1f,
-            lcov >= 65 ? COL_GREEN : COL_ORANGE);
-        if (!s_circHasData)
-            DrawText(lcx - TW("Rotate fully", 1.05f) * 0.5f, cy + PR + 24.f,
-                "Rotate fully", 1.05f, COL_DIM);
+        {
+            if (s_circMaxR[b] >= 0.7f)
+            {
+                ++lcov;
+                if (s_circMaxR[b] < lminR) lminR = s_circMaxR[b];
+            }
+        }
+        {
+            float ry2 = cy + PR + 6.f;
+            char lcovbuf[8]; IntToStr(lcov * 100 / CIRC_BUCKETS, lcovbuf, sizeof(lcovbuf));
+            char lcovstr[12]; StrCopy(lcovstr, sizeof(lcovstr), lcovbuf); StrCat2(lcovstr, sizeof(lcovstr), lcovstr, "%");
+            DrawText(lcx - 60.f, ry2, "gate:", 1.1f, COL_GRAY);
+            DrawText(lcx - 22.f, ry2, lcovstr, 1.1f, lcov >= CIRC_BUCKETS ? COL_GREEN : COL_ORANGE);
+            if (lcov > 0 && lminR <= 1.f)
+            {
+                int lminPct;
+                { float f = lminR * 100.f; __asm { fld f } __asm { fistp lminPct } }
+                char lminbuf[8]; IntToStr(lminPct, lminbuf, sizeof(lminbuf));
+                char lminstr[12]; StrCopy(lminstr, sizeof(lminstr), lminbuf); StrCat2(lminstr, sizeof(lminstr), lminstr, "%");
+                DrawText(lcx + 10.f, ry2, "min R:", 1.1f, COL_GRAY);
+                DrawText(lcx + 52.f, ry2, lminstr, 1.1f, lminPct >= 85 ? COL_GREEN : COL_ORANGE);
+            }
+            if (!s_circHasData)
+                DrawText(lcx - TW("Rotate fully", 1.05f) * 0.5f, ry2 + 14.f,
+                    "Rotate fully", 1.05f, COL_DIM);
+        }
 
-        // Right plot
+        // ── Right plot ──
         CircPlot(rcx, cy, PR, s_circMaxRR, rx, ry);
         DrawText(rcx - TW("RIGHT STICK", 1.15f) * 0.5f, cy - PR - 16.f,
             "RIGHT STICK", 1.15f, COL_YELLOW);
 
         int rcov = 0;
+        float rminR = 2.f;
         for (int b = 0; b < CIRC_BUCKETS; ++b)
-            if (s_circMaxRR[b] > 0.05f) rcov++;
-        char rcovbuf[8]; IntToStr(rcov * 100 / CIRC_BUCKETS, rcovbuf, sizeof(rcovbuf));
-        char rcovstr[16];
-        StrCopy(rcovstr, sizeof(rcovstr), rcovbuf);
-        StrCat2(rcovstr, sizeof(rcovstr), rcovstr, "% covered");
-        DrawText(rcx - TW(rcovstr, 1.1f) * 0.5f, cy + PR + 8.f, rcovstr, 1.1f,
-            rcov >= 65 ? COL_GREEN : COL_ORANGE);
-        if (!s_circHasDataR)
-            DrawText(rcx - TW("Rotate fully", 1.05f) * 0.5f, cy + PR + 24.f,
-                "Rotate fully", 1.05f, COL_DIM);
+        {
+            if (s_circMaxRR[b] >= 0.7f)
+            {
+                ++rcov;
+                if (s_circMaxRR[b] < rminR) rminR = s_circMaxRR[b];
+            }
+        }
+        {
+            float ry2 = cy + PR + 6.f;
+            char rcovbuf[8]; IntToStr(rcov * 100 / CIRC_BUCKETS, rcovbuf, sizeof(rcovbuf));
+            char rcovstr[12]; StrCopy(rcovstr, sizeof(rcovstr), rcovbuf); StrCat2(rcovstr, sizeof(rcovstr), rcovstr, "%");
+            DrawText(rcx - 60.f, ry2, "gate:", 1.1f, COL_GRAY);
+            DrawText(rcx - 22.f, ry2, rcovstr, 1.1f, rcov >= CIRC_BUCKETS ? COL_GREEN : COL_ORANGE);
+            if (rcov > 0 && rminR <= 1.f)
+            {
+                int rminPct;
+                { float f = rminR * 100.f; __asm { fld f } __asm { fistp rminPct } }
+                char rminbuf[8]; IntToStr(rminPct, rminbuf, sizeof(rminbuf));
+                char rminstr[12]; StrCopy(rminstr, sizeof(rminstr), rminbuf); StrCat2(rminstr, sizeof(rminstr), rminstr, "%");
+                DrawText(rcx + 10.f, ry2, "min R:", 1.1f, COL_GRAY);
+                DrawText(rcx + 52.f, ry2, rminstr, 1.1f, rminPct >= 85 ? COL_GREEN : COL_ORANGE);
+            }
+            if (!s_circHasDataR)
+                DrawText(rcx - TW("Rotate fully", 1.05f) * 0.5f, ry2 + 14.f,
+                    "Rotate fully", 1.05f, COL_DIM);
+        }
 
-        // Centre footer
+        // Centre footer legend
+        DrawText(X_MID - TW("Green dot = gate reached (R >= 70%)", 1.05f) * 0.5f,
+            contentY + 240.f, "Green dot = gate reached (R >= 70%)", 1.05f, COL_DIM);
+        DrawText(X_MID - TW("Amber dot = partial contact", 1.05f) * 0.5f,
+            contentY + 254.f, "Amber dot = partial contact", 1.05f, D3DCOLOR_XRGB(200, 140, 0));
         DrawText(X_MID - TW("[X] Clear trace", 1.05f) * 0.5f,
-            cy + PR + 42.f, "[X] Clear trace", 1.05f, COL_DIM);
+            contentY + 268.f, "[X] Clear trace", 1.05f, COL_DIM);
     }
 
     // ── DRIFT test ─────────────────────────────────────────────────────────
