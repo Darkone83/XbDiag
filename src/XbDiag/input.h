@@ -68,3 +68,30 @@ bool IsPortConnected(int port);
 // Returns true if a Memory Unit is present in the given port/slot.
 //   port 0-3,  slot 0 = top (A),  slot 1 = bottom (B)
 bool IsMUPresent(int port, int slot);
+
+// -----------------------------------------------------------------------------
+// Controller model — detected at connect time via XInputGetCapabilities SubType
+// -----------------------------------------------------------------------------
+enum ControllerType
+{
+    CT_UNKNOWN = 0,  // port empty or SubType unrecognised
+    CT_DUKE,         // Original "Duke" controller  (SubType 0x01)
+    CT_TYPE_S,       // Smaller "Type-S" controller (SubType 0x02)
+};
+
+// Returns detected model for port 0-3. CT_UNKNOWN if empty or unrecognised.
+ControllerType GetControllerType(int port);
+
+// -----------------------------------------------------------------------------
+// Active test port — which connected port GetButtons/GetSticks/GetTriggers read.
+// Defaults to the first connected port. ControllerTest cycles this with LT+Dpad.
+// -----------------------------------------------------------------------------
+
+// Returns the currently active port (0-3), or -1 if no controller connected.
+int  GetActivePort();
+
+// Sets the active port explicitly. No-op if port has no controller.
+void SetActivePort(int port);
+
+// Advances active port to next/prev connected port (wraps). No-op if <2 ports.
+void StepActivePort(int dir);  // dir: +1 = next, -1 = prev

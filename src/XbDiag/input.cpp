@@ -18,6 +18,13 @@ static int          s_rumblePort = -1;        // port whose handle we call XInpu
 // Tracked via XGetDeviceChanges bit flags — no handles opened, no data read.
 static bool g_muPresent[MAX_PORTS][2];
 
+// Controller model — detected at connect time via XInputGetCapabilities SubType.
+static ControllerType g_ctrlType[MAX_PORTS];
+
+// Active test port — which port GetButtons/GetSticks/GetTriggers read from.
+// -1 = not yet set; resolved to first connected port on first read.
+static int g_activePort = -1;
+
 // -----------------------------------------------------------------------------
 // InitInput
 // -----------------------------------------------------------------------------
@@ -29,6 +36,8 @@ void InitInput()
     memset(g_padStates, 0, sizeof(g_padStates));
     memset(g_padButtons, 0, sizeof(g_padButtons));
     memset(g_muPresent, 0, sizeof(g_muPresent));
+    memset(g_ctrlType, 0, sizeof(g_ctrlType));
+    g_activePort = -1;
     s_rumbleLeft = 0;  // motors start off — no need to send a stop packet
     s_rumbleRight = 0;
     s_rumblePort = -1;
@@ -53,6 +62,27 @@ void PumpInput()
                     g_padHandles[i] = XInputOpen(
                         XDEVICE_TYPE_GAMEPAD, i, XDEVICE_NO_SLOT, NULL);
                     g_padLastPacket[i] = 0xFFFFFFFF; // ensures first packet always processes
+
+                    // Detect Duke vs Type-S via XInputGetCapabilities SubType
+                    XINPUT_CAPABILITIES caps;
+                    ZeroMemory(&caps, sizeof(caps));
+                    if (g_padHandles[i] &&
+                        XInputGetCapabilities(g_padHandles[i], &caps) == ERROR_SUCCESS)
+                    {
+                        if (caps.SubType == XINPUT_DEVSUBTYPE_GC_GAMEPAD_ALT)
+                            g_ctrlType[i] = CT_TYPE_S;
+                        else if (caps.SubType == XINPUT_DEVSUBTYPE_GC_GAMEPAD)
+                            g_ctrlType[i] = CT_DUKE;
+                        else
+                            g_ctrlType[i] = CT_UNKNOWN;  // wheel, arcade stick, etc.
+                    }
+                    else
+                    {
+                        g_ctrlType[i] = CT_UNKNOWN;
+                    }
+                    // If no active port yet, claim this one
+                    if (g_activePort < 0)
+                        g_activePort = i;
                 }
             }
             if (rem & 1)
@@ -71,6 +101,16 @@ void PumpInput()
                 s_rumbleRight = 0xFFFF;
                 if (s_rumblePort == i)
                     s_rumblePort = -1;
+                g_ctrlType[i] = CT_UNKNOWN;
+                // If the active port disconnected, fall back to first remaining connected port
+                if (g_activePort == i)
+                {
+                    g_activePort = -1;
+                    for (int j = 0; j < MAX_PORTS; ++j)
+                    {
+                        if (g_padHandles[j]) { g_activePort = j; break; }
+                    }
+                }
             }
 
             ins >>= 1;
@@ -157,45 +197,33 @@ void PumpInput()
 }
 
 // -----------------------------------------------------------------------------
-// GetButtons – returns synthesized unified mask from first connected pad
+// GetButtons – returns synthesized unified mask from the active port
 // -----------------------------------------------------------------------------
 WORD GetButtons()
 {
-    for (int i = 0; i < MAX_PORTS; ++i)
-    {
-        if (g_padHandles[i])
-            return g_padButtons[i];
-    }
-    return 0;
+    if (g_activePort < 0 || !g_padHandles[g_activePort]) return 0;
+    return g_padButtons[g_activePort];
 }
 
 // -----------------------------------------------------------------------------
-// GetSticks – returns left/right analog sticks (with deadzones)
+// GetSticks – returns left/right analog sticks (with deadzones) from active port
 // -----------------------------------------------------------------------------
 void GetSticks(int& lx, int& ly, int& rx, int& ry)
 {
     lx = ly = rx = ry = 0;
+    if (g_activePort < 0 || !g_padHandles[g_activePort]) return;
 
-    for (int i = 0; i < MAX_PORTS; ++i)
-    {
-        if (!g_padHandles[i])
-            continue;
+    const XINPUT_GAMEPAD& gp = g_padStates[g_activePort].Gamepad;
+    lx = gp.sThumbLX;
+    ly = gp.sThumbLY;
+    rx = gp.sThumbRX;
+    ry = gp.sThumbRY;
 
-        const XINPUT_GAMEPAD& gp = g_padStates[i].Gamepad;
-
-        lx = gp.sThumbLX;
-        ly = gp.sThumbLY;
-        rx = gp.sThumbRX;
-        ry = gp.sThumbRY;
-
-        // Deadzone filtering
-        if (abs(lx) < STICK_DEADZONE) lx = 0;
-        if (abs(ly) < STICK_DEADZONE) ly = 0;
-        if (abs(rx) < STICK_DEADZONE) rx = 0;
-        if (abs(ry) < STICK_DEADZONE) ry = 0;
-
-        return; // first connected pad only
-    }
+    // Deadzone filtering
+    if (abs(lx) < STICK_DEADZONE) lx = 0;
+    if (abs(ly) < STICK_DEADZONE) ly = 0;
+    if (abs(rx) < STICK_DEADZONE) rx = 0;
+    if (abs(ry) < STICK_DEADZONE) ry = 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -205,45 +233,33 @@ void GetSticks(int& lx, int& ly, int& rx, int& ry)
 void GetRawSticks(int& lx, int& ly, int& rx, int& ry)
 {
     lx = ly = rx = ry = 0;
+    if (g_activePort < 0 || !g_padHandles[g_activePort]) return;
 
-    for (int i = 0; i < MAX_PORTS; ++i)
-    {
-        if (!g_padHandles[i])
-            continue;
-
-        const XINPUT_GAMEPAD& gp = g_padStates[i].Gamepad;
-        lx = gp.sThumbLX;
-        ly = gp.sThumbLY;
-        rx = gp.sThumbRX;
-        ry = gp.sThumbRY;
-        return; // first connected pad only
-    }
+    const XINPUT_GAMEPAD& gp = g_padStates[g_activePort].Gamepad;
+    lx = gp.sThumbLX;
+    ly = gp.sThumbLY;
+    rx = gp.sThumbRX;
+    ry = gp.sThumbRY;
 }
 // -----------------------------------------------------------------------------
 // GetTriggers – returns raw 0..255 analog values for all analog buttons
-// from the first connected pad. Includes triggers, Black/White, and face buttons.
+// from the active port. Includes triggers, Black/White, and face buttons.
 // -----------------------------------------------------------------------------
 void GetTriggers(int& lt, int& rt, int& black, int& white,
     int& btnA, int& btnB, int& btnX, int& btnY)
 {
     lt = rt = black = white = btnA = btnB = btnX = btnY = 0;
+    if (g_activePort < 0 || !g_padHandles[g_activePort]) return;
 
-    for (int i = 0; i < MAX_PORTS; ++i)
-    {
-        if (!g_padHandles[i])
-            continue;
-
-        const BYTE* a = g_padStates[i].Gamepad.bAnalogButtons;
-        lt = a[XINPUT_GAMEPAD_LEFT_TRIGGER];
-        rt = a[XINPUT_GAMEPAD_RIGHT_TRIGGER];
-        black = a[XINPUT_GAMEPAD_BLACK];
-        white = a[XINPUT_GAMEPAD_WHITE];
-        btnA = a[XINPUT_GAMEPAD_A];
-        btnB = a[XINPUT_GAMEPAD_B];
-        btnX = a[XINPUT_GAMEPAD_X];
-        btnY = a[XINPUT_GAMEPAD_Y];
-        return;
-    }
+    const BYTE* a = g_padStates[g_activePort].Gamepad.bAnalogButtons;
+    lt = a[XINPUT_GAMEPAD_LEFT_TRIGGER];
+    rt = a[XINPUT_GAMEPAD_RIGHT_TRIGGER];
+    black = a[XINPUT_GAMEPAD_BLACK];
+    white = a[XINPUT_GAMEPAD_WHITE];
+    btnA = a[XINPUT_GAMEPAD_A];
+    btnB = a[XINPUT_GAMEPAD_B];
+    btnX = a[XINPUT_GAMEPAD_X];
+    btnY = a[XINPUT_GAMEPAD_Y];
 }
 
 // -----------------------------------------------------------------------------
@@ -300,4 +316,50 @@ void SetRumble(WORD left, WORD right)
     s_rumbleLeft = left;
     s_rumbleRight = right;
     s_rumbleLastMs = now;
+}
+
+// -----------------------------------------------------------------------------
+// GetControllerType – returns cached model detected at connect time
+// -----------------------------------------------------------------------------
+ControllerType GetControllerType(int port)
+{
+    if (port < 0 || port >= MAX_PORTS) return CT_UNKNOWN;
+    return g_ctrlType[port];
+}
+
+// -----------------------------------------------------------------------------
+// Active port API
+// -----------------------------------------------------------------------------
+int GetActivePort()
+{
+    return g_activePort;
+}
+
+void SetActivePort(int port)
+{
+    if (port < 0 || port >= MAX_PORTS) return;
+    if (!g_padHandles[port]) return;  // no controller here — ignore
+    g_activePort = port;
+}
+
+void StepActivePort(int dir)
+{
+    // Count connected ports — need at least 2 to be worth stepping
+    int count = 0;
+    for (int i = 0; i < MAX_PORTS; ++i)
+        if (g_padHandles[i]) ++count;
+    if (count < 2) return;
+
+    // Walk in the requested direction, wrapping, until we find a connected port
+    int start = (g_activePort >= 0) ? g_activePort : 0;
+    int cur = start;
+    for (int step = 0; step < MAX_PORTS; ++step)
+    {
+        cur = (cur + dir + MAX_PORTS) % MAX_PORTS;
+        if (g_padHandles[cur])
+        {
+            g_activePort = cur;
+            return;
+        }
+    }
 }

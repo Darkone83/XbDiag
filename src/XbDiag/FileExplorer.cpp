@@ -749,6 +749,10 @@ void FileExplorer_Tick(const DiagLogo& logo)
     if (Keyboard_IsActive()) { Keyboard_Tick(logo);  return; }
     if (FileViewer_IsActive()) { FileViewer_Tick(logo); return; }
 
+    // Sync s_prevBtns after returning from any intercept so buttons held during
+    // FileViewer (e.g. BACK for save) don't appear as fresh edges here.
+    s_prevBtns = GetButtons();
+
 
     // ---- MU hotplug polling -----------------------------------------------
     // PumpInput is called by the main loop before Tick so IsMUPresent is current.

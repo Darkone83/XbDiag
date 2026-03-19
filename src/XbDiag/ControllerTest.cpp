@@ -1207,8 +1207,21 @@ static void Render(const DiagLogo& logo, WORD cur,
                 portLabels[p], 1.2f, tc);
         }
 
+        // Controller type row — Duke / Type-S / blank under each port box
+        float typeY = py + PBH + 3.f;
+        for (int p = 0; p < 4; ++p)
+        {
+            bool conn = IsPortConnected(p);
+            if (!conn) continue;
+            float cx = px + (PBW + PGAP) * (float)p + PBW * 0.5f;
+            ControllerType ct = GetControllerType(p);
+            const char* tag = ct == CT_DUKE ? "DUKE" :
+                ct == CT_TYPE_S ? "TYPE-S" : "???";
+            DrawText(cx - TW(tag, 1.0f) * 0.5f, typeY, tag, 1.0f, COL_CYAN);
+        }
+
         // Disconnects row — label on the left, count centred under each box
-        float discY = py + PBH + 4.f;
+        float discY = py + PBH + 17.f;
         DrawText(px - 84.f, discY, "Disconnects:", 1.1f, COL_GRAY);
         for (int p = 0; p < 4; ++p)
         {
@@ -1296,6 +1309,20 @@ static void Render(const DiagLogo& logo, WORD cur,
                 DrawText(cx - TW(state, 1.0f) * 0.5f, muY, state, 1.0f, sc);
             }
             muY += LINE_H + 1.f;
+        }
+
+        // ── Active port indicator ──────────────────────────────────────────
+        // "TESTING PORT X" centered below MU table
+        {
+            int ap = GetActivePort();
+            if (ap >= 0)
+            {
+                char portNum[4]; IntToStr(ap + 1, portNum, sizeof(portNum));
+                char label[20];
+                StrCopy(label, sizeof(label), "TESTING PORT ");
+                StrCat2(label, sizeof(label), label, portNum);
+                DrawText(X_MID - TW(label, 1.1f) * 0.5f, muY + 4.f, label, 1.1f, COL_CYAN);
+            }
         }
     }
 
@@ -1490,6 +1517,17 @@ void ControllerTest_Tick(const DiagLogo& logo)
     }
 
     // ── Main controller view ────────────────────────────────────────────────
+
+    // LT held + DPAD_RIGHT -> next connected port
+    // LT held + DPAD_LEFT  -> prev connected port
+    // Guard: not while START is also held (avoids colliding with stick test entry)
+    if ((cur & BTN_LTRIG) && !(cur & BTN_START))
+    {
+        if (Edge(cur, s_prev, BTN_DPAD_RIGHT))
+            StepActivePort(+1);
+        else if (Edge(cur, s_prev, BTN_DPAD_LEFT))
+            StepActivePort(-1);
+    }
 
     // START+DPAD_UP -> enter stick test card
     if ((cur & BTN_START) && Edge(cur, s_prev, BTN_DPAD_UP))

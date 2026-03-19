@@ -533,9 +533,9 @@ static void Render(const DiagLogo& logo)
     const char* hint = "[B] Back";
     if (s_state == UPST_IDLE)       hint = "[A] Check for update    [B] Back";
     else if (s_state == UPST_AVAIL)      hint = "[A] Download update    [B] Back";
-    else if (s_state == UPST_WRITE_DONE) hint = "[A] Relaunch to dashboard";
+    else if (s_state == UPST_WRITE_DONE) hint = "[A] Relaunch";
     else if (s_state == UPST_RECV_XBE || s_state == UPST_RECV_VER2) hint = "";
-    else if (s_state == UPST_UP_TO_DATE) hint = "[A] Re-check    [B] Back";
+    else if (s_state == UPST_UP_TO_DATE) hint = "[A] Re-check    [X] Download anyway    [B] Back";
     else if (s_state == UPST_ERROR)      hint = "[A] Retry    [B] Back";
 
     DrawPageChrome(logo, "SOFTWARE UPDATE", hint);
@@ -1031,6 +1031,12 @@ void Update_Tick(const DiagLogo& logo)
         RequestState(MSTATE_MENU); return;
     }
 
+    if (EdgeDown(cur, s_prevBtns, BTN_X))
+    {
+        if (s_state == UPST_UP_TO_DATE)
+            s_state = UPST_AVAIL;
+    }
+
     if (EdgeDown(cur, s_prevBtns, BTN_A))
     {
         switch (s_state)
@@ -1098,7 +1104,7 @@ void Update_Tick(const DiagLogo& logo)
         case UPST_WRITE_DONE:
         {
             LAUNCH_DATA ld; ZeroMemory(&ld, sizeof(ld));
-            XLaunchNewImage(NULL, &ld);
+            XLaunchNewImage(k_xbeDest, &ld);
             while (true) {}
         }
 

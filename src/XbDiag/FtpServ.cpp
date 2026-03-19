@@ -875,8 +875,17 @@ static void FtpHandleCommand(char* cmd)
     }
     else if (verb[0] == 'F' && verb[1] == 'E' && verb[2] == 'A' && verb[3] == 'T')
     {
-        // Advertise SIZE so clients know file sizes before transfer
-        FtpSendStr(g_ftp.ctrlSock, "211-Features:\r\n SIZE\r\n TVFS\r\n UTF8\r\n MDTM\r\n211 END\r\n");
+        // Advertise supported features. Do NOT advertise MLST/MLSD — FileZilla
+        // will prefer MLSD over LIST if advertised, and we don't implement it.
+        // EPSV deliberately omitted — clients probe it anyway but we decline it.
+        FtpSendStr(g_ftp.ctrlSock,
+            "211-Features:\r\n"
+            " SIZE\r\n"
+            " MDTM\r\n"
+            " REST STREAM\r\n"
+            " UTF8\r\n"
+            " TVFS\r\n"
+            "211 END\r\n");
     }
     else if (verb[0] == 'O' && verb[1] == 'P' && verb[2] == 'T' && verb[3] == 'S')
     {
@@ -896,8 +905,9 @@ static void FtpHandleCommand(char* cmd)
     }
     else if (verb[0] == 'E' && verb[1] == 'P' && verb[2] == 'S' && verb[3] == 'V')
     {
-        // FileZilla tries EPSV before PASV — not supported, fall back to PASV.
-        FtpReply(522, "EPSV not supported, use PASV.");
+        // FileZilla tries EPSV before PASV — decline with 500 so it falls back cleanly.
+        // 522 means "network protocol not supported" which confuses some clients.
+        FtpReply(500, "EPSV not supported, use PASV.");
     }
     else if (verb[0] == 'A' && verb[1] == 'B' && verb[2] == 'O' && verb[3] == 'R')
     {
@@ -923,22 +933,16 @@ static void FtpHandleCommand(char* cmd)
     }
     else if (verb[0] == 'S' && verb[1] == 'I' && verb[2] == 'Z' && verb[3] == 'E')
     {
-        // Return file size so client can show progress
         char fullPath[FTP_MAX_PATH];
         FtpResolvePath(arg, fullPath, sizeof(fullPath));
-        HANDLE hf = CreateFile(fullPath, GENERIC_READ, FILE_SHARE_READ,
-            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hf != INVALID_HANDLE_VALUE)
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExA(fullPath, GetFileExInfoStandard, &fad) &&
+            !(fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
         {
-            DWORD szHigh = 0;
-            DWORD szLow = GetFileSize(hf, &szHigh);
-            CloseHandle(hf);
-            // Build decimal string for file size (up to ~4GB via DWORD)
-            char szBuf[32]; char reply[48];
-            IntToStr((int)szLow, szBuf, sizeof(szBuf));
-            reply[0] = '\0';
-            StrCat2(reply, sizeof(reply), reply, szBuf);
-            FtpReply(213, reply);
+            // Report low 32 bits — files over 4GB are uncommon on Xbox FAT
+            char szBuf[32];
+            IntToStr((int)fad.nFileSizeLow, szBuf, sizeof(szBuf));
+            FtpReply(213, szBuf);
         }
         else { FtpReply(550, "File not found."); }
     }
@@ -982,6 +986,18 @@ static void FtpHandleCommand(char* cmd)
     {
         // MODE S (stream) is the only mode we support
         FtpReply(200, "MODE S OK.");
+    }
+    else if (verb[0] == 'S' && verb[1] == 'I' && verb[2] == 'T' && verb[3] == 'E')
+    {
+        // SITE subcommands — not implemented, 202 = "not implemented but accepted"
+        // Use 202 not 502 so clients don't treat it as a fatal error
+        FtpReply(202, "SITE not implemented.");
+    }
+    else if ((verb[0] == 'X' && verb[1] == 'C' && verb[2] == 'R' && verb[3] == 'C') ||
+        (verb[0] == 'X' && verb[1] == 'M' && verb[2] == 'D' && verb[3] == '5'))
+    {
+        // FlashFXP checksum commands — not supported
+        FtpReply(502, "Checksum commands not supported.");
     }
     else
     {
@@ -1182,7 +1198,7 @@ void FtpServ_Tick()
     // ---- Data transfer ---------------------------------------------------
     if (g_ftp.state == FTP_TRANSFER && g_ftp.dataSock != INVALID_SOCKET)
     {
-        static char ioBuf[4096];
+        static char ioBuf[65536];  // 64KB — matches retrBuf for symmetric up/down speed
 
         if (g_ftp.xferType == XFER_LIST)
         {
@@ -1211,6 +1227,10 @@ void FtpServ_Tick()
             {
                 // All listing data sent — close data socket and reply 226
                 closesocket(g_ftp.dataSock); g_ftp.dataSock = INVALID_SOCKET;
+                if (g_ftp.dataListen != INVALID_SOCKET)
+                {
+                    closesocket(g_ftp.dataListen); g_ftp.dataListen = INVALID_SOCKET;
+                }
                 FtpReply(226, "Transfer complete.");
                 g_ftp.xferType = XFER_NONE;
                 g_ftp.state = FTP_CONNECTED;
@@ -1268,6 +1288,10 @@ void FtpServ_Tick()
                 {
                     // EOF or read error — transfer complete
                     closesocket(g_ftp.dataSock); g_ftp.dataSock = INVALID_SOCKET;
+                    if (g_ftp.dataListen != INVALID_SOCKET)
+                    {
+                        closesocket(g_ftp.dataListen); g_ftp.dataListen = INVALID_SOCKET;
+                    }
                     CloseHandle(g_ftp.xferFile); g_ftp.xferFile = INVALID_HANDLE_VALUE;
                     FtpReply(226, "Transfer complete.");
                     g_ftp.xferType = XFER_NONE;
@@ -1306,6 +1330,10 @@ void FtpServ_Tick()
                     // Client closed data connection = transfer complete
                     FlushFileBuffers(g_ftp.xferFile);
                     closesocket(g_ftp.dataSock); g_ftp.dataSock = INVALID_SOCKET;
+                    if (g_ftp.dataListen != INVALID_SOCKET)
+                    {
+                        closesocket(g_ftp.dataListen); g_ftp.dataListen = INVALID_SOCKET;
+                    }
                     CloseHandle(g_ftp.xferFile); g_ftp.xferFile = INVALID_HANDLE_VALUE;
                     FtpReply(226, "Transfer complete.");
                     g_ftp.xferType = XFER_NONE;

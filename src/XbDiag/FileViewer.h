@@ -16,14 +16,15 @@
 // Controls:
 //   DPad Up/Down  — scroll one line
 //   LT / RT       — page up / page down
+//   Y             — open in FileEdit editor
 //   B             — exit, free buffer, return to explorer
 //
 // Long lines are wrapped at 80 chars to fit the display width.
-// If the file exceeds 512KB a truncation notice is shown at the bottom.
+// If the file exceeds 512KB a truncation notice is shown (editing disabled).
 
 #include "DiagCommon.h"
 
-// Returns true if the file extension is .txt or .csv (case-insensitive).
+// Returns true if the file extension is .txt, .csv, .cfg, or .ini (case-insensitive).
 bool FileViewer_CanOpen(const char* filename);
 
 // Load file at path and enter viewer. filename is shown in the title bar.

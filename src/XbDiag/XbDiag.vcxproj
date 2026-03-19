@@ -19,6 +19,7 @@
     <ClCompile Include="EepromSettings.cpp" />
     <ClCompile Include="EepromView.cpp" />
     <ClCompile Include="EepromCrypto.cpp" />
+    <ClCompile Include="FileEdit.cpp" />
     <ClCompile Include="FileExplorerOps.cpp" />
     <ClCompile Include="FileExplorer.cpp" />
     <ClCompile Include="FileExplorerMU.cpp" />
@@ -56,6 +57,7 @@
     <ClInclude Include="EepromRepair.h" />
     <ClInclude Include="EepromSettings.h" />
     <ClInclude Include="EepromView.h" />
+    <ClInclude Include="FileEdit.h" />
     <ClInclude Include="FileExplorer.h" />
     <ClInclude Include="FileExplorerMU.h" />
     <ClInclude Include="FileExplorerOps.h" />
