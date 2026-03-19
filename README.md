@@ -457,6 +457,7 @@ Sequential write, sequential read, buffer read, and random seek test against a t
 <img src="https://github.com/Darkone83/XbDiag/blob/main/img/Controllertest.png">
 </div>
 
+ 
 ### Port Status Strip
 
 A live strip at the top of the screen shows connection status for all four controller ports. Connected ports are highlighted in green; disconnected ports are dimmed. Updates every frame — hotplug is reflected immediately.
@@ -518,6 +519,8 @@ Dedicated subcard for testing the left (low-frequency) and right (high-frequency
 <div align=center>
 <img src="https://github.com/Darkone83/XbDiag/blob/main/img/Stress_CPU.png">
 </div>
+
+**Retro Fighter: Hunter Notes** -- This controller has a firmware-level issue that, when holding down Back+b, the controller will reset. This is not the fault of the app but a FW-related issue on the dongle that Retro Fighters will need to correct.
 
 Two test cards — CPU and RAM — navigated with `[DPad Left]` / `[DPad Right]`. Each card shares the same thermal threshold and abort controls.
 
