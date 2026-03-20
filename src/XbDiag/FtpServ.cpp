@@ -31,7 +31,7 @@
 // Internal string helpers
 // ============================================================================
 
-static void FtpServ_AppendStr(char* out, int outLen, const char* src)
+void FtpServ_AppendStr(char* out, int outLen, const char* src)
 {
     int i = 0; while (out[i]) i++;
     while (*src && i < outLen - 1) out[i++] = *src++;
@@ -40,7 +40,7 @@ static void FtpServ_AppendStr(char* out, int outLen, const char* src)
 
 // Copy src into dst, truncating to maxChars display characters.
 // Appends "~" if truncated. dst must be >= dstLen bytes.
-static void FtpServ_TruncName(const char* src, char* dst, int maxChars, int dstLen)
+void FtpServ_TruncName(const char* src, char* dst, int maxChars, int dstLen)
 {
     int len = 0; while (src[len]) len++;
     if (len <= maxChars)
@@ -1088,6 +1088,13 @@ void FtpServ_Tick()
         if (ds != INVALID_SOCKET)
         {
             u_long nb = 1; ioctlsocket(ds, FIONBIO, &nb);
+
+            // Expand TCP send buffer to 256KB — Xbox default is ~8KB which causes
+            // constant WSAEWOULDBLOCK even with the spin loop, capping throughput.
+            // 256KB gives the kernel enough runway to keep the wire saturated.
+            int sndbuf = 256 * 1024;
+            setsockopt(ds, SOL_SOCKET, SO_SNDBUF, (const char*)&sndbuf, sizeof(sndbuf));
+
             g_ftp.dataSock = ds;
 
             // If a LIST was waiting for a data connection, execute it now
@@ -1238,13 +1245,13 @@ void FtpServ_Tick()
         }
         else if (g_ftp.xferType == XFER_RETR)
         {
-            // Time-bounded pump: keep reading + sending for up to 15ms per tick.
-            // This lets us push multiple 64KB chunks per frame when the socket
-            // is keeping up, without starving input/render on slow transfers.
-            // Every exit path below is identical to the old single-shot logic —
-            // we just loop instead of returning after the first chunk.
+            // Time-bounded pump: keep reading + sending for up to 30ms per tick.
+            // On WSAEWOULDBLOCK we spin within the time window rather than bailing
+            // for a full frame — this is the key to hitting max throughput since
+            // the TCP send buffer drains in microseconds and we'd waste the rest
+            // of the budget if we broke out immediately.
             DWORD retrStart = GetTickCount();
-            while (GetTickCount() - retrStart < 15)
+            while (GetTickCount() - retrStart < 30)
             {
                 // Drain any unsent remainder from the previous read first
                 if (g_ftp.retrBufOff < g_ftp.retrBufLen)
@@ -1262,7 +1269,7 @@ void FtpServ_Tick()
                     else if (sent < 0)
                     {
                         if (WSAGetLastError() == WSAEWOULDBLOCK)
-                            break;  // TCP send buffer full — yield this frame
+                            continue;  // TCP send buffer full — spin within time budget
                         // Hard error
                         closesocket(g_ftp.dataSock); g_ftp.dataSock = INVALID_SOCKET;
                         CloseHandle(g_ftp.xferFile); g_ftp.xferFile = INVALID_HANDLE_VALUE;

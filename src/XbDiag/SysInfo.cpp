@@ -84,6 +84,7 @@ struct SysData
     char cpuIC[24];             // "Coppermine-128"
     char cpuSpeedMHz[16];       // measured via TSC, e.g. "733 MHz"
     DWORD cpuMHz;               // numeric for status bar
+    bool  cpuIsOC;              // true if PLL MHz doesn't match any known stock speed
     bool  isXemu;               // true if running under xemu/KVM
     char cpuLeaf1[12];          // raw CPUID leaf 1 EAX hex e.g. "0x00000683"
 
@@ -191,7 +192,7 @@ static bool EdgeDown(WORD cur, WORD prev, WORD btn)
 // PCI config space read via kernel export (EXPORTNUM 46).
 // HalReadWritePCISpace is the safe arbitrated path — avoids raw 0xCF8/0xCFC
 // port I/O which shares the PCI config address register with the kernel.
-//   SlotNumber encodes dev[4:0] | func[2:0]<<5  (PCI_SLOT_NUMBER format)
+//   SlotNumber encodes dev[4:0]<<5 | func[2:0]  (PCI_SLOT_NUMBER format)
 extern "C" VOID __stdcall HalReadWritePCISpace(
     ULONG BusNumber, ULONG SlotNumber, ULONG RegisterNumber,
     PVOID Buffer, ULONG Length, BOOLEAN WritePCISpace);
@@ -199,7 +200,7 @@ extern "C" VOID __stdcall HalReadWritePCISpace(
 static DWORD PciRead32(BYTE bus, BYTE dev, BYTE func, BYTE reg)
 {
     DWORD val = 0;
-    ULONG slot = ((ULONG)dev & 0x1F) | (((ULONG)func & 0x07) << 5);
+    ULONG slot = (((ULONG)dev & 0x1F) << 5) | ((ULONG)func & 0x07);
     HalReadWritePCISpace(bus, slot, reg, &val, sizeof(val), FALSE);
     return val;
 }
@@ -221,6 +222,15 @@ static void DoCpuid(DWORD leaf,
         mov[redx], edx
     }
 }
+
+// ============================================================================
+// Xbox crystal reference frequency.
+// 16.666... MHz — used for both CPUMPLL FSB and NV2A NVPLL calculations.
+// Expressed as explicit repeating decimal to match Haguero's reference
+// implementation rather than relying on 50000000.0/3.0 FPU rounding.
+// ============================================================================
+
+static const double XTAL_HZ = 16666666.6667;
 
 // ============================================================================
 // Pure PLL-based CPU frequency — no CPUID, no timing window.
@@ -269,7 +279,7 @@ static DWORD MeasureCpuMHz()
 
     if (fsb_div == 0 || fsb_mult == 0) return 733;
 
-    double fsb_hz = (50000000.0 / 3.0) * ((double)fsb_mult / (double)fsb_div);
+    double fsb_hz = XTAL_HZ * ((double)fsb_mult / (double)fsb_div);
 
     DWORD msr_lo = 0;
     __asm
@@ -314,15 +324,13 @@ static DWORD ReadGpuMHz()
     DWORD reg = *pll;
     DWORD M = (reg >> 0) & 0xFF;
     DWORD N = (reg >> 8) & 0xFF;
-    DWORD P = (reg >> 16) & 0x0F;
+    DWORD P = (reg >> 16) & 0x07;   // 3-bit post-divider
 
     if (M == 0) return 233;   // fallback - avoid div zero
     if (N == 0) return 233;
 
-    // Crystal = 50000000/3 Hz (16.666... MHz) — exact, matches reference.
-    // F_out = (N * crystal) / (M * 2^P)
-    // Use double to avoid integer truncation on GPU frequencies.
-    double gpu_hz = ((double)N * (50000000.0 / 3.0)) / ((double)M * (double)(1u << P));
+    // F_out = (N * XTAL_HZ / 2^P) / M
+    double gpu_hz = ((double)N * XTAL_HZ / (double)(1u << P)) / (double)M;
     DWORD  mhz = (DWORD)(gpu_hz / 1.0e6 + 0.5);  // round to nearest
 
     // Sanity check - NV2A should be 200-300 MHz
@@ -856,9 +864,64 @@ static void ReadSysData()
     }
 
     // --- CPU speed (PLL: MCPX CPUMPLL + MSR 0x2A ratio) ---
+    // OC detection logic:
+    //   MeasureCpuMHz() returns the PLL+MSR derived speed, but falls back to
+    //   733 if the MSR ratio pattern is unknown — which can happen on an OC'd
+    //   board where the FSB has been pushed past a known ratio boundary.
+    //   To detect that case we read the raw CPUMPLL FSB independently and
+    //   compute what speed the CPU *should* be at stock (733/750/766 MHz).
+    //   If the raw PLL FSB produces a non-stock result, cpuIsOC = true,
+    //   regardless of what MeasureCpuMHz() returned.
+    //   MSR is still used as the multiplier sanity check via MeasureCpuMHz —
+    //   if both PLL and MSR agree on a non-stock speed, that confirms the OC.
     {
         d.cpuMHz = MeasureCpuMHz();
-        // On xemu CPUMPLL/MSR may not reflect real hardware — flag with asterisk
+        d.cpuIsOC = false;
+
+        if (!d.isXemu)
+        {
+            // Re-read CPUMPLL and MSR directly for OC cross-check.
+            DWORD cpumpll = PciRead32(0, 3, 0, 0x6C);
+            DWORD fsb_div = cpumpll & 0xFF;
+            DWORD fsb_mult = (cpumpll >> 8) & 0xFF;
+
+            DWORD msr_lo = 0;
+            __asm { mov ecx, 0x2A }
+            __asm { rdmsr          }
+            __asm { mov msr_lo, eax }
+
+            DWORD ratio = CpuRatioX10FromMsr(msr_lo);
+
+            if (fsb_div != 0 && fsb_mult != 0 && ratio != 0)
+            {
+                // Both PLL and MSR gave valid readings — compute actual MHz.
+                double fsb_hz = XTAL_HZ * ((double)fsb_mult / (double)fsb_div);
+                double cpu_mhz = (fsb_hz * ((double)ratio / 10.0)) / 1.0e6;
+                DWORD  pllMHz = (DWORD)(cpu_mhz + 0.5);
+
+                // Known stock Xbox CPU speeds (MHz)
+                static const DWORD k_stockMHz[] = { 733, 750, 766 };
+                bool isStock = false;
+                for (int si = 0; si < 3; ++si)
+                    if (pllMHz == k_stockMHz[si]) { isStock = true; break; }
+
+                d.cpuIsOC = !isStock;
+
+                // Use the PLL+MSR computed value as the displayed speed
+                // (more authoritative than MeasureCpuMHz fallback of 733).
+                if (pllMHz >= 400 && pllMHz <= 1600)
+                    d.cpuMHz = pllMHz;
+            }
+            else if (fsb_div != 0 && fsb_mult != 0)
+            {
+                // MSR ratio unknown — check FSB alone against stock 133 MHz.
+                // Stock: XTAL_HZ * (8/3) = 133.33 MHz.  Threshold 135 MHz.
+                double fsb_mhz = XTAL_HZ * ((double)fsb_mult / (double)fsb_div) / 1.0e6;
+                d.cpuIsOC = (fsb_mhz >= 135.0);
+            }
+        }
+
+        // On xemu CPUMPLL/MSR may not reflect real hardware -- flag with asterisk
         char t[12];
         IntToStr((int)d.cpuMHz, t, sizeof(t));
         StrCat2(d.cpuSpeedMHz, sizeof(d.cpuSpeedMHz), t, " MHz");
@@ -1957,6 +2020,12 @@ static void Render(const DiagLogo& logo)
         float sy = STRIP_Y + (STRIP_H - LINE_H) * 0.5f + 1.f;
         DrawText(LM, sy, "CPU:", 1.2f, COL_GRAY);
         DrawText(LM + 34.f, sy, d.cpuSpeedMHz, 1.2f, COL_CYAN);
+        if (d.cpuIsOC)
+        {
+            int cpuLen = 0; while (d.cpuSpeedMHz[cpuLen]) ++cpuLen;
+            float ocX = LM + 34.f + (float)cpuLen * Font_GetAdvance() * 1.2f + 4.f;
+            DrawText(ocX, sy, "(OC Detected)", 1.2f, COL_ORANGE);
+        }
         float gpuX = SW * 0.5f + 8.f;
         DrawText(gpuX, sy, "GPU:", 1.2f, COL_GRAY);
         DrawText(gpuX + 34.f, sy, d.gpuSpeedMHz, 1.2f, COL_CYAN);

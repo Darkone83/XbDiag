@@ -18,11 +18,14 @@
 #include "DiagCommon.h"
 #include "input.h"
 #include "FtpServ.h"
-#include "Update.h"
 #include <xtl.h>
 
 extern "C" LONG __stdcall ExQueryNonVolatileSetting(
     ULONG ValueIndex, ULONG* Type, void* Value, ULONG ValueLength, ULONG* ResultLength);
+
+// For CerBIOS E: partition mount in CerBiosOwnsLCD()
+typedef struct { USHORT Length; USHORT MaximumLength; char* Buffer; } LCD_XBOX_STRING;
+extern "C" LONG WINAPI IoCreateSymbolicLink(LCD_XBOX_STRING* symLink, LCD_XBOX_STRING* target);
 
 // Forward declarations
 static void LCDCmd(BYTE cmd);
@@ -257,6 +260,20 @@ static bool StrEq(const char* a, const char* b)
 
 static bool CerBiosOwnsLCD(BYTE addr7bit)
 {
+    // E: = \Device\Harddisk0\Partition1.  If XbDiag launched from C: or a
+    // modchip, E: may not be mounted yet.  Mount it now — 0xC0000035
+    // (already exists) is fine, any other error means no HDD, return false.
+    {
+        char linkBuf[] = "\\??\\E:";
+        char devBuf[] = "\\Device\\Harddisk0\\Partition1";
+        LCD_XBOX_STRING sLink = { 6,  7,  linkBuf };
+        LCD_XBOX_STRING sDev = { 28, 29, devBuf };
+        LONG r = IoCreateSymbolicLink(&sLink, &sDev);
+        // 0 = mounted fresh, 0xC0000035 = already mounted — both fine
+        if (r != 0 && r != (LONG)0xC0000035)
+            return false;
+    }
+
     HANDLE hFile = CreateFileA(CERBIOS_INI_PATH, GENERIC_READ, FILE_SHARE_READ,
         NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE)
@@ -401,8 +418,29 @@ static void DrawPageSplash()
 {
     // Build "XbDiag v1.0.1" and center it within "** ... **" borders.
     // Inner field = LCD_COLS - 4 (two '*' each side).
+    // Read version directly from D:\XbDiag.ver — Update_GetLocalVersion() may
+    // not be populated yet since LCD_Begin() runs before Update_StartBootCheck().
     char verNum[16];
-    StripVersionSuffix(Update_GetLocalVersion(), verNum, sizeof(verNum));
+    verNum[0] = '\0';
+    {
+        HANDLE hv = CreateFileA("D:\\XbDiag.ver", GENERIC_READ, FILE_SHARE_READ,
+            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hv != INVALID_HANDLE_VALUE)
+        {
+            char buf[32]; DWORD rd = 0;
+            if (ReadFile(hv, buf, sizeof(buf) - 1, &rd, NULL) && rd > 0)
+            {
+                buf[rd] = '\0';
+                // Strip whitespace
+                int e = (int)rd - 1;
+                while (e >= 0 && (buf[e] == '\r' || buf[e] == '\n' ||
+                    buf[e] == ' ' || buf[e] == '\t')) buf[e--] = '\0';
+                StripVersionSuffix(buf, verNum, sizeof(verNum));
+            }
+            CloseHandle(hv);
+        }
+        if (verNum[0] == '\0') StrCopy(verNum, sizeof(verNum), "?.?.?");
+    }
     char title[17];
     StrCopy(title, sizeof(title), "XbDiag v");
     StrCat2(title, sizeof(title), title, verNum);
@@ -570,10 +608,14 @@ void LCD_Begin()
     s_dataReady = false;
     s_page = 1;
 
-    // CerBIOS InAppLCDEnable only drives the LCD during game/app execution
-    // under CerBIOS. When XbDiag is the running XBE, CerBIOS's in-app
-    // overlay is not active, so there is no SMBus conflict. We do not
-    // yield to it here.
+    // Cerbios 3.x.x has a persistent background LCD task that continues
+    // driving the display even when a third-party XBE is running.
+    // If it owns the SMBus LCD at our address, any write from us will
+    // corrupt the display or cause a bus collision.
+    // CerBiosOwnsLCD() reads E:\Cerbios\cerbios.ini — if InAppLCDEnable=True
+    // on bus 0 at our address, stay off the bus entirely.
+    if (CerBiosOwnsLCD(0x3C))
+        return;
 
     BYTE dummy = 0;
     if (!SMBusRead(LCD_ADDR, 0x00, dummy))
@@ -670,7 +712,27 @@ void LCD_Tick(WORD curButtons, WORD prevButtons)
         return;
     }
 
-    // ---- Hold splash until data arrives ----
+    // ---- Live sensor refresh (runs even before SysInfo data is available) ----
+    if ((now - s_sensorTimer) >= LCD_SENSOR_INTERVAL_MS)
+    {
+        s_sensorTimer = GetTickCount();  // recapture after potential SMBus delay
+        LCDReadSensors();
+
+        // If SysInfo data hasn't arrived yet, start the auto-cycle now from
+        // thermal so the display doesn't stay stuck on splash indefinitely.
+        if (!s_dataReady)
+        {
+            s_dataReady = true;
+            PageChange(1);
+            s_pageTimer = GetTickCount();
+            return;
+        }
+
+        if (s_page == 1)
+            DrawPageThermal();
+    }
+
+    // ---- Hold until data ready ----
     if (!s_dataReady) return;
 
     // ---- Auto-cycle ----
@@ -680,15 +742,6 @@ void LCD_Tick(WORD curButtons, WORD prevButtons)
         PageChange(nextPage);
         s_pageTimer = now;
         return;
-    }
-
-    // ---- Live sensor refresh ----
-    if ((now - s_sensorTimer) >= LCD_SENSOR_INTERVAL_MS)
-    {
-        s_sensorTimer = now;
-        LCDReadSensors();
-        if (s_page == 1)
-            DrawPageThermal();
     }
 }
 
