@@ -23,8 +23,8 @@ PAL-I (576i 50Hz) and PAL-M (480i 60Hz, Brazil) consoles are fully supported. Th
 
 PAL-I users: modes other than 576i (480p, 720p, 1080i) require an HDTV-capable AV pack and are blocked on PAL-I consoles by region policy check in VideoInfo. PAL60 (480i 60Hz on a PAL console) is treated as NTSC timing.
 
-### CPU Stress Test — Under Active Development
-Power draw during the CPU stress test is lower than during the RAM stress test, indicating the CPU is not being fully saturated thermally. The stress kernel in `StressMath.cpp` is under active revision. The current release ships the stable FFT-based kernel pending further testing on real hardware.
+### CPU Stress Test — Thermal Tuning In Progress
+The CPU stress kernel in `StressMath.cpp` has been updated with increased SSE pass count (`SM_SSE_OUTER = 256`) and adjusted memory flood timing (`MEM_BURST_CYCLES = 16`, `MEM_BURST_MS = 30`) to improve sustained thermal soak on upgraded systems. Real hardware validation of the new thermal delta is pending.
 
 ---
 
@@ -636,12 +636,15 @@ To format a Memory Unit as FATX: navigate to its entry in the drive list and pre
 
 ## Update
 
-XbDiag includes a built-in OTA updater that fetches the latest release from GitHub over raw TCP HTTP/1.0 and writes it directly to `D:\XbDiag.xbe`.
+XbDiag includes a built-in OTA updater that fetches the latest release from a self-hosted update server over raw TCP HTTP/1.0 and writes it directly to the directory XbDiag was launched from.
 
-1. Connects to `raw.githubusercontent.com` and reads `xbe/XbDiag.ver` to check the latest version tag
-2. If a newer version is available, displays the tag and prompts for confirmation
-3. Downloads the release XBE and overwrites `D:\XbDiag.xbe`
-4. Reports success or failure with a status message
+1. Connects to `darkone83.myddns.me:8008` and reads `/xbdiag/XbDiag.ver` to check the latest version tag
+2. If a newer version is available, displays the tag, fetches the remote changelog, and prompts for confirmation
+3. Downloads `default.xbe` first, then overwrites the local copy; `XbDiag.ver` is written last to confirm a complete update
+4. Reports success or failure with a status message; a `[X] Download anyway` option bypasses the version check
+5. On successful update XbDiag relaunches automatically
+
+A background boot check runs silently at startup — if a newer version is detected the app jumps directly to the Update screen instead of the main menu.
 
 Requires a network connection and DHCP. Reports `NO LINK` if no IP address is available at entry.
 
@@ -658,7 +661,7 @@ Requires a network connection and DHCP. Reports `NO LINK` if no IP address is av
 <img src="https://github.com/Darkone83/XbDiag/blob/main/img/About.png">
 </div>
 
-Displays version information and two credit logo cards. A rotating Xbox hardware trivia ticker is shown above the bottom bar, fading between facts automatically. Press `[X]` or `[Y]` to cycle through facts manually.
+Displays version information and two credit logo cards. A cracktro-style rainbow wave scroller runs below the modules list, crediting contributors with a per-character sine wave and cycling rainbow colour effect. A rotating Xbox hardware trivia ticker is shown above the bottom bar, fading between facts automatically. Press `[X]` or `[Y]` to cycle through facts manually.
 
 | Button | Action |
 |--------|--------|
@@ -747,11 +750,11 @@ When the FTP server is active, the display locks to an FTP status page mirroring
 - **Rev 1.6 temperatures** are read via PIC registers (0x09/0x0A). Xcalibur readings are noisier than ADM1032 — values are averaged across 10 samples to compensate.
 - **EEPROM export** writes to the title directory. If the directory is read-only the export will silently fail and the status indicator on screen will show `FAIL`.
 - **Flash chip detection** is suppressed when a modchip is active (LPC bus intercepted) and on rev 1.6/1.6b hardware (no TSOP present).
-- **xemu compatibility**: The PIC SMBus device (0x20) may not respond in xemu. Video Info and Temp Monitor handle this gracefully. NV2A MMIO reads in Video Info are guarded by a PCI vendor ID check and will show `N/A` if the guard fails. CPU detection uses the hypervisor present bit (CPUID leaf 1, ECX bit 31) to distinguish xemu from real hardware. CPU speed is read via CPUMPLL + MSR 0x2A — on xemu these registers may not reflect real hardware clocks and the displayed value is marked with `*`. All other modules work normally.
+
 - **LBA48 capacity** is displayed correctly for drives over 137GB. Drives over 2TB will display a `+` suffix indicating the upper 32 address bits are non-zero.
 - **Video mode switching** (`[WHITE]` in Video Info) switches the D3D device via `Reset()`. Modes unsupported by the connected AV pack will be rejected silently by the NV2A encoder — the hardware verify readout will show `MISMATCH` in that case. The original mode is always restored cleanly on exit.
 - **FTP passive mode only** — active mode (PORT) is not supported. Configure your FTP client to use passive mode.
-- **OTA Update** connects over plain HTTP to `raw.githubusercontent.com`. No TLS certificate verification is performed. Do not use on untrusted networks.
+- **OTA Update** connects over plain HTTP to `darkone83.myddns.me`. No TLS certificate verification is performed. Do not use on untrusted networks.
 
 ---
 
@@ -762,7 +765,7 @@ Built by **Darkone83** / **Darkone Customs**.
 Additional credits:
 
 Team Resurgent x Equinox [PrometheOS]  
-Rocky5 [XBMC4Gamers] — referenced for compatibility
-Ernegien [XboxEepromEditor] - referenced for EEPROM repair utility and validation
+Rocky5 [XBMC4Gamers] — referenced for compatibility  
+Ernegien [XboxEepromEditor] — referenced for EEPROM repair utility and validation
 
 These sources were referenced for various functions throughout XbDiag to ensure hardware compatibility.
