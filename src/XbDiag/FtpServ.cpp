@@ -199,10 +199,8 @@ static void FtpSendPasv()
     FtpSendStr(g_ftp.ctrlSock, reply);
 }
 
-// Send one LIST line directly to the data socket.
-// Uses the real filename — no truncation.
-// line format: "drwxr-xr-x  1 xbox xbox  <size> Jan 01 00:00 <name>\r\n"
 // Append one LIST line to g_ftp.listBuf. Returns false if buffer full.
+// line format: "drwxr-xr-x  1 xbox xbox  <size> Jan 01 00:00 <n>\r\n"
 static bool FtpAppendListLine(const char* name, bool isDir, DWORD sizeLow)
 {
     char line[FTP_MAX_PATH + 64];

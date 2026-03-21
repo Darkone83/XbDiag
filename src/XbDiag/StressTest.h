@@ -116,10 +116,6 @@ extern int   s_tempThreshold;
 extern bool  s_thermalAbort;
 extern BYTE  s_measuredLoad;
 extern DWORD s_testStartMs;
-extern BYTE  s_minCPU;
-extern BYTE  s_maxCPU;
-extern BYTE  s_minFan;
-extern BYTE  s_maxFan;
 
 // RAM card state — defined in StressTestRAM.cpp, used by HandleInput and Tick
 extern StressState s_ramState;

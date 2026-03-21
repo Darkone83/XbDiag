@@ -190,7 +190,6 @@ static bool    s_loaded = false;
 // Helpers
 // ============================================================================
 
-
 #include "EepromCrypto.h"
 #include "EepromSettings.h"
 #include "EepromRepair.h"
@@ -556,8 +555,11 @@ static int RowToField(int row)
 }
 
 // ============================================================================
-// EEPROM Security Section Crypto
-// Matches PrometheOS XKEEPROM::Decrypt() and EncryptAndCalculateCRC() exactly.
+// ReadEeprom
+// Reads the full 256-byte EEPROM image via the kernel API.
+// Matches PrometheOS XKEEPROM::ReadFromXBOX():
+//   ExQueryNonVolatileSetting(0xFFFF, &type, &m_EEPROMData, 256, &size)
+// ============================================================================
 static void ReadEeprom()
 {
     // Matches PrometheOS XKEEPROM::ReadFromXBOX():
@@ -788,7 +790,7 @@ static void RenderDecoded(const DiagLogo& logo)
 }
 
 // ============================================================================
-// ============================================================================
+// Public API
 // ============================================================================
 
 

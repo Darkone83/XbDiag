@@ -347,9 +347,7 @@ static bool SmartReadData(BYTE buf[512])
     return true;
 }
 
-// Return a human-readable name for a SMART attribute ID.
-// Returns NULL for unknown IDs (caller shows raw ID hex).
-// Byte-swap ATA string words into null-terminated ASCII, trim trailing spaces
+// Byte-swap ATA string words into null-terminated ASCII, trim trailing spaces.
 static void AtaStr(const WORD* words, int nWords, char* out, int outLen)
 {
     int pos = 0;
@@ -1180,10 +1178,6 @@ static void Render(const DiagLogo& logo)
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
-
-// ============================================================================
-// Render: SMART view
-// ============================================================================
 
 // ============================================================================
 // Tick

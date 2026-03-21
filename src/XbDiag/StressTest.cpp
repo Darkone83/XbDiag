@@ -67,10 +67,6 @@ static const int MSTATE_MENU = 0;
 static const DWORD SAMPLE_INTERVAL_MS = 500;   // idle/confirm/threshold
 static const DWORD SAMPLE_INTERVAL_BURN_MS = 1500;  // running — reduces SMBus traffic during soak
 
-// CPU temp thresholds
-
-
-
 // ============================================================================
 // Layout (all Y values are in 640x480 design space)
 // ============================================================================
@@ -121,10 +117,6 @@ static const float ABORT_BAR_H = 6.f;
 
 // ============================================================================
 // State
-// ============================================================================
-
-// ============================================================================
-// State definitions
 // ============================================================================
 
 StressState s_state = SSTATE_IDLE;
@@ -186,11 +178,6 @@ static void PushHistory(BYTE cpu, BYTE load, BYTE fan)
         if (fan > s_maxFan) s_maxFan = fan;
     }
 }
-
-// ============================================================================
-// ============================================================================
-// CPUStress(), StressMath_Init() — implemented in StressMath.cpp.
-// ============================================================================
 
 // ============================================================================
 // OnEnter
@@ -494,7 +481,6 @@ void StressTest_Tick(const DiagLogo& logo)
     }
 }
 // ============================================================================
-// ============================================================================
 // StressTest_AutoRun — headless CPU stress for XbSet automation
 // Uses the exact same burn loop as StressTest_Tick (CARD_CPU / SSTATE_RUNNING):
 //   same CPUStress kernel, same TakeSample, same edge-aligned measurement windows.
@@ -663,8 +649,6 @@ void StressTest_AutoRun(HANDLE hReport, DWORD durationMs)
     else
         WL("Result:         ", "PASS");
 }
-
-// ============================================================================
 
 // ============================================================================
 // AutoRun result accessors

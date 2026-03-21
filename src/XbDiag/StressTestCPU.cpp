@@ -17,11 +17,16 @@
 // Exact value, no SMBus dependency, works on all CPU variants including
 // Tualatin upgrades where the ICS clock generator may be absent or replaced.
 // CPUMPLL is cached on first call — the PLL config never changes at runtime.
+// Matches SysInfo MeasureCpuMHz() exactly so both modules always agree.
 // ============================================================================
 
 extern "C" VOID __stdcall HalReadWritePCISpace(
     ULONG BusNumber, ULONG SlotNumber, ULONG RegisterNumber,
     PVOID Buffer, ULONG Length, BOOLEAN WritePCISpace);
+
+// Xbox crystal reference frequency — 16.666... MHz.
+// Matches SysInfo XTAL_HZ exactly; both modules must use the same constant.
+static const double XTAL_HZ = 16666666.6667;
 
 static int ReadCPUMHz()
 {
@@ -30,7 +35,9 @@ static int ReadCPUMHz()
     static bool  s_cpumpllRead = false;
     if (!s_cpumpllRead)
     {
-        ULONG slot = (3 & 0x1F) | ((0 & 0x07) << 5); // dev=3, func=0
+        // SlotNumber: dev[4:0] in bits [4:0], func[2:0] in bits [7:5]
+        // PCI_SLOT_NUMBER format: (dev << 5) | func  — dev=3, func=0
+        ULONG slot = ((3UL & 0x1F) << 5) | (0UL & 0x07);
         HalReadWritePCISpace(0, slot, 0x6C, &s_cpumpll, sizeof(s_cpumpll), FALSE);
         s_cpumpllRead = true;
     }
@@ -39,10 +46,7 @@ static int ReadCPUMHz()
     DWORD fsb_mult = (s_cpumpll >> 8) & 0xFF;
     if (fsb_div == 0 || fsb_mult == 0) return 733;
 
-    // Crystal = 50000000/3 Hz (16.666... MHz) — matches reference implementation exactly.
-    // Use double throughout to avoid integer truncation error (up to 1 MHz on 800MHz configs).
-    double fsb_hz = (50000000.0 / 3.0) * ((double)fsb_mult / (double)fsb_div);
-    double fsb_mhz = fsb_hz / 1.0e6;
+    double fsb_hz = XTAL_HZ * ((double)fsb_mult / (double)fsb_div);
 
     // CPU ratio from MSR 0x2A bits [27:22] masked 0x2F
     DWORD msr_lo = 0;
@@ -77,7 +81,7 @@ static int ReadCPUMHz()
     default:   return 733;
     }
 
-    DWORD cpu_mhz = (DWORD)(fsb_mhz * ((double)ratio / 10.0) + 0.5);  // round to nearest
+    DWORD cpu_mhz = (DWORD)((fsb_hz * ((double)ratio / 10.0)) / 1.0e6 + 0.5);
     if (cpu_mhz < 400 || cpu_mhz > 1600) return 733;
     return (int)cpu_mhz;
 }
@@ -167,14 +171,6 @@ static void TakeSample()
         ST_PushHistory(cpu, load, fanPct);
     }
 }
-
-// ============================================================================
-// CPUStress(), StressMath_Init() — implemented in StressMath.cpp.
-// ============================================================================
-
-// ============================================================================
-// OnEnter
-// ============================================================================
 
 // ============================================================================
 // DrawInfoPanel — compact panel with large readout + tri-color gauge bar
@@ -636,9 +632,7 @@ static void RenderCPUCard(const DiagLogo& logo)
         char mhzDisp[20]; StrCat2(mhzDisp, sizeof(mhzDisp), mhzBuf, " MHz");
         DrawText(px + ST_P_PAD_X, py + ST_P_BIG_DY, mhzDisp, ST_P_BIG_SC, COL_WHITE);
 
-        const char* sLabel = !s_pathKnown ? "detecting..."
-            : s_is16 ? "ICS + PIC (v1.6)"
-            : "ICS + PIC";
+        const char* sLabel = "MCPX PLL + MSR";
         DrawText(px + ST_P_PAD_X, py + ST_PANEL_H - 14.f, sLabel, 1.0f, COL_DIM);
     }
 
@@ -728,13 +722,6 @@ static void RenderCPUCard(const DiagLogo& logo)
     else if (s_state == SSTATE_CONFIRM)
         DrawConfirmOverlay();
 }
-
-// ============================================================================
-// RAM stress engine state
-// All file-scope — mirrors RamTest's stress state machine exactly.
-// ============================================================================
-
-#define RAM_CHUNK_SIZE          (2  * 1024 * 1024)
 
 // ============================================================================
 // Public API wrappers

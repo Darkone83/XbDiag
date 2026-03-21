@@ -3,9 +3,10 @@
 //
 // Layout:
 //   Chrome:  DrawPageChrome (top bar, bottom bar, logo)
-//   Content: Vertically centered list of 11 menu entries.
+//   Content: List of 12 menu entries pinned flush under the top bar.
 //            Selected row = full-width FillRectGrad highlight bar (COL_SEL_BAR).
-//            Each row: index number  |  label  |  one-line description  |  status badge
+//            Each row: index number  |  label  |  READY badge (right-aligned)
+//            Info panel below the list: label | divider | desc of selected item
 //
 // Navigation:
 //   D-pad up/down  = move cursor
@@ -54,7 +55,7 @@ enum
 
 struct MenuItem
 {
-    const char* index;       // "01" .. "08"
+    const char* index;       // "01" .. "12"
     const char* label;       // short name, uppercase
     const char* desc;        // one-line description shown to the right
     int         targetState; // AppState to transition to on [A]
@@ -72,7 +73,7 @@ static const MenuItem k_items[] =
     { "08", "CONTROLLER TEST",  "Buttons, analog sticks, triggers, and rumble motor test",      MSTATE_CTRL    },
     { "09", "STRESS TEST",      "Sustained CPU and RAM load test with thermal monitoring",      MSTATE_STRESS  },
     { "10", "FILE EXPLORER",    "Browse Xbox partitions - C: E: F: G: and MU slots",            MSTATE_FILES   },
-    { "11", "UPDATE CHECK",     "Check GitHub for a newer version and download if available",    MSTATE_UPDATE  },
+    { "11", "UPDATE CHECK",     "Check for a newer version on the update server and download",  MSTATE_UPDATE  },
     { "12", "ABOUT",            "Version info, credits, and hardware compatibility notes",       MSTATE_ABOUT   },
 };
 
@@ -96,7 +97,6 @@ static const float IDX_X = 12.f;   // index number X
 static const float LABEL_X = 52.f;   // label text X
 static const float BADGE_RX = SW - 12.f; // READY badge right edge
 static const float TS = 1.4f;   // row text scale
-static const float INFO_Y = LIST_TOP + (float)12 * ROW_H + 10.f; // info panel Y
 
 // ============================================================================
 // OnEnter

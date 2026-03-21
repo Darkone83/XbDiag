@@ -12,8 +12,6 @@
 #include "input.h"
 #include <xtl.h>
 
-// ============================================================================
-
 #define RAM_CHUNK_SIZE          (2  * 1024 * 1024)
 #define RAM_BANK_SIZE_STD       (16 * 1024 * 1024)
 #define RAM_BANK_SIZE_EXT       (32 * 1024 * 1024)
@@ -785,7 +783,6 @@ static void RenderRAMCard(const DiagLogo& logo)
 }
 
 
-// ============================================================================
 // ============================================================================
 // RamStress_AutoRun — timed RAM stress using the StressTest RAM engine
 // Calls RamOnStart() then drives RamStressStep() until durationMs expires,

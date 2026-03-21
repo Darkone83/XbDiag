@@ -14,9 +14,9 @@ void FE_Ops_MkDir(const char* name);        // create folder in current director
 
 void FE_Ops_PickLoadDriveList();            // load drive list into picker
 void FE_Ops_PickLoadDir(const char* path);  // load directory into picker
-void FE_Ops_DrawPicker();
-void FE_Ops_EnterSelected();           // enter selected picker item
-bool FE_Ops_DeleteRecursive(const char* path, bool isDir); // delete file/dir recursively                   // render destination picker overlay
+void FE_Ops_DrawPicker();                                                        // render destination picker overlay
+void FE_Ops_EnterSelected();                                                     // enter selected item
+bool FE_Ops_DeleteRecursive(const char* path, bool isDir);                       // delete file/dir recursively
 
 // Directory loading — called by picker and op completion
 void FE_Ops_LoadDirectory(const char* path);

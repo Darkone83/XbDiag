@@ -100,7 +100,7 @@ enum VideoSubState { VSS_INFO, VSS_NTSC_BARS, VSS_PAL_BARS, VSS_MODE_TEST };
 static VideoSubState s_subState = VSS_INFO;
 
 // ============================================================================
-// Mode test — state and mode table
+// Mode test — state, probe table, and mode table
 // ============================================================================
 //
 // ModeEntry mirrors main.cpp's VideoMode but is local to VideoInfo.
@@ -120,10 +120,6 @@ static VideoSubState s_subState = VSS_INFO;
 // NOTE: Xbox D3D8 Reset() does not invalidate CPU-side texture allocations
 // (unified memory — no "default pool" eviction as on PC D3D8).  The logo
 // texture (g_logo.tex) and font (pure DrawPrimitiveUP, no texture) survive.
-
-// ============================================================================
-// Mode test — state, probe table, and mode table
-// ============================================================================
 //
 // Three-layer capability model:
 //   Layer 1 — policy eligibility  (AV pack + region + EEPROM flags)

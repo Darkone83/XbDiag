@@ -230,7 +230,6 @@ void DrawLabelValue(float x, float y,
 
 // ============================================================================
 // DDS loader  (uncompressed A8R8G8B8 only)
-// Lifted verbatim from BiosScreen with minimal rename.
 // ============================================================================
 
 #pragma pack(push,1)
@@ -255,18 +254,6 @@ struct DDSHDR
 // Converts a linear ARGB bitmap into Xbox NV2A swizzled layout.
 // Only handles 32bpp (4 bytes/pixel), power-of-two dimensions.
 // ============================================================================
-
-static unsigned int SwizzleAxis(unsigned int val, int dimension)
-{
-    unsigned int result = 0;
-    for (int bit = 0; dimension > 1; dimension >>= 1, bit++)
-    {
-        result |= (val & 1) << bit;
-        val >>= 1;
-        bit++;   // interleave: skip to next output bit pair
-    }
-    return result;
-}
 
 static void SwizzleRect(const BYTE* src, int srcPitch,
     BYTE* dst, int w, int h)
@@ -546,14 +533,7 @@ void DrawPageChrome(const DiagLogo& logo,
 //                            BOOLEAN WordFlag, ULONG Value);
 //   Returns 0 (STATUS_SUCCESS) on success.
 //
-// Convenience address defines (8-bit software-shifted):
-#define SMBADDR_PIC       0x20   // PIC16L / SMC
-#define SMBADDR_ENC_CNXT  0x8A   // Conexant video encoder
-#define SMBADDR_ENC_FOCUS 0xD4   // Focus FS454 video encoder
-#define SMBADDR_ENC_XCAL  0xE0   // Xcalibur video encoder (1.6)
-#define SMBADDR_ADM1032   0x98   // ADM1032 temp monitor (1.0-1.5 only)
-#define SMBADDR_EEPROM    0xA8   // 93LC56 EEPROM
-#define SMBADDR_ICS       0xD2   // ICS clock generator
+// Address defines are in DiagCommon.h.
 // ============================================================================
 
 // Forward declarations — provided by xboxkrnl via xtl.h

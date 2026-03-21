@@ -15,8 +15,8 @@
 //   Default 50ms. Raise to 75ms for more sustained FSB pressure.
 //   Lower to 30ms if the burst feels too long on a Tualatin upgrade.
 
-static const int MEM_BURST_CYCLES = 8;
-static const int MEM_BURST_MS = 50;
+static const int MEM_BURST_CYCLES = 16;
+static const int MEM_BURST_MS = 30;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 

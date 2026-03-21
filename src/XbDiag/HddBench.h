@@ -70,6 +70,5 @@ void HddBench_Export();
 bool HddBench_IsRunning();   // true while a benchmark phase is in progress
 
 // Internal bench state accessor for HddInfo_AutoRun
-struct BenchData;
 BenchData& HddBench_GetData();
 void HddBench_Reset();   // cleanup + zero — call from OnEnter

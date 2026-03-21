@@ -69,7 +69,6 @@
 
 #include "FileExplorer.h"
 #include "FtpServ.h"
-#include "FileExplorer.h"
 #include "FileExplorerMU.h"
 #include "FileExplorerOps.h"
 #include "Keyboard.h"
@@ -83,11 +82,7 @@ extern void RequestState(int newState);
 static const int MSTATE_MENU = 0;
 
 // ============================================================================
-
-// ============================================================================
 // Module state
-// ============================================================================
-// Module state definitions
 // ============================================================================
 
 FileEntry s_entries[MAX_ENTRIES];
@@ -151,6 +146,8 @@ int            s_opSkipCount = 0;
 int            s_opDelFail = 0;
 bool           s_opCopyOK = true;
 
+// ============================================================================
+// LoadDriveList / LoadDirectory
 // ============================================================================
 static void LoadDriveList()
 {

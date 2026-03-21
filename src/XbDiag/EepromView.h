@@ -44,9 +44,6 @@ extern bool    s_restoreConfirm;
 extern const EepField s_fields[];
 extern const int      NUM_FIELDS;
 
-
-
-
 // ============================================================================
 // Shared layout constants (used by EepromView, EepromSettings, EepromRepair)
 // ============================================================================

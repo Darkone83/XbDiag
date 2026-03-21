@@ -14,31 +14,27 @@
 #include <xtl.h>
 
 // ============================================================================
-// EEPROM Repair
-// ============================================================================
-//
-// Diagnostic items (16 total):
+// EEPROM Repair — diagnostic item list (16 items, indices 0–15)
 //
 //   REPAIRABLE via SMBus direct write:
 //     Factory checksum  (0x30) — ~Calc(data, 0x34, 0x2C)
 //
-//   REPAIRABLE via ExSaveNonVolatileSetting (kernel recalculates user checksum):
-//     User checksum     (0x60) — verified after kernel writes; repaired implicitly
+//   REPAIRABLE via ExSaveNonVolatileSetting (kernel recalculates checksums):
+//     User checksum     (0x60) — recalculated as part of the full 256-byte write
 //     Video standard    (0x58) — reset to NTSC-M (0x00400100)
 //     Video flags       (0x94) — mask to valid bits 0x005F0000
 //     Audio flags       (0x98) — mask to valid bits 0x00030003
-//     Game region       (0x54) — reset to NA (0x00000001)
-//     DVD region        (0xBC) — reset to 0 (no region lock)
+//     Game region       (0x2C) — reset to NA (0x00000001) via XC_GAME_REGION
+//     DVD region        (0xBC) — reset to 0 (region free)
 //     Language          (0x90) — reset to English (1)
-//     Timezone          (0x64) — reset bias to 0 (UTC)
+//     Timezone          (0x64) — reset to UTC+0 via EepromSettings_GetUtcTzBlock
 //     Game rating       (0x9C) — reset to disabled (0)
 //     Movie rating      (0xA4) — reset to disabled (0)
 //     Parental passcode (0xA0) — reset to disabled (0)
 //
 //   DETECT ONLY (no repair possible):
-//     Security hash     (0x00) — HMAC-SHA1 requires per-version RC4 key baked into kernel
-//                                Detected via ExQueryNonVolatileSetting return value
-//     Serial number     (0x34) — factory assigned, 12 ASCII digits check
+//     Security hash     (0x00) — HMAC-SHA1; detected via ExQueryNonVolatileSetting return code
+//     Serial number     (0x34) — factory assigned; 12 ASCII digits check
 //     MAC address       (0x40) — Xbox OUI prefix check + no multicast bit
 //     Online key        (0x48) — nonzero check (all-zeros = never provisioned)
 //
@@ -46,54 +42,19 @@
 //     HDD key           (0x1C) — encrypted, hardware-unique; touching this bricks the HDD
 //     Confounder        (0x14) — part of the security section encryption
 //
-// Checksum algorithm (RE'd from Xbox kernel 4034 by XboxEepromEditor):
+// Checksum algorithm (RE'd from Xbox kernel 4034, confirmed same in 5838):
 //   Accumulate all DWORDs with 64-bit carry tracking.
 //   result = high + low
 //   stored = ~result
-//   valid:  stored + result == 0xFFFFFFFF  →  Calc(section_including_stored) == 0xFFFFFFFF
+//   valid:  stored + result == 0xFFFFFFFF
 //
 // Write paths:
 //   Factory checksum  → HalWriteSMBusValue to EEPROM IC at 0xA8, byte by byte, 10ms delay
-//   All user fields   → ExSaveNonVolatileSetting, which re-encrypts and recalculates checksums
+//   All user fields   → ExSaveNonVolatileSetting (full 256-byte write after RecalcChecksums)
 //
 // Restore from D:\eeprom.bin:
 //   Reads 256 bytes, validates both checksums, writes all bytes via SMBus.
 //   A confirm modal is shown before any write for both repair and restore.
-//   valid: ~result + result == 0xFFFFFFFF  -->  (checksum + Calc(section)) == 0xFFFFFFFF
-//
-// Factory write path: direct HalWriteSMBusValue to EEPROM at 0xA8
-// User write path:    ExSaveNonVolatileSetting — kernel handles re-encryption + checksums
-// ============================================================================
-// EEPROM Repair
-// ============================================================================
-//
-// Diagnostic items:
-//
-//   CHECKSUM SECTION (can repair)
-//   1. Factory checksum  0x30  ~Calc(0x34, 0x2C)  covers serial/MAC/online key/video std
-//   2. User checksum     0x60  ~Calc(0x64, 0x5C)  covers timezone/language/flags/ratings
-//
-//   SECURITY SECTION (detect only — cannot repair without per-version RC4 key)
-//   3. HMAC SHA1 hash    0x00  result of HMAC-SHA1 over decrypted confounder+HDD key+region
-//      We detect this by checking if ExQueryNonVolatileSetting returns STATUS_DEVICE_DATA_ERROR
-//      (0xC000009C), which is exactly what the kernel returns on hash mismatch.
-//
-//   USER SETTINGS (can repair via ExSaveNonVolatileSetting)
-//   4. Video standard    0x58  must be one of four known DWORD values
-//   5. Video flags       0x94  must not have bits outside mask 0x005F0000
-//   6. Audio flags       0x98  must not have bits outside mask 0x00030003
-//   7. Game region       0x2C  (security section, read via kernel) must be known region code
-//   8. DVD region        0xBC  0-6 (0=none, 1-6=CSS zone)
-//   9. Language          0x90  0-9 (Neutral through Portuguese)
-//  10. Timezone          0x64  zone bias + std/dst names match a known Xbox TZ entry
-//
-// NEVER touched: HDD key (0x1C-0x2B), confounder (0x14-0x1B), serial (0x34),
-//                MAC (0x40), online key (0x48), security hash (0x00).
-//
-// Checksum algorithm RE'd from Xbox kernel 4034 (confirmed same in 5838):
-//   Sum all DWORDs tracking carry in high DWORD.
-//   stored = ~(high + low)
-//   valid:  stored + (high+low) == 0xFFFFFFFF
 // ============================================================================
 
 // ---- Checksum ---------------------------------------------------------------
@@ -363,7 +324,7 @@ static void RepairBuildDiag()
     add("Language", "0x90  Neutral-Portuguese (0-9)", EepLanguageOK(), true);
     add("Timezone", "0x64  valid bias + printable TZ name", EepTimezoneOK(), true);
     add("Game Rating", "0x9C  ESRB 0-8 or 0xFF", EepGameRatingOK(), true);
-    add("Movie Rating", "0xA4  MPAA 0-8 or 0xFF", EepMovieRatingOK(), true);
+    add("Movie Rating", "0xA4  MPAA: NR=0 NC17=1 R=2 PG13=4 PG=5 G=7", EepMovieRatingOK(), true);
     add("Parental Passcode", "0xA0  nibbles 0-4 or zero", EepParentalPasscodeOK(), true);
 }
 
@@ -381,7 +342,8 @@ static int RepairBadCount()
 //   2. Read fresh 256-byte image
 //   3. Write all bad user-section field defaults directly into the buffer
 //   4. Recalculate both checksums in the buffer
-//   5. Write all 256 bytes atomically
+//   5. Write all 256 bytes atomically via ExSaveNonVolatileSetting
+//   6. Re-read and verify checksums; update item states to FIXED or FAIL
 //
 // Factory checksum (item 0) is included in the Checksum2 recalculation at step 4 —
 // no separate SMBus write needed. Items 2-5 (security hash, serial, MAC, online key)

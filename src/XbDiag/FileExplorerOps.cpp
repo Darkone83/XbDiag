@@ -216,9 +216,8 @@ static void EnterSelected()
     s_scroll = 0;
 }
 
-// Navigate up one level
 // ============================================================================
-// IP resolution (same pattern as SysInfo)
+// ExpandToWorkList / FileDeleteRecursive / FileOpTick
 // ============================================================================
 static void ExpandToWorkList(const char* srcPath, const char* dstPath, bool isDir)
 {

@@ -10,10 +10,10 @@
 #include <xtl.h>
 
 // Decrypt security section (0x14-0x2F) in-place.
-// Tries all 4 hardware versions (Debug / RetailFirst / RetailMiddle / RetailLast).
+// Tries all 4 version-specific IV sets (indices 0-3).
 // Returns the version index (0-3) on success, -1 on failure.
 int  EepCrypto_Decrypt(BYTE* buf);
 
 // Re-encrypt security section in-place using the given version index (0-3).
-// ver must be the value returned by EepCrypto_Decrypt.
+// Pass the value returned by EepCrypto_Decrypt, or a known valid index.
 void EepCrypto_Encrypt(BYTE* buf, int ver);

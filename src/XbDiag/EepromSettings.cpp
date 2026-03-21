@@ -26,7 +26,6 @@ static int  s_editFailReason = 0;
 static DWORD s_editVideoStd;
 static DWORD s_editVideoFlags;
 static DWORD s_editAudioFlags;
-static DWORD s_editGameRegion;
 static DWORD s_editDvdRegion;
 static DWORD s_editGameRating;
 static int   s_editTzIndex;
@@ -34,14 +33,14 @@ static bool  s_editConfirm;
 static bool  s_editWriteDone;
 static bool  s_editWriteOK;
 
+// Field counts per card: VIDEO=7, AUDIO=3, REGION=2, TIME=1
 static const int CARD_FIELD_COUNT[4] = { 7, 3, 2, 1 };
 
 // ============================================================================
-// Timezone table — matches Xbox dashboard timezone list and kernel bias values.
 // Timezone table — each entry carries the full 44-byte raw EEPROM block for
-// offsets 0x64-0x8F, sourced directly from XboxEepromEditor _timeZoneMappings.
-// This is the authoritative data; writing these 44 bytes produces a fully
-// consistent timezone block that the Xbox kernel recognises.
+// offsets 0x64-0x8F, sourced from XboxEepromEditor _timeZoneMappings.
+// Writing these 44 bytes produces a consistent timezone block that the Xbox
+// kernel recognises. Names match the Xbox dashboard timezone list.
 //
 // Block layout (44 bytes):
 //   [0x00-0x03]  0x64  TZ Bias (int32 LE, minutes west of UTC)
@@ -283,9 +282,6 @@ static int CycleEnum(int cur, int count, int delta)
     return cur;
 }
 
-// Forward declaration — defined in the repair section below.
-
-// Write a DWORD little-endian into a raw buffer at offset
 // Recalculate and write both checksums into a 256-byte EEPROM buffer.
 // Matches PrometheOS CalculateChecksum2() + CalculateChecksum3():
 //   Checksum2 (0x30): ~Calc(buf+0x34, 0x2C) — serial/MAC/online key/video std

@@ -8,7 +8,7 @@
 //   - Color palette (BiosScreen heritage)
 //   - 2D vertex helpers: FillRect, FillRectGrad, HLine
 //   - Text helpers: TW, DrawTextR, DrawLabelValue
-//   - BiosResetShader
+//   - DiagResetShader
 //   - Ftoi (safe float->int, no __ftol2_sse)
 //   - String helpers: IntToStr, IntToHex, StrCat2, StrCopy, HexByte
 //   - DDS loader

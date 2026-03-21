@@ -66,6 +66,8 @@ static void EVXboxHmac(int ver, const BYTE* data, int len, BYTE out[20])
         {{0x8058763A,0xF97D4E0E,0x865A9762,0x8A3D920D,0x08995B2C},{0x01075307,0xA2F1E037,0x1186EEEA,0x88DA9992,0x168A5609}},
     };
     EVSha1 s; BYTE mid[20];
+    // bitLen pre-loaded to 512: SHA1 state as if a full 64-byte block of HMAC
+    // key padding has already been processed — matches Xbox custom IV convention.
     for (int j = 0; j < 5; ++j)s.H[j] = ivs[ver][0][j]; s.bi = 0; s.bitLen = 512;
     EVSha1Update(s, data, len); EVSha1Final(s, mid);
     for (int j = 0; j < 5; ++j)s.H[j] = ivs[ver][1][j]; s.bi = 0; s.bitLen = 512;
@@ -119,6 +121,9 @@ void EepCrypto_Encrypt(BYTE* buf, int ver)
     EVXboxHmac(ver, buf + 0x14, 28, buf + 0x00);
     BYTE kh[20]; EVXboxHmac(ver, buf + 0x00, 20, kh);
     EVRC4 rc4; EVRC4Init(rc4, kh, 20);
+    // Encrypt in two segments matching the reference split:
+    // bytes 0x14-0x1B (8 bytes: HDD key first half), then 0x1C-0x2F (20 bytes: remainder).
+    // Both calls share the same RC4 state — the stream is continuous across the split.
     EVRC4Crypt(rc4, buf + 0x14, 8);
     EVRC4Crypt(rc4, buf + 0x1C, 20);
 }

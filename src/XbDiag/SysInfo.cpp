@@ -2001,8 +2001,6 @@ static void Render(const DiagLogo& logo)
     DrawRow(C2, y2, V2, "SIZE   :", d.hddSizeGB, COL_WHITE);    y2 += LH;
     DrawRow(C2, y2, V2, "MODE   :", d.hddUDMA, COL_WHITE);    y2 += LH + GAP;
 
-    // ---- RIGHT: DVD drive ----
-
     // ---- RIGHT: Network ----
     DrawSection(C2, y2, RULEW, "NETWORK");                       y2 += LH + 4.f;
     DrawRow(C2, y2, V2, "MAC    :", d.macAddr,

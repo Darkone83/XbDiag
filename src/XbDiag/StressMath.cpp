@@ -654,7 +654,7 @@ static bool sm_sseOK = false;
 // =============================================================================
 
 static const int SM_SSE_PASS = (16 * 1024) / sizeof(float); // 4096 floats = 16KB
-static const int SM_SSE_OUTER = 128;  // passes before deadline re-check
+static const int SM_SSE_OUTER = 256;  // passes before deadline re-check
 static __declspec(align(16)) float sm_sse[SM_SSE_PASS];
 
 // ============================================================================

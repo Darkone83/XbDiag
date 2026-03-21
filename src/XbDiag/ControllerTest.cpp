@@ -72,10 +72,11 @@ static bool s_rumbleSkip = false;  // skip first tick on rumble entry — flush 
 
 // ============================================================================
 // Stick Test card  (START+DPAD_UP to enter, B to exit)
-// Three sub-tests cycled with LEFT/RIGHT dpad:
+// Four sub-tests cycled with LEFT/RIGHT dpad:
 //   0 = Dead-zone   — raw XY + dead-zone radius ring visualised on stick plot
 //   1 = Circularity — traces stick path, shows gate shape vs ideal circle
 //   2 = Drift       — samples at-rest position, reports average XY offset
+//   3 = Triggers    — large trigger bars with dead-zone band + min/max tracking
 // ============================================================================
 static bool s_stickMode = false;
 static int  s_stickTest = 0;    // 0/1/2
@@ -412,7 +413,6 @@ static void RenderRumble(const DiagLogo& logo, int lt, int rt)
 }
 
 // ============================================================================
-// ============================================================================
 // Stick test helpers
 // ============================================================================
 
@@ -645,7 +645,7 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
         float lcx = X_MID - 130.f;
         float lcy = contentY + 110.f;
         float lRadius = StickRadius(lx, ly);
-        // Dead-zone: threshold at ~7000/32767 ≈ 0.21 (STICK_DEADZONE from input.cpp)
+        // Dead-zone: threshold at ~8000/32767 ≈ 0.24 (STICK_DEADZONE from input.cpp)
         float dzN = 8000.f / 32767.f;
         StickPlot(lcx, lcy, PR, lx, ly, dzN,
             lRadius > dzN ? COL_GREEN : D3DCOLOR_XRGB(100, 100, 100));
@@ -1232,7 +1232,9 @@ static void Render(const DiagLogo& logo, WORD cur,
             DrawText(cx - TW(buf, 1.2f) * 0.5f, discY, buf, 1.2f, cc);
         }
     }
-    // LT left, RT right
+
+    // =========================================================
+    // TRIGGER BARS  — LT left, RT right
     // =========================================================
 
     TrigBar(X_LEFT, B + Y_TRIG, "LT", lt);

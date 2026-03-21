@@ -6,7 +6,8 @@
 //     App name + version  (large, centered)
 //     Purpose statement   (two lines, centered)
 //     Horizontal rule
-//     Target hardware row + modules rows (two lines)
+//     Target hardware row + modules rows (three lines)
+//     Special thanks label + rainbow wave scroller
 //
 //   Lower panel (DIVIDER_Y to BOT_BAR_Y):
 //     Two credit cards side by side, centered:
@@ -74,6 +75,20 @@ static bool  s_factFadingIn = true;
 static const DWORD FACT_HOLD_MS = 4000;
 static const DWORD FACT_FADE_MS = 500;
 
+// ============================================================================
+// Credits scroller state
+// ============================================================================
+
+static const char k_scrollText[] =
+"LuckyXmods -=- Equinox -=- Andr0 -=- Haguero -=- Harcroft -=- "
+"Wolfgang von Douchenozzle -=- The XBOX-Scene Discord -=- "
+"The OG Xbox Community      ";
+
+static float s_scrollX = 0.f;   // current left edge of scroller text (pixels)
+static float s_scrollTime = 0.f;   // accumulated time for wave + RGB phase (seconds)
+static DWORD s_scrollPrev = 0;     // GetTickCount at last scroller tick
+static bool  s_scrollInit = false;
+
 static float Clamp01(float v) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; }
 
 static void TickFact()
@@ -136,6 +151,10 @@ void AboutScreen_OnEnter()
 
     s_trLogo.tex = DiagLoadDDS("D:\\tex\\tr.dds", s_trLogo.w, s_trLogo.h);
     s_dcLogo.tex = DiagLoadDDS("D:\\tex\\dc.dds", s_dcLogo.w, s_dcLogo.h);
+
+    s_scrollX = (float)SW;
+    s_scrollTime = 0.f;
+    s_scrollInit = false;
 }
 
 // ============================================================================
@@ -149,7 +168,8 @@ static bool EdgeDown(WORD cur, WORD prev, WORD btn)
 
 // ============================================================================
 // DrawCreditCard
-// Draws a bordered card with logo centered above name + tagline text.
+// Draws a bordered card with logo centered above name text.
+// tagline is accepted but currently passed as "" at all call sites.
 // ============================================================================
 
 static void DrawCreditCard(float cx, float cy,
@@ -187,6 +207,111 @@ static void DrawCreditCard(float cx, float cy,
     const float TAG_S = 1.1f;
     float tagY = nameY + LINE_H;
     DrawText(cx - TW(tagline, TAG_S) * 0.5f, tagY, tagline, TAG_S, COL_DIM);
+}
+
+// ============================================================================
+// TickScroller
+//
+// Advances scroll position and time accumulator each frame.
+// s_scrollX starts at SW (right edge) on first tick and moves left at
+// SCROLL_SPEED px/sec. When the entire text clears the left edge it resets
+// to SW for seamless wrap.
+//
+// Constants below are shared with DrawScroller.
+// ============================================================================
+
+static const float SCROLL_SCALE = 1.3f;   // glyph scale for scroller text
+static const float SCROLL_SPEED = 60.f;   // pixels per second
+static const float SCROLL_AMP = 7.f;    // wave amplitude in pixels
+static const float SCROLL_WFREQ = 0.018f; // spatial wave frequency (rad/px)
+static const float SCROLL_TFREQ = 2.2f;   // temporal wave frequency (rad/s)
+
+static void TickScroller()
+{
+    DWORD now = GetTickCount();
+    if (!s_scrollInit)
+    {
+        s_scrollX = (float)SW;
+        s_scrollPrev = now;
+        s_scrollInit = true;
+    }
+
+    DWORD elapsed = now - s_scrollPrev;
+    s_scrollPrev = now;
+
+    float dt = (float)elapsed * 0.001f;
+    if (dt > 0.1f) dt = 0.1f;   // clamp on first frame / stall
+
+    s_scrollTime += dt;
+
+    // Advance text left
+    s_scrollX -= SCROLL_SPEED * dt;
+
+    // Measure total text width so we can wrap cleanly
+    int   len = 0; while (k_scrollText[len]) ++len;
+    float textW = (float)len * Font_GetAdvance() * SCROLL_SCALE;
+
+    // Once the tail has passed the left edge, reset to right
+    if (s_scrollX + textW < 0.f)
+        s_scrollX = (float)SW;
+}
+
+// ============================================================================
+// DrawScroller
+//
+// Draws each character at its own Y offset (sine wave) with a rainbow colour
+// that shifts per character position and advances over time.
+// Each character is drawn as a single DrawText call with a one-char string.
+// ============================================================================
+
+static void DrawScroller(float baseY)
+{
+    float advance = Font_GetAdvance() * SCROLL_SCALE;
+    float cx = s_scrollX;
+
+    char buf[2];
+    buf[1] = '\0';
+
+    int len = 0; while (k_scrollText[len]) ++len;
+
+    for (int i = 0; i < len; ++i, cx += advance)
+    {
+        // Cull characters fully off-screen
+        if (cx + advance < 0.f || cx >(float)SW) continue;
+
+        // Wave: Y offset = amplitude * sin(spatial_phase + temporal_phase)
+        float xPhase = cx * SCROLL_WFREQ;
+        float waveY = SCROLL_AMP * sinf(xPhase + s_scrollTime * SCROLL_TFREQ);
+
+        // Rainbow: hue cycles with character index + time
+        // H in [0,1], full saturation, full value -> RGB
+        float hue = (float)i * (1.f / 24.f) + s_scrollTime * 0.18f;
+        hue = hue - (float)(int)hue;   // frac(), C89-safe
+
+        // HSV->RGB: S=1, V=1
+        float h6 = hue * 6.f;
+        int   hi = (int)h6;
+        float f = h6 - (float)hi;
+        // p=0, q=1-f, t=f  (S=V=1 simplification)
+        float r = 0.f, g = 0.f, b = 0.f;
+        switch (hi % 6)
+        {
+        case 0: r = 1.f;       g = f;         b = 0.f;       break;
+        case 1: r = 1.f - f;   g = 1.f;       b = 0.f;       break;
+        case 2: r = 0.f;       g = 1.f;       b = f;         break;
+        case 3: r = 0.f;       g = 1.f - f;   b = 1.f;       break;
+        case 4: r = f;         g = 0.f;       b = 1.f;       break;
+        case 5: r = 1.f;       g = 0.f;       b = 1.f - f;   break;
+        }
+
+        BYTE rb = (BYTE)Ftoi(r * 255.f);
+        BYTE gb = (BYTE)Ftoi(g * 255.f);
+        BYTE bb = (BYTE)Ftoi(b * 255.f);
+        DWORD col = D3DCOLOR_XRGB(rb, gb, bb);
+
+        buf[0] = k_scrollText[i];
+        DrawText(cx, baseY + waveY, buf, SCROLL_SCALE, col);
+    }
 }
 
 // ============================================================================
@@ -253,6 +378,19 @@ static void Render(const DiagLogo& logo)
     DrawText(VM2, y, "HDD Info  EEPROM  Video Out  Stress Test", LS, COL_WHITE);
     y += LINE_H;
     DrawText(VM2, y, "File Explorer  Controller Test  Update Check", LS, COL_WHITE);
+    y += LINE_H + 6.f;
+
+    // -------------------------------------------------------------------------
+    // Special thanks label + wave scroller
+    // Lives in the natural gap between the modules list and DIVIDER_Y.
+    // -------------------------------------------------------------------------
+    {
+        const char* k_thanks = "Special Thanks To:";
+        const float LABEL_S = 1.1f;
+        DrawText((SW - TW(k_thanks, LABEL_S)) * 0.5f, y, k_thanks, LABEL_S, COL_WHITE);
+        y += LINE_H + 2.f;
+        DrawScroller(y);
+    }
 
     // -------------------------------------------------------------------------
     // Divider + logo panel background
@@ -345,5 +483,6 @@ void AboutScreen_Tick(const DiagLogo& logo)
 
     s_prevBtns = cur;
     TickFact();
+    TickScroller();
     Render(logo);
 }
