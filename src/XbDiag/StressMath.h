@@ -6,17 +6,17 @@
 // ── Tuning constants ──────────────────────────────────────────────────────────
 //
 // MEM_BURST_CYCLES — number of compute iterations between MemFlood bursts.
-//   Default 8 targets ~70% compute / ~30% memory flood at 733 MHz.
+//   Default 6 targets ~60% compute / ~40% memory flood at 733 MHz.
 //   Lower = more memory/FSB pressure (minimum useful value: 4).
 //   Higher = more compute-dominant (10+ shifts back toward core-only burn).
-//   Recommended tuning steps: 8 → 6 (more heat) / 10 (less bursty feel).
+//   Recommended tuning steps: 6 → 4 (more heat) / 8 (less bursty feel).
 //
 // MEM_BURST_MS — duration of each MemFlood burst in milliseconds.
-//   Default 50ms. Raise to 75ms for more sustained FSB pressure.
-//   Lower to 30ms if the burst feels too long on a Tualatin upgrade.
+//   Default 60ms. Raise to 75ms for more sustained FSB pressure.
+//   Lower to 40ms if the burst feels too long on a Tualatin upgrade.
 
-static const int MEM_BURST_CYCLES = 16;
-static const int MEM_BURST_MS = 30;
+static const int MEM_BURST_CYCLES = 6;
+static const int MEM_BURST_MS = 60;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
