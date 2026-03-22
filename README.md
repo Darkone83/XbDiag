@@ -41,7 +41,7 @@ The CPU stress kernel in `StressMath.cpp` has been updated with increased SSE pa
 | 07 | **HDD Info** | ATA IDENTIFY — model, serial, firmware, capacity, RPM/SSD, UDMA mode, partition sizes, SMART, HDD benchmark, and DVD drive detection |
 | 08 | **Controller Test** | Port connection status strip (all 4 ports), digital buttons, analog sticks, triggers, Black/White — live visualizer with stick sub-tests (dead-zone, circularity, drift, trigger dead-zone card) and rumble motor subcard |
 | 09 | **Stress Test** | CPU and RAM stress tests with live temperature monitoring, fan speed readback, and configurable thermal auto-abort |
-| 10 | **File Explorer** | Full file manager with FTP server, file copy/move/delete, multi-select, new folder creation, file viewer, and XBE launcher |
+| 10 | **File Explorer** | Full file manager with FTP server, file copy/move/delete, multi-select, new folder creation, file viewer, XBE launcher, and MU Utilities (format, Skeleton Key, ENDGAME creation) |
 | 11 | **Update** | GitHub OTA updater — checks latest release tag, downloads, and overwrites `D:\XbDiag.xbe` in place |
 | 12 | **About** | Version info, credits, and rotating Xbox hardware facts ticker |
 
@@ -615,9 +615,28 @@ Opens `.txt` and `.csv` files directly in the explorer. The viewer reads up to 5
 
 ### Memory Unit Support
 
-Plugged-in Memory Units appear in the drive list as lettered drives (A–H, mapped by controller port and slot). Insertion and removal are detected every frame — the drive list reloads automatically on hotplug.
+Plugged-in Memory Units appear in the drive list as lettered drives (A–H, mapped by controller port and slot). Insertion and removal are detected every frame — the drive list reloads automatically on hotplug. Memory Units also appear as selectable destinations in the copy/move destination picker alongside HDD partitions.
 
-To format a Memory Unit as FATX: navigate to its entry in the drive list and press `[Back+Black]`. A confirmation overlay appears — press `[A]` to format or `[B]` to cancel.
+Navigating to a Memory Unit entry in the drive list and pressing `[Back+Black]` opens the **MU Utilities** card — a three-item modal menu:
+
+| Item | Action |
+|------|--------|
+| **Format** | Dismount, format as FATX, and remount the MU. A confirmation overlay appears before any data is erased. |
+| **Create Skeleton Key** | Write a Skeleton Key image to the MU. If `D:\resources\SK.xba` is not present, offers to download it from the update server first. |
+| **Create ENDGAME** | Write an ENDGAME image to the MU. If `D:\resources\ENDGAME.xba` is not present, offers to download it from the update server first. |
+
+Navigate the card with `[DPad Up/Down]`, confirm with `[A]`, or cancel with `[B]`.
+
+#### Skeleton Key / ENDGAME Flow
+
+Both operations follow the same sequence:
+
+1. **Asset check** — if the `.xba` archive is not present on `D:\resources\`, a download prompt is shown. Pressing `[A]` downloads the file from `darkone83.myddns.me:8008` with a live KB progress bar. Press `[B]` to cancel.
+2. **Confirm** — once the asset is present, a confirmation overlay shows the target MU label and warns that all data will be erased. Press `[A]` to proceed, `[B]` to cancel.
+3. **Create** — the MU is formatted, the `.xba` archive is extracted to a temporary directory on `D:\resources\tmp\`, all files are copied to the MU root, and the temp directory is cleaned up. A file-count progress bar is shown throughout.
+4. **Result** — success or a two-line error message (error type / detail). Press `[B]` to close.
+
+The `.xba` assets are retained in `D:\resources\` after creation so subsequent writes to additional MUs do not require a re-download.
 
 ### FTP Server
 
@@ -715,6 +734,14 @@ hddbench.txt   (written by HDD Info benchmark export)
 bios.bin       (written by System Info BIOS dump)
 ramresult.csv  (written by Memory Test export)
 smbid.id       (created automatically if not present; user-editable SMBus device database)
+```
+
+MU Utilities asset cache (downloaded on first use, retained for subsequent writes):
+
+```
+D:\resources\SK.xba       (Skeleton Key archive — downloaded from update server on demand)
+D:\resources\ENDGAME.xba  (ENDGAME archive — downloaded from update server on demand)
+D:\resources\tmp\         (temporary extraction directory — created and cleaned up per operation)
 ```
 
 ---

@@ -43,6 +43,7 @@
     <ClCompile Include="TempMonitor.cpp" />
     <ClCompile Include="Update.cpp" />
     <ClCompile Include="VideoInfo.cpp" />
+    <ClCompile Include="xba.cpp" />
     <ClCompile Include="XbSet.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -80,6 +81,7 @@
     <ClInclude Include="TempMonitor.h" />
     <ClInclude Include="Update.h" />
     <ClInclude Include="VideoInfo.h" />
+    <ClInclude Include="xba.h" />
     <ClInclude Include="XbSet.h" />
   </ItemGroup>
   <ItemGroup>
@@ -236,6 +238,7 @@ MKDIR "$(OutDir)XISO"
       <FixedBaseAddress>false</FixedBaseAddress>
       <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
       <AdditionalOptions>/ignore:4254 %(AdditionalOptions)</AdditionalOptions>
+      <StackReserveSize>1048576 </StackReserveSize>
     </Link>
     <PostBuildEvent>
       <Message>Creating Xbox Image...</Message>

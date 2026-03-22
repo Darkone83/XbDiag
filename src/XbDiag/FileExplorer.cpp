@@ -15,7 +15,7 @@
 //  [DPad Up/Dn]  Move cursor
 //  [LT / RT]     Page up / page down
 //  [Start]       Toggle FTP server on / off
-//  [Back+Black]  Format MU (at drive root, cursor on MU entry)
+//  [Back+Black]  Open MU Utilities card (Format / Skeleton Key / ENDGAME) when cursor is on a MU at root
 //
 // ===========================================================================
 // FTP server — bare minimum passive-mode only
@@ -93,6 +93,9 @@ bool      s_atRoot = true;
 char      s_path[MAX_PATH_LEN] = {};
 static bool s_skipFirstTick = true;
 static WORD s_prevBtns = 0;
+// Set true whenever a MU modal opens so the first input tick is consumed
+// before accepting [A]/[B] — prevents analog button re-assertion auto-fire.
+static bool s_muModalSkipInput = false;
 
 // ── New Folder via keyboard ────────────────────────────────────────────────
 static char s_mkdirBuf[MAX_NAME_LEN];
@@ -110,6 +113,31 @@ bool      s_muFormatPending = false;
 int       s_muFormatPort = -1;
 int       s_muFormatSlot = -1;
 char      s_muFormatLabel[16] = {};
+
+// MU Utilities card state
+enum MUCardItem { MUCARD_FORMAT = 0, MUCARD_SK, MUCARD_EG, MUCARD_COUNT };
+static bool s_muCardOpen = false;
+static int  s_muCardCursor = 0;
+
+// Skeleton Key / ENDGAME state (shared flow, s_skIsEndgame selects asset)
+enum SKState {
+    SK_NONE = 0,
+    SK_PROMPT_DOWNLOAD,   // .xba not present — ask to download
+    SK_DOWNLOADING,       // download in progress
+    SK_CONFIRM_CREATE,    // .xba present — confirm create on this MU
+    SK_CREATING,          // extract + format + copy in progress
+    SK_DONE,              // success
+    SK_ERROR              // something went wrong
+};
+static SKState s_skState = SK_NONE;
+static bool    s_skIsEndgame = false;  // false = Skeleton Key, true = ENDGAME
+static int     s_skPort = -1;
+static int     s_skSlot = -1;
+static char    s_skLabel[16] = {};
+static char    s_skMsg[128] = {};
+
+// Pointer to current frame's logo — set at start of Tick, used by SK_RenderPump
+static const DiagLogo* s_tickLogo = NULL;
 
 ClipboardEntry s_clipboard[MAX_CLIPBOARD] = {};
 int            s_clipCount = 0;
@@ -381,6 +409,16 @@ void FileExplorer_OnEnter()
     s_muFormatPort = -1;
     s_muFormatSlot = -1;
 
+    s_muCardOpen = false;
+    s_muCardCursor = 0;
+    s_muModalSkipInput = false;
+    s_skState = SK_NONE;
+    s_skIsEndgame = false;
+    s_skPort = -1;
+    s_skSlot = -1;
+    s_skLabel[0] = '\0';
+    s_skMsg[0] = '\0';
+
     // FTP off until [Start]
     ZeroMemory(&g_ftp, sizeof(g_ftp));
     g_ftp.listenSock = INVALID_SOCKET;
@@ -423,8 +461,8 @@ static void Render(const DiagLogo& logo)
         hints = "[Black] Paste  [White] Move here  [Back] Clear clipboard";
     else if (cursorOnMU)
         hints = g_ftp.state != FTP_OFF
-        ? "[A] Open  [B] Back  [Start] FTP Off  [Back+Black] Format MU"
-        : "[A] Open  [B] Back  [Start] FTP On   [Back+Black] Format MU";
+        ? "[A] Open  [B] Back  [Start] FTP Off  [Back+Black] MU Utilities"
+        : "[A] Open  [B] Back  [Start] FTP On   [Back+Black] MU Utilities";
     else if (g_ftp.state != FTP_OFF)
         hints = canLaunch ? "[A] Open  [B] Back  [X] Launch  [Y] Mark  [R3] New Folder  [Start] FTP Off"
         : "[A] Open  [B] Back  [Y] Mark  [R3] New Folder  [L3] View  [Start] FTP Off";
@@ -695,14 +733,14 @@ static void Render(const DiagLogo& logo)
         DrawText(LM, BOT_BAR_Y - 16.f, clipLine, 1.05f, COL_CYAN);
     }
 
-    // ---- MU format hint — shown when a MU entry is selected at root -------
-    if (s_atRoot && s_entryCount > 0 && !s_muFormatPending)
+    // ---- MU Utilities hint — shown when a MU entry is selected at root ------
+    if (s_atRoot && s_entryCount > 0 && !s_muFormatPending && !s_muCardOpen)
     {
         const FileEntry& ce = s_entries[s_cursor];
         if (ce.isDir && ce.sizeLow >= (DWORD)'A' && ce.sizeLow <= (DWORD)'H')
         {
             DrawText(LM, BOT_BAR_Y - 16.f,
-                "[Back+Black] Format Memory Unit",
+                "[Back+Black] MU Utilities",
                 1.0f, D3DCOLOR_XRGB(180, 100, 30));
         }
     }
@@ -728,8 +766,189 @@ static void Render(const DiagLogo& logo)
         DrawText(CX + 10.f, CY + 74.f, "[A] Format    [B] Cancel", 1.1f, COL_WHITE);
     }
 
+    // ---- MU Utilities card -----------------------------------------------
+    if (s_muCardOpen && !s_muFormatPending)
+    {
+        FillRect(0.f, 0.f, SW, SH, D3DCOLOR_ARGB(160, 0, 0, 0));
+
+        const float CW = 300.f, CH = 136.f;
+        const float CX = (SW - CW) * 0.5f, CY = (SH - CH) * 0.5f;
+        const float ROW = 28.f;
+        const float PADY = 36.f;
+
+        FillRect(CX, CY, CX + CW, CY + CH, D3DCOLOR_XRGB(14, 17, 38));
+        HLine(CY, CX, CX + CW, COL_CYAN);
+        HLine(CY + CH, CX, CX + CW, COL_BORDER);
+        VLine(CX, CY, CY + CH, COL_BORDER);
+        VLine(CX + CW, CY, CY + CH, COL_BORDER);
+
+        DrawText(CX + 10.f, CY + 8.f, "MU UTILITIES", 1.3f, COL_CYAN);
+        DrawText(CX + 10.f, CY + 22.f, s_muFormatLabel, 1.05f, COL_YELLOW);
+
+        static const char* k_cardLabels[MUCARD_COUNT] = {
+            "Format",
+            "Create Skeleton Key",
+            "Create ENDGAME"
+        };
+
+        for (int i = 0; i < MUCARD_COUNT; ++i)
+        {
+            float iy = CY + PADY + (float)i * ROW;
+            if (i == s_muCardCursor)
+                FillRect(CX + 4.f, iy - 1.f, CX + CW - 4.f, iy + ROW - 4.f,
+                    D3DCOLOR_XRGB(30, 50, 120));
+            DrawText(CX + 14.f, iy + 4.f, k_cardLabels[i], 1.1f,
+                i == s_muCardCursor ? COL_WHITE : COL_GRAY);
+        }
+
+        DrawText(CX + 10.f, CY + CH - 16.f,
+            "[A] Select    [B] Cancel", 1.0f, COL_DIM);
+    }
+
+    // ---- Skeleton Key overlay --------------------------------------------
+    if (s_skState != SK_NONE)
+    {
+        FillRect(0.f, 0.f, SW, SH, D3DCOLOR_ARGB(160, 0, 0, 0));
+
+        const float CW = 400.f, CH = 180.f;
+        const float CX = (SW - CW) * 0.5f, CY = (SH - CH) * 0.5f;
+        // Bottom-anchored progress bar region: 10px bar + 14px label, 12px bottom padding
+        const float BAR_H = 10.f;
+        const float BAR_BOT = CY + CH - 12.f;          // bottom border of bar
+        const float BAR_TOP = BAR_BOT - BAR_H;          // top border of bar
+        const float LBL_Y = BAR_TOP - 14.f;           // "Files: N" / "X / Y KB" label
+        const float BX = CX + 10.f;
+        const float BW = CW - 20.f;
+        FillRect(CX, CY, CX + CW, CY + CH, D3DCOLOR_XRGB(14, 17, 38));
+        HLine(CY, CX, CX + CW, COL_CYAN);
+        HLine(CY + CH, CX, CX + CW, COL_BORDER);
+        VLine(CX, CY, CY + CH, COL_BORDER);
+        VLine(CX + CW, CY, CY + CH, COL_BORDER);
+
+        DrawText(CX + 10.f, CY + 8.f,
+            s_skIsEndgame ? "ENDGAME" : "SKELETON KEY", 1.3f, COL_CYAN);
+        DrawText(CX + 10.f, CY + 28.f, s_skLabel, 1.1f, COL_YELLOW);
+
+        if (s_skState == SK_PROMPT_DOWNLOAD)
+        {
+            DrawText(CX + 10.f, CY + 52.f,
+                s_skIsEndgame
+                ? "ENDGAME.xba not found. Download from server?"
+                : "SK.xba not found. Download from server?",
+                1.05f, COL_WHITE);
+            DrawText(CX + 10.f, CY + 72.f, "[A] Download    [B] Cancel", 1.1f, COL_WHITE);
+        }
+        else if (s_skState == SK_DOWNLOADING)
+        {
+            DrawText(CX + 10.f, CY + 52.f,
+                s_skIsEndgame ? "Downloading ENDGAME.xba..." : "Downloading SK.xba...",
+                1.1f, COL_GRAY);
+            // Byte count label above the bar
+            {
+                char szBuf[32];
+                char done[12], total[12];
+                IntToStr((int)(g_skProgressDone / 1024), done, sizeof(done));
+                IntToStr((int)(g_skProgressTotal / 1024), total, sizeof(total));
+                StrCopy(szBuf, sizeof(szBuf), done);
+                StrCat2(szBuf, sizeof(szBuf), szBuf, " / ");
+                StrCat2(szBuf, sizeof(szBuf), szBuf, total);
+                StrCat2(szBuf, sizeof(szBuf), szBuf, " KB");
+                DrawText(BX, LBL_Y, szBuf, 1.0f, COL_DIM);
+            }
+            // Progress bar — bottom-anchored
+            {
+                float frac = (g_skProgressTotal > 0)
+                    ? (float)g_skProgressDone / (float)g_skProgressTotal : 0.f;
+                if (frac > 1.f) frac = 1.f;
+                FillRect(BX, BAR_TOP, BX + BW, BAR_BOT, D3DCOLOR_XRGB(14, 17, 38));
+                if (frac > 0.f)
+                    FillRectGrad(BX, BAR_TOP, BX + BW * frac, BAR_BOT,
+                        D3DCOLOR_XRGB(40, 160, 255), D3DCOLOR_XRGB(20, 100, 200));
+                HLine(BAR_TOP, BX, BX + BW, COL_BORDER);
+                HLine(BAR_BOT, BX, BX + BW, COL_BORDER);
+            }
+        }
+        else if (s_skState == SK_CONFIRM_CREATE)
+        {
+            DrawText(CX + 10.f, CY + 52.f,
+                s_skIsEndgame
+                ? "Format MU and write ENDGAME?"
+                : "Format MU and write Skeleton Key?",
+                1.05f, COL_WHITE);
+            DrawText(CX + 10.f, CY + 70.f, "All MU data will be erased!", 1.05f, COL_GRAY);
+            DrawText(CX + 10.f, CY + 96.f, "[A] Create    [B] Cancel", 1.1f, COL_WHITE);
+        }
+        else if (s_skState == SK_CREATING)
+        {
+            DrawText(CX + 10.f, CY + 52.f,
+                s_skIsEndgame ? "Creating ENDGAME MU..." : "Creating Skeleton Key...",
+                1.1f, COL_GRAY);
+            // "N / M files" label above the bar
+            {
+                char fBuf[32]; char fa[8], fb[8];
+                IntToStr(g_skFilesDone, fa, sizeof(fa));
+                IntToStr(g_skFilesTotal, fb, sizeof(fb));
+                StrCopy(fBuf, sizeof(fBuf), fa);
+                StrCat2(fBuf, sizeof(fBuf), fBuf, " / ");
+                StrCat2(fBuf, sizeof(fBuf), fBuf, fb);
+                StrCat2(fBuf, sizeof(fBuf), fBuf, " files");
+                DrawText(BX, LBL_Y, fBuf, 1.0f, COL_DIM);
+            }
+            // File count progress bar — bottom-anchored
+            {
+                float frac = (g_skFilesTotal > 0)
+                    ? (float)g_skFilesDone / (float)g_skFilesTotal : 0.f;
+                if (frac > 1.f) frac = 1.f;
+                FillRect(BX, BAR_TOP, BX + BW, BAR_BOT, D3DCOLOR_XRGB(14, 17, 38));
+                if (frac > 0.f)
+                    FillRectGrad(BX, BAR_TOP, BX + BW * frac, BAR_BOT,
+                        D3DCOLOR_XRGB(40, 200, 80), D3DCOLOR_XRGB(20, 120, 40));
+                HLine(BAR_TOP, BX, BX + BW, COL_BORDER);
+                HLine(BAR_BOT, BX, BX + BW, COL_BORDER);
+            }
+        }
+        else if (s_skState == SK_DONE)
+        {
+            DrawText(CX + 10.f, CY + 52.f,
+                s_skIsEndgame ? "ENDGAME MU created!" : "Skeleton Key created!",
+                1.15f, COL_GREEN);
+            DrawText(CX + 10.f, CY + 76.f, "[B] Close", 1.1f, COL_WHITE);
+        }
+        else if (s_skState == SK_ERROR)
+        {
+            // Split at ': ' if present to show type on line 1, detail on line 2
+            const char* detail = NULL;
+            char line1[64]; StrCopy(line1, sizeof(line1), s_skMsg);
+            int mi = 0;
+            while (s_skMsg[mi] && !(s_skMsg[mi] == ':' && s_skMsg[mi + 1] == ' ')) ++mi;
+            if (s_skMsg[mi] == ':')
+            {
+                line1[mi] = '\0';
+                detail = s_skMsg + mi + 2;
+            }
+            DrawText(CX + 10.f, CY + 52.f, line1, 1.05f, COL_RED);
+            if (detail && detail[0])
+                DrawText(CX + 10.f, CY + 70.f, detail, 1.0f, COL_ORANGE);
+            DrawText(CX + 10.f, CY + 100.f, "[B] Close", 1.1f, COL_WHITE);
+        }
+    }
+
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
+}
+
+// ============================================================================
+// SK_RenderPump — called from FileExplorerMU during blocking SK operations
+// ============================================================================
+
+static void SK_RenderPump()
+{
+    // Mirror Update.cpp: call Render() directly — it owns BeginScene/EndScene/Present.
+    // Called from inside blocking SK operations (download, extract, copy).
+    // The natural pace of recv()/WriteFile()/ReadFile() throttles frame rate
+    // without any explicit timer needed.
+    if (!s_tickLogo) return;
+    Render(*s_tickLogo);
 }
 
 // ============================================================================
@@ -738,6 +957,7 @@ static void Render(const DiagLogo& logo)
 
 void FileExplorer_Tick(const DiagLogo& logo)
 {
+    s_tickLogo = &logo;
     // Service FTP and file ops every tick regardless of input skip
     FtpServ_Tick();
     FE_Ops_Tick();
@@ -791,6 +1011,13 @@ void FileExplorer_Tick(const DiagLogo& logo)
     // ---- MU format confirm modal — intercepts all input while active -------
     if (s_muFormatPending)
     {
+        if (s_muModalSkipInput)
+        {
+            s_muModalSkipInput = false;
+            s_prevBtns = cur;
+            Render(logo);
+            return;
+        }
         if (FE_EdgeDown(cur, s_prevBtns, BTN_A))
         {
             s_muFormatPending = false;
@@ -798,11 +1025,154 @@ void FileExplorer_Tick(const DiagLogo& logo)
             LoadDriveList();
             s_cursor = 0;
             s_scroll = 0;
+            // Mask [A] so the next card open doesn't inherit this press.
+            s_prevBtns = cur & ~BTN_A;
+            Render(logo);
+            return;
         }
         else if (FE_EdgeDown(cur, s_prevBtns, BTN_B))
         {
             s_muFormatPending = false;
+            // Mask [B] so it doesn't also trigger go-up on the same edge.
+            s_prevBtns = cur & ~BTN_B;
+            Render(logo);
+            return;
         }
+        s_prevBtns = cur;
+        Render(logo);
+        return;
+    }
+
+    // ---- MU Utilities card modal — intercepts all input while open ----------
+    if (s_muCardOpen)
+    {
+        if (s_muModalSkipInput)
+        {
+            s_muModalSkipInput = false;
+            s_prevBtns = cur;
+            Render(logo);
+            return;
+        }
+        if (FE_EdgeDown(cur, s_prevBtns, BTN_DPAD_UP))
+        {
+            if (s_muCardCursor > 0) s_muCardCursor--;
+        }
+        else if (FE_EdgeDown(cur, s_prevBtns, BTN_DPAD_DOWN))
+        {
+            if (s_muCardCursor < MUCARD_COUNT - 1) s_muCardCursor++;
+        }
+        else if (FE_EdgeDown(cur, s_prevBtns, BTN_A))
+        {
+            s_muCardOpen = false;
+            if (s_muCardCursor == MUCARD_FORMAT)
+            {
+                s_muFormatPending = true;
+            }
+            else
+            {
+                // MUCARD_SK or MUCARD_EG — enter the shared SK/EG flow
+                s_skIsEndgame = (s_muCardCursor == MUCARD_EG);
+                s_skMsg[0] = '\0';
+                if (s_skIsEndgame)
+                    s_skState = FE_MU_EGXbaPresent() ? SK_CONFIRM_CREATE : SK_PROMPT_DOWNLOAD;
+                else
+                    s_skState = FE_MU_SKXbaPresent() ? SK_CONFIRM_CREATE : SK_PROMPT_DOWNLOAD;
+            }
+            // Mask [A] from s_prevBtns so whichever modal opens next doesn't
+            // inherit this press and fire immediately on the same edge.
+            // Also set skip so the new modal burns one tick before accepting input
+            // — analog [A] re-asserts while still physically held.
+            s_muModalSkipInput = true;
+            s_prevBtns = cur & ~BTN_A;
+            Render(logo);
+            return;
+        }
+        else if (FE_EdgeDown(cur, s_prevBtns, BTN_B))
+        {
+            s_muCardOpen = false;
+        }
+        s_prevBtns = cur;
+        Render(logo);
+        return;
+    }
+
+    if (s_skState != SK_NONE)
+    {
+        if (s_muModalSkipInput)
+        {
+            s_muModalSkipInput = false;
+            s_prevBtns = cur;
+            Render(logo);
+            return;
+        }
+        if (s_skState == SK_PROMPT_DOWNLOAD)
+        {
+            if (FE_EdgeDown(cur, s_prevBtns, BTN_A))
+            {
+                s_skState = SK_DOWNLOADING;
+                s_prevBtns = cur;
+                // Show downloading frame then pump during blocking call
+                Render(logo);
+
+                g_skRenderFn = SK_RenderPump;
+                bool ok = s_skIsEndgame
+                    ? FE_MU_DownloadEG(s_skMsg, sizeof(s_skMsg))
+                    : FE_MU_DownloadSK(s_skMsg, sizeof(s_skMsg));
+                g_skRenderFn = NULL;
+                if (ok)
+                    s_skState = SK_CONFIRM_CREATE;
+                else
+                    s_skState = SK_ERROR;
+            }
+            else if (FE_EdgeDown(cur, s_prevBtns, BTN_B))
+            {
+                s_skState = SK_NONE;
+                s_prevBtns = cur & ~BTN_B;
+                Render(logo);
+                return;
+            }
+        }
+        else if (s_skState == SK_CONFIRM_CREATE)
+        {
+            if (FE_EdgeDown(cur, s_prevBtns, BTN_A))
+            {
+                s_skState = SK_CREATING;
+                s_prevBtns = cur;
+                // Show creating frame then pump during blocking call
+                Render(logo);
+
+                g_skRenderFn = SK_RenderPump;
+                bool ok = s_skIsEndgame
+                    ? FE_MU_CreateEG(s_skPort, s_skSlot, s_skMsg, sizeof(s_skMsg))
+                    : FE_MU_CreateSK(s_skPort, s_skSlot, s_skMsg, sizeof(s_skMsg));
+                g_skRenderFn = NULL;
+                s_skState = ok ? SK_DONE : SK_ERROR;
+                if (ok)
+                {
+                    LoadDriveList();
+                    s_cursor = 0; s_scroll = 0;
+                }
+            }
+            else if (FE_EdgeDown(cur, s_prevBtns, BTN_B))
+            {
+                s_skState = SK_NONE;
+                s_prevBtns = cur & ~BTN_B;
+                Render(logo);
+                return;
+            }
+        }
+        else if (s_skState == SK_DONE || s_skState == SK_ERROR)
+        {
+            if (FE_EdgeDown(cur, s_prevBtns, BTN_B))
+            {
+                s_skState = SK_NONE;
+                // Mask [B] so it doesn't also fire go-up in the main flow.
+                s_prevBtns = cur & ~BTN_B;
+                Render(logo);
+                return;
+            }
+        }
+        // SK_DOWNLOADING and SK_CREATING are blocking — no input processed.
         s_prevBtns = cur;
         Render(logo);
         return;
@@ -877,8 +1247,12 @@ void FileExplorer_Tick(const DiagLogo& logo)
                 if (s_pickEntryCount > 0)
                 {
                     FileEntry& pe = s_pickEntries[s_pickCursor];
+                    // MU entries store the drive letter in sizeLow (A-H);
+                    // HDD entries have sizeLow==0 so fall back to name[0].
+                    char driveLetter = (pe.sizeLow >= (DWORD)'A' && pe.sizeLow <= (DWORD)'H')
+                        ? (char)pe.sizeLow : pe.name[0];
                     char drivePath[8];
-                    drivePath[0] = pe.name[0]; drivePath[1] = ':';
+                    drivePath[0] = driveLetter; drivePath[1] = ':';
                     drivePath[2] = '\\'; drivePath[3] = '\0';
                     FE_Ops_PickLoadDir(drivePath);
                     s_pickCursor = 0;
@@ -916,8 +1290,13 @@ void FileExplorer_Tick(const DiagLogo& logo)
             char driveFallback[8];
             if (s_pickAtRoot && s_pickEntryCount > 0)
             {
-                // At root — use the selected drive as destination
-                driveFallback[0] = s_pickEntries[s_pickCursor].name[0];
+                // At root — use the selected drive as destination.
+                // MU entries store the drive letter in sizeLow (A-H);
+                // HDD entries have sizeLow==0 so fall back to name[0].
+                FileEntry& pe = s_pickEntries[s_pickCursor];
+                char driveLetter = (pe.sizeLow >= (DWORD)'A' && pe.sizeLow <= (DWORD)'H')
+                    ? (char)pe.sizeLow : pe.name[0];
+                driveFallback[0] = driveLetter;
                 driveFallback[1] = ':'; driveFallback[2] = '\\'; driveFallback[3] = '\0';
                 destPath = driveFallback;
             }
@@ -963,20 +1342,29 @@ void FileExplorer_Tick(const DiagLogo& logo)
         return;
     }
 
-    // [Back+Black] on a MU entry at root — prompt to format
+    // [Back+Black] on a MU entry at root — open MU Utilities card
     if (s_atRoot && (cur & BTN_BACK) && FE_EdgeDown(cur, s_prevBtns, BTN_BLACK))
     {
         if (s_entryCount > 0)
         {
             FileEntry& e = s_entries[s_cursor];
-            // MU entries store their drive letter in sizeLow (A-H range)
             if (e.isDir && e.sizeLow >= (DWORD)'A' && e.sizeLow <= (DWORD)'H')
             {
                 int mu = (int)(e.sizeLow - 'A');
                 s_muFormatPort = mu / 2;
                 s_muFormatSlot = mu % 2;
+                s_skPort = mu / 2;
+                s_skSlot = mu % 2;
                 StrCopy(s_muFormatLabel, sizeof(s_muFormatLabel), e.name);
-                s_muFormatPending = true;
+                StrCopy(s_skLabel, sizeof(s_skLabel), e.name);
+                s_muCardCursor = 0;
+                s_muCardOpen = true;
+                s_muModalSkipInput = true;
+                // Mask Back+Black out of s_prevBtns so neither button is seen
+                // as held when the card modal processes input on the next tick.
+                s_prevBtns = cur & ~(BTN_BACK | BTN_BLACK);
+                Render(logo);
+                return;
             }
         }
     }

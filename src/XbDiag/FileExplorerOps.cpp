@@ -20,11 +20,12 @@ static void PickLoadDriveList()
     s_pickAtRoot = true;
     s_pickPath[0] = '\0';
 
-    const char* drives[] = { "C", "D", "E", "F", "G", "X", "Y", "Z" };
+    // HDD drives — probe with FindFirstFile (same as main browser)
+    const char* hddDrives[] = { "C", "D", "E", "F", "G", "X", "Y", "Z" };
     for (int d = 0; d < 8 && s_pickEntryCount < MAX_ENTRIES; ++d)
     {
         char pattern[8];
-        pattern[0] = drives[d][0]; pattern[1] = ':'; pattern[2] = '\\';
+        pattern[0] = hddDrives[d][0]; pattern[1] = ':'; pattern[2] = '\\';
         pattern[3] = '*'; pattern[4] = '\0';
 
         WIN32_FIND_DATA fd;
@@ -33,9 +34,32 @@ static void PickLoadDriveList()
         {
             FindClose(h);
             FileEntry& e = s_pickEntries[s_pickEntryCount++];
-            e.name[0] = drives[d][0]; e.name[1] = ':'; e.name[2] = '\0';
+            e.name[0] = hddDrives[d][0]; e.name[1] = ':'; e.name[2] = '\0';
             e.isDir = true;
             e.sizeLow = 0;
+        }
+    }
+
+    // Memory Units — use GetFileAttributesA on root (FindFirstFile fails on
+    // empty MUs).  Drive letter stored in sizeLow so the picker can open it.
+    // Labels mirror the main browser so the user sees "P1 MMU1" etc.
+    static const char* k_muLabels[8] = {
+        "P1 MMU1", "P1 MMU2",
+        "P2 MMU1", "P2 MMU2",
+        "P3 MMU1", "P3 MMU2",
+        "P4 MMU1", "P4 MMU2",
+    };
+    for (int mu = 0; mu < 8 && s_pickEntryCount < MAX_ENTRIES; ++mu)
+    {
+        char muRoot[8];
+        muRoot[0] = 'A' + (char)mu; muRoot[1] = ':'; muRoot[2] = '\\'; muRoot[3] = '\0';
+        DWORD attr = GetFileAttributesA(muRoot);
+        if (attr != 0xFFFFFFFF && (attr & FILE_ATTRIBUTE_DIRECTORY))
+        {
+            FileEntry& e = s_pickEntries[s_pickEntryCount++];
+            StrCopy(e.name, sizeof(e.name), k_muLabels[mu]);
+            e.isDir = true;
+            e.sizeLow = (DWORD)('A' + mu);  // drive letter for picker navigation
         }
     }
 }
