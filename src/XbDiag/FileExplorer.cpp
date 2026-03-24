@@ -958,8 +958,8 @@ static void SK_RenderPump()
 void FileExplorer_Tick(const DiagLogo& logo)
 {
     s_tickLogo = &logo;
-    // Service FTP and file ops every tick regardless of input skip
-    FtpServ_Tick();
+    // Service file ops every tick regardless of input skip.
+    // FtpServ_Tick is now called from the main loop so it runs across all screens.
     FE_Ops_Tick();
 
     // Keyboard and FileViewer intercept all input while open

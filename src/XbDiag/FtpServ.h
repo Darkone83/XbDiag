@@ -52,6 +52,7 @@ struct FtpCtx
     bool     authed;
     bool     gotUser;
     bool     atVirtualRoot;
+    bool     ctrlHalfClosed;  // peer shut down write side; drain sendBuf then disconnect
 
     char     cwd[256];
 
@@ -79,6 +80,9 @@ struct FtpCtx
     bool     listPending;
     bool     listVirtualRoot;
     char     listDir[256];
+
+    bool     retrPending;     // RETR open done; waiting for dataSock before sending 150
+    bool     storPending;     // STOR open done; waiting for dataSock before sending 150
 
     char     listBuf[65536];
     int      listBufLen;

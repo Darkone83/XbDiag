@@ -267,7 +267,7 @@ void FtpServ_Start(const char* ipStr, bool ipOK)
     sa.sin_port = htons(FTP_CTRL_PORT);
 
     if (bind(g_ftp.listenSock, (SOCKADDR*)&sa, sizeof(sa)) != 0 ||
-        listen(g_ftp.listenSock, 1) != 0)
+        listen(g_ftp.listenSock, 5) != 0)
     {
         closesocket(g_ftp.listenSock);
         g_ftp.listenSock = INVALID_SOCKET;
@@ -740,9 +740,18 @@ static void FtpHandleCommand(char* cmd)
         g_ftp.retrBufOff = 0;
         FtpServ_TruncName(arg, g_ftp.xferName, 18, sizeof(g_ftp.xferName));
         StrCopy(g_ftp.xferPath, sizeof(g_ftp.xferPath), fullPath);
-        FtpReply(150, "Opening data connection.");
+        // Defer 150 until dataSock is accepted — mirrors LIST's listPending pattern.
+        // Sending 150 before the data connection exists starts the client's transfer
+        // timeout prematurely; on back-to-back transfers the port may not be ready yet.
+        g_ftp.retrPending = true;
         g_ftp.xferType = XFER_RETR;
-        g_ftp.state = FTP_TRANSFER;
+        // Do not set FTP_TRANSFER yet — tick promotes state when dataSock accepted
+        if (g_ftp.dataSock != INVALID_SOCKET)
+        {
+            FtpReply(150, "Opening data connection.");
+            g_ftp.retrPending = false;
+            g_ftp.state = FTP_TRANSFER;
+        }
     }
     else if (verb[0] == 'S' && verb[1] == 'T' && verb[2] == 'O' && verb[3] == 'R')
     {
@@ -766,9 +775,16 @@ static void FtpHandleCommand(char* cmd)
         g_ftp.xferDone = 0;
         FtpServ_TruncName(arg, g_ftp.xferName, 18, sizeof(g_ftp.xferName));
         StrCopy(g_ftp.xferPath, sizeof(g_ftp.xferPath), fullPath);
-        FtpReply(150, "Opening data connection.");
+        // Defer 150 until dataSock is accepted — same pattern as RETR/LIST.
+        g_ftp.storPending = true;
         g_ftp.xferType = XFER_STOR;
-        g_ftp.state = FTP_TRANSFER;
+        // Do not set FTP_TRANSFER yet — tick promotes state when dataSock accepted
+        if (g_ftp.dataSock != INVALID_SOCKET)
+        {
+            FtpReply(150, "Opening data connection.");
+            g_ftp.storPending = false;
+            g_ftp.state = FTP_TRANSFER;
+        }
     }
     else if (verb[0] == 'Q' && verb[1] == 'U' && verb[2] == 'I' && verb[3] == 'T')
     {
@@ -785,7 +801,10 @@ static void FtpHandleCommand(char* cmd)
         g_ftp.gotUser = false;
         g_ftp.gotRnfr = false;
         g_ftp.atVirtualRoot = false;
+        g_ftp.ctrlHalfClosed = false;
         g_ftp.listPending = false;
+        g_ftp.retrPending = false;
+        g_ftp.storPending = false;
         g_ftp.xferType = XFER_NONE;
         g_ftp.recvLen = 0;
         g_ftp.listBufLen = 0;
@@ -1037,6 +1056,7 @@ void FtpServ_Tick()
             if (g_ftp.dataListen != INVALID_SOCKET) { closesocket(g_ftp.dataListen); g_ftp.dataListen = INVALID_SOCKET; }
             g_ftp.authed = false; g_ftp.gotUser = false; g_ftp.gotRnfr = false;
             g_ftp.atVirtualRoot = false; g_ftp.listPending = false;
+            g_ftp.ctrlHalfClosed = false; g_ftp.retrPending = false; g_ftp.storPending = false;
             g_ftp.xferType = XFER_NONE; g_ftp.recvLen = 0;
             g_ftp.retrBufLen = 0; g_ftp.retrBufOff = 0;
             g_ftp.listBufLen = 0; g_ftp.listBufOff = 0;
@@ -1059,6 +1079,7 @@ void FtpServ_Tick()
             g_ftp.gotUser = false;
             g_ftp.gotRnfr = false;
             g_ftp.atVirtualRoot = false;
+            g_ftp.ctrlHalfClosed = false;
             g_ftp.xferType = XFER_NONE;
             g_ftp.recvLen = 0;
             g_ftp.state = FTP_CONNECTED;
@@ -1071,8 +1092,15 @@ void FtpServ_Tick()
             FtpSendStr(g_ftp.ctrlSock, "220-Credentials : xbox / xbox\r\n");
             FtpSendStr(g_ftp.ctrlSock, "220-Mode        : Passive (PASV) only\r\n");
             FtpSendStr(g_ftp.ctrlSock, "220 Ready.\r\n");
+            // Fall through — don't return. The send-drain at the top of the
+            // next-tick pass needs the banner to be flushed promptly. Returning
+            // here would defer it one full frame on every new connection.
         }
-        return;
+        else
+        {
+            // No pending connection this tick — nothing else to do in LISTEN state.
+            return;
+        }
     }
 
     // ---- Accept passive data connection ----------------------------------
@@ -1098,6 +1126,20 @@ void FtpServ_Tick()
             // If a LIST was waiting for a data connection, execute it now
             if (g_ftp.listPending)
                 FtpDoListing();
+
+            // If a RETR or STOR was waiting, send the deferred 150 now
+            if (g_ftp.retrPending)
+            {
+                FtpReply(150, "Opening data connection.");
+                g_ftp.retrPending = false;
+                g_ftp.state = FTP_TRANSFER;
+            }
+            else if (g_ftp.storPending)
+            {
+                FtpReply(150, "Opening data connection.");
+                g_ftp.storPending = false;
+                g_ftp.state = FTP_TRANSFER;
+            }
         }
     }
 
@@ -1111,6 +1153,21 @@ void FtpServ_Tick()
         FtpDoListing();
     }
 
+    // Deferred RETR/STOR 150: dataSock just became available — send 150 now and
+    // promote to FTP_TRANSFER so the data pump engages this tick.
+    if (g_ftp.retrPending && g_ftp.dataSock != INVALID_SOCKET)
+    {
+        FtpReply(150, "Opening data connection.");
+        g_ftp.retrPending = false;
+        g_ftp.state = FTP_TRANSFER;
+    }
+    if (g_ftp.storPending && g_ftp.dataSock != INVALID_SOCKET)
+    {
+        FtpReply(150, "Opening data connection.");
+        g_ftp.storPending = false;
+        g_ftp.state = FTP_TRANSFER;
+    }
+
     // ---- Control socket: receive and command dispatch --------------------
     if ((g_ftp.state == FTP_CONNECTED || g_ftp.state == FTP_TRANSFER) &&
         g_ftp.ctrlSock != INVALID_SOCKET)
@@ -1118,15 +1175,27 @@ void FtpServ_Tick()
         // Always try to recv — don't gate on send buffer fullness.
         // A 8KB send buffer gives enough headroom; pausing recv causes
         // FileZilla to time out waiting for command acknowledgement.
+        //
+        // recv == 0 is a TCP half-close: the peer (FileZilla) shut down its write
+        // side after its last command but still expects our pending replies (e.g.
+        // 226 Transfer complete) on the ctrl socket.  Set ctrlHalfClosed and stop
+        // reading; the send-drain at the top of tick will flush the buffer, and we
+        // tear down only once it is empty.  Treating half-close as a hard error was
+        // the root cause of random FileZilla disconnects before 226 was delivered.
         {
             int space = (int)sizeof(g_ftp.recvBuf) - g_ftp.recvLen - 1;
-            if (space > 0)
+            if (space > 0 && !g_ftp.ctrlHalfClosed)
             {
                 int n = recv(g_ftp.ctrlSock,
                     g_ftp.recvBuf + g_ftp.recvLen, space, 0);
                 if (n > 0) g_ftp.recvLen += n;
-                else if (n == 0 || (n < 0 && WSAGetLastError() != WSAEWOULDBLOCK))
-                    goto ctrl_disconnect;
+                else if (n == 0)
+                {
+                    // Graceful half-close — stop receiving, keep sending
+                    g_ftp.ctrlHalfClosed = true;
+                }
+                else if (WSAGetLastError() != WSAEWOULDBLOCK)
+                    goto ctrl_disconnect;  // hard socket error
             }
             else
             {
@@ -1169,6 +1238,12 @@ void FtpServ_Tick()
                 buf[remaining] = '\0';
             }
         }
+        // Half-close teardown: peer shut write side; once our send buffer is fully
+        // drained (all replies delivered) we can close the session cleanly.
+        // We do NOT dispatch any further commands once ctrlHalfClosed is set.
+        if (g_ftp.ctrlHalfClosed && g_ftp.sendLen == g_ftp.sendOff)
+            goto ctrl_disconnect;
+
         goto skip_ctrl_disconnect;
 
     ctrl_disconnect:
@@ -1185,7 +1260,10 @@ void FtpServ_Tick()
             g_ftp.gotUser = false;
             g_ftp.gotRnfr = false;
             g_ftp.atVirtualRoot = false;
+            g_ftp.ctrlHalfClosed = false;
             g_ftp.listPending = false;
+            g_ftp.retrPending = false;
+            g_ftp.storPending = false;
             g_ftp.xferType = XFER_NONE;
             g_ftp.recvLen = 0;
             g_ftp.retrBufLen = 0;
@@ -1267,7 +1345,7 @@ void FtpServ_Tick()
                     else if (sent < 0)
                     {
                         if (WSAGetLastError() == WSAEWOULDBLOCK)
-                            continue;  // TCP send buffer full — spin within time budget
+                            break;  // TCP send buffer full — yield to next tick
                         // Hard error
                         closesocket(g_ftp.dataSock); g_ftp.dataSock = INVALID_SOCKET;
                         CloseHandle(g_ftp.xferFile); g_ftp.xferFile = INVALID_HANDLE_VALUE;

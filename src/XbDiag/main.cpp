@@ -34,6 +34,7 @@
 #include "ControllerTest.h"
 #include "StressTest.h"
 #include "FileExplorer.h"
+#include "FtpServ.h"
 #include "XbSet.h"
 #include "Update.h"
 #include "lcd.h"
@@ -430,5 +431,12 @@ void __cdecl main()
             LCD_Tick(cur, g_lcdPrevBtns);
             g_lcdPrevBtns = cur;
         }
+
+        // FTP server tick runs every frame regardless of app state.
+        // FtpServ_Tick is a no-op when g_ftp.state == FTP_OFF, so this
+        // costs nothing when the server is not running. Keeping it here
+        // ensures the listen socket accepts connections and keepalive NOOPs
+        // are serviced even when the user has navigated away from FileExplorer.
+        FtpServ_Tick();
     }
 }
