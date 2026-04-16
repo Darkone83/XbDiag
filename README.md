@@ -554,6 +554,23 @@ Allocates the largest available contiguous block per bank and runs 11-phase movi
 | 10/11 | WRITE stride-31 — addr XOR `0xBAADF00D` |
 | 11/11 | READ stride-31 — verify |
 
+### GPU Stress `[Right]` from RAM card
+
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/Stress_GPU.png">
+</div>
+
+Runs the **Crystalline Grotto** scene as a continuous NV2A GPU workload — ~454K triangle submissions per frame across 16 DOT3 bump-map and cubemap reflection passes, a textured cave mesh drawn three times, and 120 billboarded fog quads. Scene loops every 20 seconds until aborted.
+
+A live overlay shows elapsed time, loop count, FPS, peak FPS, min FPS, CPU temperature, and fan speed throughout the run.
+
+Requires `crystal_n.dds`, `crystal_cube.dds`, and `rock.dds` in `D:\tex\` — included in the release package.
+
+| Button | Action |
+|--------|--------|
+| `[A]` | Start (confirm with LT+RT) |
+| `[Back]+[A]` hold 5s | Abort |
+
 ### Thermal Auto-Abort
 
 Adjustable in 5°C steps before starting. If the hottest sensor (CPU die or board) reaches the threshold, the test halts immediately and the result is flagged as a thermal abort.

@@ -221,7 +221,7 @@ static void LoadDriveList()
         int port = mu / 2, slot = mu % 2;
         if (!IsMUPresent(port, slot)) continue;
         char muPat[8];
-        muPat[0] = 'A' + (char)mu; muPat[1] = ':'; muPat[2] = '\\';
+        muPat[0] = FE_MU_Letter(port, slot); muPat[1] = ':'; muPat[2] = '\\';
         muPat[3] = '\0';
         // Use GetFileAttributesA on the root — succeeds even on empty MUs.
         // FindFirstFile("X:\\*") fails on empty volumes, so don't use it here.
@@ -231,7 +231,7 @@ static void LoadDriveList()
             FileEntry& e = s_entries[s_entryCount++];
             StrCopy(e.name, sizeof(e.name), k_muLabels[mu]);
             e.isDir = true;
-            e.sizeLow = (DWORD)('A' + mu);  // drive letter stored for open
+            e.sizeLow = (DWORD)(200 + mu);  // mu index offset — not a drive letter, not a file size
         }
     }
 }
@@ -445,10 +445,10 @@ static void Render(const DiagLogo& logo)
         !s_entries[s_cursor].isDir &&
         FE_IsXBE(s_entries[s_cursor].name) &&
         s_markedCount == 0;
-    // Check if cursor is on a MU entry at root (sizeLow A-H)
+    // Check if cursor is on a MU entry at root (sizeLow 200-207 = mu index offset)
     bool cursorOnMU = s_atRoot && s_entryCount > 0 &&
-        s_entries[s_cursor].sizeLow >= (DWORD)'A' &&
-        s_entries[s_cursor].sizeLow <= (DWORD)'H';
+        s_entries[s_cursor].sizeLow >= 200 &&
+        s_entries[s_cursor].sizeLow <= 207;
     if (s_fosState == FOS_CONFIRM_DELETE)
         hints = "[B] Confirm Delete  [Back] Cancel";
     else if (s_fosState == FOS_CONFIRM_OVERWRITE)
@@ -737,7 +737,7 @@ static void Render(const DiagLogo& logo)
     if (s_atRoot && s_entryCount > 0 && !s_muFormatPending && !s_muCardOpen)
     {
         const FileEntry& ce = s_entries[s_cursor];
-        if (ce.isDir && ce.sizeLow >= (DWORD)'A' && ce.sizeLow <= (DWORD)'H')
+        if (ce.isDir && ce.sizeLow >= 200 && ce.sizeLow <= 207)
         {
             DrawText(LM, BOT_BAR_Y - 16.f,
                 "[Back+Black] MU Utilities",
@@ -1247,10 +1247,11 @@ void FileExplorer_Tick(const DiagLogo& logo)
                 if (s_pickEntryCount > 0)
                 {
                     FileEntry& pe = s_pickEntries[s_pickCursor];
-                    // MU entries store the drive letter in sizeLow (A-H);
+                    // MU entries store mu index (200-207) in sizeLow;
                     // HDD entries have sizeLow==0 so fall back to name[0].
-                    char driveLetter = (pe.sizeLow >= (DWORD)'A' && pe.sizeLow <= (DWORD)'H')
-                        ? (char)pe.sizeLow : pe.name[0];
+                    char driveLetter = (pe.sizeLow >= 200 && pe.sizeLow <= 207)
+                        ? FE_MU_Letter((int)(pe.sizeLow - 200) / 2, (int)(pe.sizeLow - 200) % 2)
+                        : pe.name[0];
                     char drivePath[8];
                     drivePath[0] = driveLetter; drivePath[1] = ':';
                     drivePath[2] = '\\'; drivePath[3] = '\0';
@@ -1291,11 +1292,12 @@ void FileExplorer_Tick(const DiagLogo& logo)
             if (s_pickAtRoot && s_pickEntryCount > 0)
             {
                 // At root — use the selected drive as destination.
-                // MU entries store the drive letter in sizeLow (A-H);
+                // MU entries store mu index (200-207) in sizeLow;
                 // HDD entries have sizeLow==0 so fall back to name[0].
                 FileEntry& pe = s_pickEntries[s_pickCursor];
-                char driveLetter = (pe.sizeLow >= (DWORD)'A' && pe.sizeLow <= (DWORD)'H')
-                    ? (char)pe.sizeLow : pe.name[0];
+                char driveLetter = (pe.sizeLow >= 200 && pe.sizeLow <= 207)
+                    ? FE_MU_Letter((int)(pe.sizeLow - 200) / 2, (int)(pe.sizeLow - 200) % 2)
+                    : pe.name[0];
                 driveFallback[0] = driveLetter;
                 driveFallback[1] = ':'; driveFallback[2] = '\\'; driveFallback[3] = '\0';
                 destPath = driveFallback;
@@ -1348,9 +1350,9 @@ void FileExplorer_Tick(const DiagLogo& logo)
         if (s_entryCount > 0)
         {
             FileEntry& e = s_entries[s_cursor];
-            if (e.isDir && e.sizeLow >= (DWORD)'A' && e.sizeLow <= (DWORD)'H')
+            if (e.isDir && e.sizeLow >= 200 && e.sizeLow <= 207)
             {
-                int mu = (int)(e.sizeLow - 'A');
+                int mu = (int)(e.sizeLow - 200);
                 s_muFormatPort = mu / 2;
                 s_muFormatSlot = mu % 2;
                 s_skPort = mu / 2;

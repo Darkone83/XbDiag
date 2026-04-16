@@ -120,6 +120,9 @@
     <ClCompile Include="xba.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="StressTestGPU.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Text Include="Media\Copy Assets Here.txt">
@@ -226,6 +229,9 @@
     <ClInclude Include="xba.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="StressTestGPU.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Image Include="Media\tex\tr.dds">
@@ -235,6 +241,15 @@
       <Filter>Media</Filter>
     </Image>
     <Image Include="Media\tex\DC.dds">
+      <Filter>Media</Filter>
+    </Image>
+    <Image Include="Media\tex\crystal_cube.dds">
+      <Filter>Media</Filter>
+    </Image>
+    <Image Include="Media\tex\crystal_n.dds">
+      <Filter>Media</Filter>
+    </Image>
+    <Image Include="Media\tex\rock.dds">
       <Filter>Media</Filter>
     </Image>
   </ItemGroup>

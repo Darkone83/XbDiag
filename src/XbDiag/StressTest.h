@@ -13,7 +13,7 @@
 // ============================================================================
 
 enum StressState { SSTATE_IDLE = 0, SSTATE_THRESHOLD, SSTATE_CONFIRM, SSTATE_RUNNING };
-enum StressCard { CARD_CPU = 0, CARD_RAM = 1 };
+enum StressCard { CARD_CPU = 0, CARD_RAM = 1, CARD_GPU = 2 };
 
 // ============================================================================
 // Shared constants (used by both CPU and RAM render)
@@ -44,6 +44,7 @@ static const float ST_TAB_H = 16.f;
 static const float ST_TAB_W = 56.f;
 static const float ST_TAB_CPU_X = LM;
 static const float ST_TAB_RAM_X = LM + 56.f + 4.f;
+static const float ST_TAB_GPU_X = LM + (56.f + 4.f) * 2.f;
 
 static const float ST_PANEL_H = 70.f;
 static const float ST_PANEL_W = 182.f;
@@ -122,6 +123,11 @@ extern StressState s_ramState;
 extern bool        s_ramAbortHold;
 extern DWORD       s_ramAbortStart;
 
+// GPU card state — defined in StressTestGPU.cpp
+extern StressState s_gpuState;
+extern bool        s_gpuAbortHold;
+extern DWORD       s_gpuAbortHoldStart;
+
 // ============================================================================
 // Shared inline helpers
 // ============================================================================
@@ -158,6 +164,11 @@ void ST_DrawTabStrip(StressCard active);
 void StressTest_OnEnter();
 void StressTest_Tick(const DiagLogo& logo);
 void StressTest_AutoRun(HANDLE hReport, DWORD durationMs);
+
+// GPU stress API — defined in StressTestGPU.cpp
+void ST_GPU_OnStart();
+void ST_GPU_Stop();
+void ST_GPU_Render(const DiagLogo& logo);
 
 // CPU AutoRun result accessors
 BYTE  StressAutoRun_GetMinCPU();

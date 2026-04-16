@@ -128,8 +128,8 @@ static const KnownDevice s_known[] =
     },
     {
         0x54, "EEPROM",
-        "93LC56 EEPROM  -  serial, region, MAC address, HDKEY",
-        "Reg 0x00-0x11=confounder  0x34=serial  0xEA-0xEF=MAC"
+        "24LC-compatible EEPROM  -  serial, region, MAC address, HDKEY",
+        "Reg 0x00-0x11=confounder  0x34=serial  0x40-0x45=MAC  0xA8-0xAB=HDD key"
     },
     {
         0x4C, "ADM1032",
@@ -191,24 +191,35 @@ static const RegDesc s_regs_enc[] =
 };
 static const RegDesc s_regs_pic[] =
 {
-    { 0x01, "VERSION " },
-    { 0x03, "SCRATCH " },
-    { 0x04, "AV PACK " },
+    { 0x01, "VERSION " },   // firmware version (also board rev shift register)
+    { 0x03, "SCRATCH " },   // scratch register
+    { 0x04, "AV PACK " },   // AV pack type bits[2:0]
+    { 0x09, "CPU TEMP" },   // CPU temp in C (1.6 only — ADM1032 absent)
+    { 0x0A, "MB TEMP " },   // motherboard temp in C (1.6 only)
+    { 0x10, "FAN SPD " },   // fan speed readback
+    { 0x06, "FAN MODE" },   // fan control mode
 };
 static const RegDesc s_regs_eeprom[] =
 {
-    { 0x00, "B[0x00] " },
-    { 0x34, "SERIAL0 " },
-    { 0xEA, "MAC[0]  " },
-    { 0xEB, "MAC[1]  " },
-    { 0xEC, "MAC[2]  " },
+    { 0x00, "CONF[0] " },   // confounder byte 0
+    { 0x34, "SERIAL0 " },   // serial string start
+    { 0x40, "MAC[0]  " },   // MAC byte 0  (confirmed via ExQueryNonVolatileSetting)
+    { 0x41, "MAC[1]  " },   // MAC byte 1
+    { 0x42, "MAC[2]  " },   // MAC byte 2
+    { 0x43, "MAC[3]  " },   // MAC byte 3
+    { 0x44, "MAC[4]  " },   // MAC byte 4
+    { 0x45, "MAC[5]  " },   // MAC byte 5
 };
 static const RegDesc s_regs_adm[] =
 {
-    { 0x00, "AMBIENT " },
-    { 0x01, "CPU DIE " },
-    { 0x04, "STATUS  " },
-    { 0x20, "LIM HI  " },
+    { 0x00, "AMBIENT " },   // local (board) temp integer
+    { 0x01, "CPU DIE " },   // remote (CPU die) temp integer
+    { 0x10, "CPU FRAC" },   // remote temp fractional byte
+    { 0x04, "STATUS  " },   // alert/limit status bits
+    { 0x0B, "LOC HI  " },   // local high limit
+    { 0x0D, "REM HI  " },   // remote high limit
+    { 0x19, "THERM L " },   // local THERM limit
+    { 0x20, "THERM R " },   // remote THERM limit
 };
 // ICS clock config bytes, OR X-HD HDMI adapter command registers at same address.
 // X-HD uses command-response protocol: send cmd byte, read back response.
@@ -222,12 +233,9 @@ static const RegDesc s_regs_ics[] =
     { 0x04, "BYTE 4  " },   //                               X-HD: version byte 4
     { 0x05, "MODE/B5 " },   // ICS: clock config byte 5  |  X-HD: mode (1=boot 2=app)
 };
-static const RegDesc s_regs_smc[] =
-{
-    { 0x01, "VERSION " },
-    { 0x02, "RST RSN " },
-    { 0x03, "INT ST  " },
-};
+// Note: s_regs_smc was removed — the SMC/PIC is the same device at 0x10;
+// its registers are covered by s_regs_pic above.
+
 static const RegDesc s_regs_rtc[] =
 {
     { 0x00, "SECONDS " },
@@ -250,12 +258,12 @@ struct DeviceRegs { BYTE addr; const RegDesc* regs; int count; };
 
 static const DeviceRegs s_devRegs[] =
 {
-    { 0x10, s_regs_pic,    3 },
-    { 0x45, s_regs_enc,    4 },
-    { 0x54, s_regs_eeprom, 5 },
-    { 0x4C, s_regs_adm,    4 },
-    { 0x69, s_regs_ics,    6 },
-    { 0x6A, s_regs_enc,    4 },   // Focus - same reg layout as Conexant for basics
+    { 0x10, s_regs_pic,    7 },   // PIC16L — version, scratch, AV, temps, fan
+    { 0x45, s_regs_enc,    4 },   // Conexant CX25871
+    { 0x54, s_regs_eeprom, 8 },   // EEPROM — confounder, serial, MAC[0-5]
+    { 0x4C, s_regs_adm,    8 },   // ADM1032 — temps, frac, status, limits
+    { 0x69, s_regs_ics,    6 },   // ICS clock / X-HD HDMI
+    { 0x6A, s_regs_enc,    4 },   // Focus FS454/455 - same reg layout as Conexant
     { 0x70, s_regs_enc,    4 },   // Xcalibur
     { 0x68, s_regs_rtc,    4 },   // X-RTC DS1307
     { 0x3C, s_regs_oled,   1 },   // OLED 0x3C
@@ -473,6 +481,42 @@ static DetailRow  s_detail[MAX_DETAIL_ROWS];
 static int        s_detailCount;
 
 // ============================================================================
+// SMBus controller health panel state
+//
+// BAR1 = 0xC000 (primary SMBus window, AMD756-compatible):
+//   0xC000  Global Status   (W1C — bits clear on write-1)
+//           bit 4: INTER  = transaction complete / interrupt pending
+//           bit 3: DEV_ERR = device error (NACK or collision)
+//           bit 2: BUS_ERR = bus error (protocol violation)
+//           bit 1: FAILED  = failed bus transaction
+//           bit 0: (reserved)
+//   0xC002  Global Enable   (host enable / interrupt enable)
+//           bit 0: HOST_EN = SMBus host controller enabled
+//
+// BAR2 = 0xC200 (secondary SMBus-related window, 32 bytes — undocumented):
+//   Public research confirms this BAR exists but its backing is unknown.
+//   We capture all 32 bytes as a raw research dump — no interpretation.
+//   Comparing idle vs post-transaction values may reveal what it tracks.
+// ============================================================================
+
+struct CtrlHealth
+{
+    BYTE  gs;               // 0xC000 Global Status
+    BYTE  ge;               // 0xC002 Global Enable
+    bool  hostEnabled;      // GE bit 0
+    bool  interPending;     // GS bit 4
+    bool  devErr;           // GS bit 3
+    bool  busErr;           // GS bit 2
+    bool  failed;           // GS bit 1
+    BYTE  bar2[32];         // Raw BAR2 bytes 0xC200-0xC21F
+    bool  bar2AllFF;        // true = all bytes 0xFF (likely dead silicon)
+    bool  bar2AllZero;      // true = all bytes 0x00 (disabled/cleared)
+};
+
+static CtrlHealth s_ctrl;
+static bool       s_ctrlPanelOpen = false;
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -566,6 +610,178 @@ static void ResetScan()
         s_phase = PHASE_SCANNING;
     s_regReadOpen = false;
     s_scanFrameSkip = 0;
+}
+
+// ============================================================================
+// SMBus controller health + BAR2 research dump
+// ============================================================================
+
+// Controller health panel — triggered by White button (BTN_WHITE = 0x0200 per input.h).
+// White and Black are synthesized digital flags from bAnalogButtons — fully
+// supported on both Duke and Type-S controllers.
+// White = open/close controller health + BAR2 research panel.
+// [A] inside the panel refreshes the read.
+#ifndef BTN_WHITE
+#define BTN_WHITE  0x0200   // must match input.h BTN_WHITE
+#endif
+
+static void ReadControllerHealth()
+{
+    // --- BAR1: Global Status (0xC000) and Global Enable (0xC002) ---
+    __asm { mov dx, 0xC000 }
+    __asm { in  al, dx     }
+    __asm { mov s_ctrl.gs, al }
+
+    __asm { mov dx, 0xC002 }
+    __asm { in  al, dx     }
+    __asm { mov s_ctrl.ge, al }
+
+    s_ctrl.hostEnabled = (s_ctrl.ge & 0x01) != 0;
+    s_ctrl.interPending = (s_ctrl.gs & 0x10) != 0;
+    s_ctrl.devErr = (s_ctrl.gs & 0x08) != 0;
+    s_ctrl.busErr = (s_ctrl.gs & 0x04) != 0;
+    s_ctrl.failed = (s_ctrl.gs & 0x02) != 0;
+
+    // --- BAR2: Raw 32-byte research dump (0xC200-0xC21F) ---
+    // Read-only port I/O — safe since this is a confirmed exposed BAR.
+    // No writes, no interpretation; raw capture for community analysis.
+    bool anyNonFF = false;
+    bool anyNonZero = false;
+    for (int i = 0; i < 32; ++i)
+    {
+        BYTE v = 0;
+        WORD port = (WORD)(0xC200 + i);
+        __asm { mov dx, port }
+        __asm { in  al, dx   }
+        __asm { mov v, al    }
+        s_ctrl.bar2[i] = v;
+        if (v != 0xFF) anyNonFF = true;
+        if (v != 0x00) anyNonZero = true;
+    }
+    s_ctrl.bar2AllFF = !anyNonFF;
+    s_ctrl.bar2AllZero = !anyNonZero;
+}
+
+static void DrawControllerPanel(const DiagLogo& logo)
+{
+    g_pDevice->BeginScene();
+    DrawPageChrome(logo, "SMBUS SCAN", "[WHITE] Close    [A] Refresh");
+
+    float px = LM;
+    float py = CONTENT_Y + 4.f;
+
+    // ---- Section: BAR1 Controller Status ----
+    DrawText(px, py, "SMBUS CONTROLLER  (BAR1 @ 0xC000)", 1.3f, COL_CYAN);
+    py += LINE_H + 4.f;
+    HLine(py, px, SW - LM, COL_BORDER); py += 6.f;
+
+    // Global Status raw
+    {
+        char gsHex[6]; IntToHex(s_ctrl.gs, 2, gsHex, sizeof(gsHex));
+        char geLine[40];
+        StrCopy(geLine, sizeof(geLine), "GS  0xC000 = 0x");
+        StrCat2(geLine, sizeof(geLine), geLine, gsHex);
+        DWORD gsCol = (s_ctrl.gs & 0x1E) ? COL_ORANGE : COL_GREEN;
+        DrawText(px, py, geLine, 1.2f, gsCol); py += LINE_H;
+    }
+
+    // Individual GS bits
+    {
+        float bx = px + 20.f;
+        DrawText(bx, py, s_ctrl.interPending ? "INTER [4]: SET  (transaction complete)" :
+            "INTER [4]: clear",
+            1.1f, s_ctrl.interPending ? COL_YELLOW : COL_DIM); py += LINE_H;
+        DrawText(bx, py, s_ctrl.devErr ? "DEV_ERR[3]: SET  (device NACK / collision)" :
+            "DEV_ERR[3]: clear",
+            1.1f, s_ctrl.devErr ? COL_RED : COL_DIM); py += LINE_H;
+        DrawText(bx, py, s_ctrl.busErr ? "BUS_ERR[2]: SET  (protocol violation)" :
+            "BUS_ERR[2]: clear",
+            1.1f, s_ctrl.busErr ? COL_RED : COL_DIM); py += LINE_H;
+        DrawText(bx, py, s_ctrl.failed ? "FAILED [1]: SET  (bus transaction failed)" :
+            "FAILED [1]: clear",
+            1.1f, s_ctrl.failed ? COL_RED : COL_DIM); py += LINE_H;
+    }
+
+    // Global Enable
+    {
+        char geHex[6]; IntToHex(s_ctrl.ge, 2, geHex, sizeof(geHex));
+        char geLine[40];
+        StrCopy(geLine, sizeof(geLine), "GE  0xC002 = 0x");
+        StrCat2(geLine, sizeof(geLine), geLine, geHex);
+        DrawText(px, py, geLine, 1.2f, COL_WHITE); py += LINE_H;
+        float bx = px + 20.f;
+        DrawText(bx, py, s_ctrl.hostEnabled ? "HOST_EN[0]: SET  (controller active)" :
+            "HOST_EN[0]: clear  (controller disabled!)",
+            1.1f, s_ctrl.hostEnabled ? COL_GREEN : COL_RED); py += LINE_H;
+    }
+
+    py += 6.f;
+    HLine(py, px, SW - LM, COL_BORDER); py += 8.f;
+
+    // ---- Section: BAR2 Research Dump ----
+    DrawText(px, py, "SMBUS BAR2  (0xC200-0xC21F)  --  UNDOCUMENTED", 1.3f, COL_CYAN);
+    py += LINE_H + 2.f;
+
+    // Status summary
+    const char* bar2Status;
+    DWORD bar2Col;
+    if (s_ctrl.bar2AllFF)
+    {
+        bar2Status = "All 0xFF  --  dead silicon or unpopulated window";
+        bar2Col = COL_DIM;
+    }
+    else if (s_ctrl.bar2AllZero)
+    {
+        bar2Status = "All 0x00  --  cleared / disabled state";
+        bar2Col = COL_GRAY;
+    }
+    else
+    {
+        bar2Status = "Non-trivial data present  --  window appears active";
+        bar2Col = COL_YELLOW;
+    }
+    DrawText(px, py, bar2Status, 1.15f, bar2Col); py += LINE_H + 4.f;
+    HLine(py, px, SW - LM, COL_BORDER); py += 6.f;
+
+    // Hex dump: 2 rows of 16 bytes each
+    // Row 0: 0xC200-0xC20F   Row 1: 0xC210-0xC21F
+    for (int row = 0; row < 2; ++row)
+    {
+        // Address label
+        char addrLbl[12];
+        StrCopy(addrLbl, sizeof(addrLbl), "0xC2");
+        char t[4]; IntToHex((BYTE)(row * 16), 2, t, sizeof(t));
+        StrCat2(addrLbl, sizeof(addrLbl), addrLbl, t);
+        StrCat2(addrLbl, sizeof(addrLbl), addrLbl, ":");
+        DrawText(px, py, addrLbl, 1.1f, COL_GRAY);
+
+        // 16 hex bytes
+        float bx = px + 58.f;
+        for (int col = 0; col < 16; ++col)
+        {
+            BYTE v = s_ctrl.bar2[row * 16 + col];
+            char hex[4]; IntToHex(v, 2, hex, sizeof(hex));
+            DWORD vc = (v == 0xFF || v == 0x00) ? COL_DIM : COL_WHITE;
+            DrawText(bx + (float)col * 22.f, py, hex, 1.1f, vc);
+        }
+        py += LINE_H + 2.f;
+    }
+
+    py += 6.f;
+
+    // Research note
+    DrawText(px, py,
+        "BAR2 is a confirmed 32-byte I/O window on PCI 00.01:1 (SMBus controller).",
+        1.05f, COL_GRAY); py += LINE_H;
+    DrawText(px, py,
+        "Its backing is publicly unknown. Compare values before/after [A] reg reads",
+        1.05f, COL_GRAY); py += LINE_H;
+    DrawText(px, py,
+        "to determine if it tracks SMBus activity. Report findings to Darkone83.",
+        1.05f, COL_GRAY);
+
+    g_pDevice->EndScene();
+    g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
 
 static void OpenRegRead(int addr)
@@ -1032,6 +1248,24 @@ void SmBusScan_Tick(const DiagLogo& logo)
 {
     WORD cur = GetButtons();
 
+    // ---- Controller health panel overlay ----
+    // [WHITE] toggles; re-reads hardware each time it opens.
+    if (s_ctrlPanelOpen)
+    {
+        if (EdgeDown(cur, s_prevBtns, BTN_WHITE))
+        {
+            s_ctrlPanelOpen = false;
+            s_prevBtns = cur;
+            return;
+        }
+        // [A] inside panel re-reads fresh data
+        if (EdgeDown(cur, s_prevBtns, BTN_A))
+            ReadControllerHealth();
+        s_prevBtns = cur;
+        DrawControllerPanel(logo);
+        return;
+    }
+
     // ---- 1.6 warning confirmation ----
     // Hold here until user explicitly accepts or cancels the scan.
     if (s_warnState == WARN_PENDING)
@@ -1064,6 +1298,11 @@ void SmBusScan_Tick(const DiagLogo& logo)
             s_prevBtns = cur;
             return;
         }
+    }
+    else if (EdgeDown(cur, s_prevBtns, BTN_WHITE))
+    {
+        ReadControllerHealth();
+        s_ctrlPanelOpen = true;
     }
     else if (EdgeDown(cur, s_prevBtns, BTN_X))
     {
@@ -1193,15 +1432,15 @@ void SmBusScan_Tick(const DiagLogo& logo)
 
     const char* hint;
     if (s_regReadOpen)
-        hint = "[B] Close registers    [X] Re-scan";
+        hint = "[B] Close registers    [X] Re-scan    [WHITE] Controller";
     else if (IsReservedAddr(s_cursor) && !s_reservedProbed[s_cursor])
-        hint = "[Y] One-shot probe    [B] Back    [X] Re-scan";
+        hint = "[Y] One-shot probe    [B] Back    [X] Re-scan    [WHITE] Controller";
     else if (IsReservedAddr(s_cursor) && s_reservedProbed[s_cursor] && s_reservedAck[s_cursor])
-        hint = "[A] Read registers    [B] Back    [X] Re-scan";
+        hint = "[A] Read registers    [B] Back    [X] Re-scan    [WHITE] Controller";
     else if (s_phase == PHASE_SCANNING)
-        hint = "[B] Back    [X] Re-scan";
+        hint = "[B] Back    [X] Re-scan    [WHITE] Controller";
     else
-        hint = "[A] Read registers    [B] Back    [X] Re-scan";
+        hint = "[A] Read registers    [B] Back    [X] Re-scan    [WHITE] Controller";
 
     DrawPageChrome(logo, "SMBUS SCAN", hint);
     DrawGrid();

@@ -130,20 +130,20 @@ static const char* RamPhaseLabel(RamPhase ph)
 {
     switch (ph)
     {
-    case RPHASE_ALLOC:    return "ALLOCATING";
+    case RPHASE_ALLOC:           return "ALLOCATING";
     case RPHASE_P1_WRITE:        return " 1/11  WRITE    fwd  0xAA55AA55";
-    case RPHASE_P2_READW:        return " 2/11  RD+WR    fwd verify / inv write";
-    case RPHASE_P3_READW:        return " 3/11  RD+WR    bwd verify / fwd write";
-    case RPHASE_P4_READ:         return " 4/11  READ     fwd verify 0xAA55AA55";
-    case RPHASE_P5_WRITE:        return " 5/11  WRITE    fwd  addr XOR DEADBEEF";
-    case RPHASE_P6_READ:         return " 6/11  READ     fwd verify addr XOR";
-    case RPHASE_P7_CHECKER_W:    return " 7/11  WRITE    fwd  checkerboard AA/55";
-    case RPHASE_P8_CHECKER_INV:  return " 8/11  RD+WR    bwd verify / invert";
-    case RPHASE_P9_CHECKER_V:    return " 9/11  READ     fwd verify inverted";
-    case RPHASE_P10_STRIDE_W:    return "10/11  WRITE    stride-31  addr XOR BAADF00D";
-    case RPHASE_P11_STRIDE_R:    return "11/11  READ     stride-31  verify";
+    case RPHASE_P2_READW:        return " 2/11  RD+WR    fwd verify/inv";
+    case RPHASE_P3_READW:        return " 3/11  RD+WR    bwd verify/fwd";
+    case RPHASE_P4_READ:         return " 4/11  READ     fwd 0xAA55AA55";
+    case RPHASE_P5_WRITE:        return " 5/11  WRITE    addr^DEADBEEF";
+    case RPHASE_P6_READ:         return " 6/11  READ     addr^XOR verify";
+    case RPHASE_P7_CHECKER_W:    return " 7/11  WRITE    checker AA/55";
+    case RPHASE_P8_CHECKER_INV:  return " 8/11  RD+WR    bwd invert";
+    case RPHASE_P9_CHECKER_V:    return " 9/11  READ     checker verify";
+    case RPHASE_P10_STRIDE_W:    return "10/11  WRITE    stride-31";
+    case RPHASE_P11_STRIDE_R:    return "11/11  READ     stride-31 verify";
     case RPHASE_FREE:            return "COMMITTING";
-    default:              return "";
+    default:                     return "";
     }
 }
 
@@ -450,7 +450,7 @@ static void RenderRAMCard(const DiagLogo& logo)
 {
     const char* hints;
     if (s_ramState == SSTATE_IDLE)
-        hints = "[Left] CPU    [A] Start Stress    [B] Back";
+        hints = "[Left] CPU    [A] Start    [B] Back";
     else if (s_ramState == SSTATE_CONFIRM)
         hints = "Hold LT+RT to confirm    [B] Cancel";
     else
@@ -460,9 +460,9 @@ static void RenderRAMCard(const DiagLogo& logo)
     ST_DrawTabStrip(CARD_RAM);
 
     // ---- Shared layout constants (mirror RamTest's Render exactly) ---------
-    const float COL_SPLIT = 300.f;
+    const float COL_SPLIT = 310.f;
     const float MAP_LM = LM;
-    const float GRID_LM = COL_SPLIT + 30.f;
+    const float GRID_LM = COL_SPLIT + 24.f;
     const float TS = 1.3f;
     const float LH = LINE_H - 2.f;
     const float SLH = LINE_H - 4.f;

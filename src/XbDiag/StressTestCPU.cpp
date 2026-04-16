@@ -568,6 +568,7 @@ void ST_DrawTabStrip(StressCard active)
 {
     bool cpuSel = (active == CARD_CPU);
     bool ramSel = (active == CARD_RAM);
+    bool gpuSel = (active == CARD_GPU);
 
     // CPU tab
     FillRectGrad(ST_TAB_CPU_X, ST_TAB_Y, ST_TAB_CPU_X + ST_TAB_W, ST_TAB_Y + ST_TAB_H,
@@ -587,7 +588,16 @@ void ST_DrawTabStrip(StressCard active)
     DrawText(ST_TAB_RAM_X + 8.f, ST_TAB_Y + 3.f, "RAM", 1.15f,
         ramSel ? COL_WHITE : COL_DIM);
 
-    // Bottom rule under both tabs
+    // GPU tab
+    FillRectGrad(ST_TAB_GPU_X, ST_TAB_Y, ST_TAB_GPU_X + ST_TAB_W, ST_TAB_Y + ST_TAB_H,
+        gpuSel ? D3DCOLOR_XRGB(40, 80, 160) : D3DCOLOR_XRGB(18, 25, 55),
+        gpuSel ? D3DCOLOR_XRGB(20, 50, 110) : D3DCOLOR_XRGB(12, 16, 38));
+    HLine(ST_TAB_Y, ST_TAB_GPU_X, ST_TAB_GPU_X + ST_TAB_W,
+        gpuSel ? COL_CYAN : COL_BORDER);
+    DrawText(ST_TAB_GPU_X + 8.f, ST_TAB_Y + 3.f, "GPU", 1.15f,
+        gpuSel ? COL_WHITE : COL_DIM);
+
+    // Bottom rule under all tabs
     HLine(ST_TAB_Y + ST_TAB_H, LM, SW - LM, COL_BORDER);
 }
 
@@ -598,10 +608,10 @@ void ST_DrawTabStrip(StressCard active)
 static void RenderCPUCard(const DiagLogo& logo)
 {
     const char* hint =
-        (s_state == SSTATE_IDLE) ? "[A] Start Test    [B] Back    [Right] RAM Card" :
+        (s_state == SSTATE_IDLE) ? "[A] Start Test    [B] Back    [Right] RAM / GPU" :
         (s_state == SSTATE_THRESHOLD) ? "[LT] Lower    [RT] Raise    [A] Continue    [B] Cancel" :
         (s_state == SSTATE_CONFIRM) ? "[LT+RT] Confirm    [B] Cancel" :
-        "[Right] RAM Card    Hold [Back+A] 5s to Abort";
+        "[Right] RAM / GPU    Hold [Back+A] 5s to Abort";
 
     DrawPageChrome(logo, "STRESS TEST  -  CPU", hint);
     ST_DrawTabStrip(CARD_CPU);

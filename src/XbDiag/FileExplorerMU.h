@@ -40,9 +40,18 @@ bool IsMUPresent(int port, int slot);
 // Public API
 // ----------------------------------------------------------------------------
 
-// Mount all HDD partitions (C/E/F/G/X/Y/Z) and any inserted MUs (A-H).
+// Mount all HDD partitions (C/E/F/G/X/Y/Z) and any inserted MUs.
 // Safe to call repeatedly — IoCreateSymbolicLink is idempotent for HDD links.
 bool FE_MU_MountAll();
+
+// Returns the drive letter for a given MU port/slot.
+// Uses a safe table that avoids HDD letters (C,E,F,G,X,Y,Z) and DVD (D).
+//   port 0-3, slot 0=top slot, slot 1=bottom slot
+char FE_MU_Letter(int port, int slot);
+
+// Returns the drive letter assigned to the MU at port/slot.
+// Uses a safe table that avoids HDD letters (C,E,F,G,X,Y,Z) and DVD (D).
+char FE_MU_Letter(int port, int slot);
 
 // Dismount, format as FATX, and remount the MU at the given port/slot.
 // Returns true on success.  Drive letter is rebound before return.

@@ -38,6 +38,7 @@
     <ClCompile Include="StressMath.cpp" />
     <ClCompile Include="StressTest.cpp" />
     <ClCompile Include="StressTestCPU.cpp" />
+    <ClCompile Include="StressTestGPU.cpp" />
     <ClCompile Include="StressTestRAM.cpp" />
     <ClCompile Include="SysInfo.cpp" />
     <ClCompile Include="TempMonitor.cpp" />
@@ -76,6 +77,7 @@
     <ClInclude Include="StressMath.h" />
     <ClInclude Include="StressTest.h" />
     <ClInclude Include="StressTestCPU.h" />
+    <ClInclude Include="StressTestGPU.h" />
     <ClInclude Include="StressTestRAM.h" />
     <ClInclude Include="SysInfo.h" />
     <ClInclude Include="TempMonitor.h" />
@@ -85,7 +87,10 @@
     <ClInclude Include="XbSet.h" />
   </ItemGroup>
   <ItemGroup>
+    <Image Include="Media\tex\crystal_cube.dds" />
+    <Image Include="Media\tex\crystal_n.dds" />
     <Image Include="Media\tex\DC.dds" />
+    <Image Include="Media\tex\rock.dds" />
     <Image Include="Media\tex\tr.dds" />
     <Image Include="Media\tex\xb.dds" />
   </ItemGroup>

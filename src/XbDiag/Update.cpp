@@ -14,6 +14,7 @@
 //   - All sockets non-blocking (FIONBIO) for version check state machine
 
 #include "Update.h"
+#include "xba.h"
 #include "font.h"
 #include "input.h"
 #include "FileExplorerMU.h"
@@ -116,11 +117,16 @@ enum UpdateState
     UPST_COMPARE,
     UPST_UP_TO_DATE,
     UPST_AVAIL,
-    UPST_RECV_XBE,
+    UPST_RECV_XBA,      // downloading update.xba
+    UPST_EXTRACT_XBA,   // extracting update.xba
+    UPST_RECV_XBE,      // (kept for compat — unused in new flow)
     UPST_RECV_VER2,
     UPST_WRITE_DONE,
     UPST_ERROR,
 };
+
+static const char* k_xbaTempPath = "D:\\update.xba";
+static const char* k_xbaServerPath = "/xbdiag/update.xba";
 
 static UpdateState s_state = UPST_IDLE;
 static WORD        s_prevBtns = 0;
@@ -137,6 +143,7 @@ static HANDLE      s_hFile = INVALID_HANDLE_VALUE;
 static DWORD       s_xbeTotal = 0;
 static DWORD       s_xbeReceived = 0;
 static char        s_errorMsg[80];
+static char        s_xbaDetail[128];    // detail from Xba_Extract on error
 static bool        s_bootCheckDone = false;
 static bool        s_bootFoundUpdate = false;
 static DWORD       s_netInitStart = 0;
@@ -265,6 +272,15 @@ static const char* FindBody(const char* buf, int len, DWORD* outCL)
 // ============================================================================
 // Network helpers
 // ============================================================================
+
+// XBA extraction progress — called by Xba_Extract, updates the download bar
+static void XbaProgressCb(int filesDone, int filesTotal,
+    DWORD bytesDone, DWORD bytesTotal)
+{
+    s_xbeReceived = bytesDone;
+    s_xbeTotal = bytesTotal;
+    (void)filesDone; (void)filesTotal;
+}
 
 static void NetEnsure()
 {
@@ -531,10 +547,11 @@ static void Render(const DiagLogo& logo)
     g_pDevice->BeginScene();
 
     const char* hint = "[B] Back";
-    if (s_state == UPST_IDLE)       hint = "[A] Check for update    [B] Back";
+    if (s_state == UPST_IDLE)            hint = "[A] Check for update    [B] Back";
     else if (s_state == UPST_AVAIL)      hint = "[A] Download update    [B] Back";
     else if (s_state == UPST_WRITE_DONE) hint = "[A] Relaunch";
-    else if (s_state == UPST_RECV_XBE || s_state == UPST_RECV_VER2) hint = "";
+    else if (s_state == UPST_RECV_XBA || s_state == UPST_EXTRACT_XBA ||
+        s_state == UPST_RECV_VER2)  hint = "";
     else if (s_state == UPST_UP_TO_DATE) hint = "[A] Re-check    [X] Download anyway    [B] Back";
     else if (s_state == UPST_ERROR)      hint = "[A] Retry    [B] Back";
 
@@ -570,8 +587,10 @@ static void Render(const DiagLogo& logo)
         case UPST_COMPARE:     ss = "Comparing versions...";          sc = COL_YELLOW; break;
         case UPST_UP_TO_DATE:  ss = "XbDiag is up to date";           sc = COL_GREEN;  break;
         case UPST_AVAIL:       ss = "Update available!  Press [A] to download"; sc = COL_YELLOW; break;
+        case UPST_RECV_XBA:    ss = "Downloading update.xba...";      sc = COL_CYAN;   break;
+        case UPST_EXTRACT_XBA: ss = "Extracting update...";           sc = COL_CYAN;   break;
         case UPST_RECV_XBE:    ss = "Downloading update...";          sc = COL_CYAN;   break;
-        case UPST_RECV_VER2:   ss = "Downloading files...";           sc = COL_CYAN;   break;
+        case UPST_RECV_VER2:   ss = "Finalising update...";           sc = COL_CYAN;   break;
         case UPST_WRITE_DONE:  ss = "Update complete!  Relaunch the app for the new version."; sc = COL_GREEN; break;
         case UPST_ERROR:       ss = s_errorMsg; sc = COL_RED; break;
         default: break;
@@ -580,10 +599,13 @@ static void Render(const DiagLogo& logo)
     }
     y += LH * 2.f;
 
-    if (s_state == UPST_RECV_XBE || s_state == UPST_WRITE_DONE)
+    if (s_state == UPST_RECV_XBA || s_state == UPST_EXTRACT_XBA ||
+        s_state == UPST_RECV_XBE || s_state == UPST_WRITE_DONE)
     {
         const float BAR_W = SW - LM * 2.f, BAR_H = 22.f;
-        DrawText(LX, y, "PROGRESS      :", 1.2f, COL_GRAY); y += LH;
+        const char* progLbl = (s_state == UPST_EXTRACT_XBA)
+            ? "EXTRACTING    :" : "PROGRESS      :";
+        DrawText(LX, y, progLbl, 1.2f, COL_GRAY); y += LH;
         float frac = 0.f;
         if (s_xbeTotal > 0) frac = (float)s_xbeReceived / (float)s_xbeTotal;
         else if (s_state == UPST_WRITE_DONE) frac = 1.f;
@@ -1076,22 +1098,51 @@ void Update_Tick(const DiagLogo& logo)
             for (int i = blen - 1; i >= 0; --i)
                 if (base[i] == '\\') { base[i + 1] = '\0'; break; }
 
-            // Step 1: download default.xbe
-            s_state = UPST_RECV_XBE;
-            char xbeDest[128]; StrCopy(xbeDest, sizeof(xbeDest), base); AppendStr(xbeDest, sizeof(xbeDest), "default.xbe");
-            if (!DoDownload("/xbdiag/default.xbe", xbeDest, logo, true))
+            // Step 1: download update.xba to temp path
+            s_state = UPST_RECV_XBA;
+            s_xbeTotal = 0; s_xbeReceived = 0;
+            if (!DoDownload(k_xbaServerPath, k_xbaTempPath, logo, true))
             {
-                SetError("dl failed: default.xbe"); break;
+                DeleteFileA(k_xbaTempPath);
+                SetError("dl failed: update.xba"); break;
             }
 
-            // Step 2: wait 5 seconds, pump render
+            // Step 2: extract update.xba to base dir
+            // Render an extracting frame so screen doesn't freeze
+            s_state = UPST_EXTRACT_XBA;
+            s_xbeTotal = 0; s_xbeReceived = 0;
+            Render(logo);
+
+            ZeroMemory(s_xbaDetail, sizeof(s_xbaDetail));
+            XbaResult xr = Xba_Extract(k_xbaTempPath, base,
+                XbaProgressCb, s_xbaDetail, sizeof(s_xbaDetail));
+
+            // Always delete the temp archive whether extraction succeeded or not
+            DeleteFileA(k_xbaTempPath);
+
+            if (xr != XBA_OK)
+            {
+                char errMsg[80];
+                StrCopy(errMsg, sizeof(errMsg), "extract failed: ");
+                AppendStr(errMsg, sizeof(errMsg), Xba_ResultStr(xr));
+                if (s_xbaDetail[0])
+                {
+                    AppendStr(errMsg, sizeof(errMsg), " (");
+                    AppendStr(errMsg, sizeof(errMsg), s_xbaDetail);
+                    AppendStr(errMsg, sizeof(errMsg), ")");
+                }
+                SetError(errMsg); break;
+            }
+
+            // Step 3: 5-second settle wait with render pump
             s_state = UPST_RECV_VER2;
             DWORD waitStart = GetTickCount();
             while (GetTickCount() - waitStart < 5000)
                 Render(logo);
 
-            // Step 3: download XbDiag.ver
-            char verDest[128]; StrCopy(verDest, sizeof(verDest), base); AppendStr(verDest, sizeof(verDest), "XbDiag.ver");
+            // Step 4: download XbDiag.ver last (confirms successful update)
+            char verDest[128]; StrCopy(verDest, sizeof(verDest), base);
+            AppendStr(verDest, sizeof(verDest), "XbDiag.ver");
             if (!DoDownload("/xbdiag/XbDiag.ver", verDest, logo, false))
             {
                 SetError("dl failed: XbDiag.ver"); break;
@@ -1181,6 +1232,8 @@ void Update_Tick(const DiagLogo& logo)
     }
     case UPST_UP_TO_DATE:
     case UPST_AVAIL:
+    case UPST_RECV_XBA:
+    case UPST_EXTRACT_XBA:
     case UPST_RECV_XBE:
     case UPST_RECV_VER2:
     case UPST_WRITE_DONE:

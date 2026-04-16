@@ -121,6 +121,11 @@ static bool  s_sensorOK;
 enum SensorPath { PATH_UNKNOWN = 0, PATH_ADM1032, PATH_PIC_16 };
 static SensorPath s_path = PATH_UNKNOWN;
 
+// Set true when PATH_PIC_16 is active but 0x09/0x0A NAK —
+// Xyclops (1.6 SMC) does not expose temp registers at these offsets.
+// Suppresses the generic NAK error and shows a specific informational message.
+static bool s_xyclopsNoTemp = false;
+
 // 10-sample accumulator for 1.6 PIC averaging
 static int  s_avg_amb_acc = 0;
 static int  s_avg_cpu_acc = 0;
@@ -187,25 +192,39 @@ static void TakeSample()
     }
     else
     {
-        // 1.6: PIC regs 0x09 (CPU) + 0x0A (board), average 10 samples
+        // 1.6: Attempt PIC/Xyclops regs 0x09 (CPU) + 0x0A (board).
+        // On 1.0-1.5 the PIC16LC proxies ADM1032 temps at these offsets.
+        // On 1.6 the SMC is Xyclops (8051 core) which does NOT implement
+        // these registers — they NAK. Detect this and flag gracefully
+        // rather than showing a generic sensor error.
         BYTE picCPU = 0, picAmb = 0;
         ok = SMBusRead(SMBADDR_PIC, 0x09, picCPU) &&
             SMBusRead(SMBADDR_PIC, 0x0A, picAmb);
-        // PIC MB temp on 1.6 reads ~25% high — apply 0.8x scaling (ref: PrometheOS)
-        if (ok) picAmb = (BYTE)((int)picAmb * 4 / 5);
-        if (ok)
+
+        if (!ok)
         {
-            s_avg_cpu_acc += (int)picCPU;
-            s_avg_amb_acc += (int)picAmb;
-            ++s_avg_count;
-            if (s_avg_count < AVG_SAMPLES)
-                return;   // accumulate more samples before committing
-            cpu = (BYTE)(s_avg_cpu_acc / AVG_SAMPLES);
-            amb = (BYTE)(s_avg_amb_acc / AVG_SAMPLES);
-            s_avg_cpu_acc = 0;
-            s_avg_amb_acc = 0;
-            s_avg_count = 0;
+            // Xyclops temp registers not available — suppress generic error,
+            // show informational N/A message instead.
+            s_xyclopsNoTemp = true;
+            s_sensorOK = false;
+            return;
         }
+
+        s_xyclopsNoTemp = false;
+
+        // Apply 0.8x scaling to ambient (ref: PrometheOS xboxConfig)
+        picAmb = (BYTE)((int)picAmb * 4 / 5);
+
+        s_avg_cpu_acc += (int)picCPU;
+        s_avg_amb_acc += (int)picAmb;
+        ++s_avg_count;
+        if (s_avg_count < AVG_SAMPLES)
+            return;   // accumulate more samples before committing
+        cpu = (BYTE)(s_avg_cpu_acc / AVG_SAMPLES);
+        amb = (BYTE)(s_avg_amb_acc / AVG_SAMPLES);
+        s_avg_cpu_acc = 0;
+        s_avg_amb_acc = 0;
+        s_avg_count = 0;
     }
 
     s_sensorOK = ok;
@@ -257,6 +276,17 @@ void TempMonitor_OnEnter()
     s_fanDetected = false;
     s_sensorOK = false;
     s_lastSample = GetTickCount() - SAMPLE_INTERVAL_MS; // sample immediately
+
+    // Reset sensor path so auto-detect runs fresh on each entry.
+    // Without this, stale path from AutoRun or a previous session persists.
+    s_path = PATH_UNKNOWN;
+    s_xyclopsNoTemp = false;
+
+    // Reset 1.6 PIC accumulator — stale values from a previous session
+    // would skew the first averaged reading.
+    s_avg_amb_acc = 0;
+    s_avg_cpu_acc = 0;
+    s_avg_count = 0;
 }
 
 // ============================================================================
@@ -508,7 +538,8 @@ static void DrawGraph()
     DrawText(lx + 13.f, ly - 2.f, "AMBIENT", 1.0f, COL_CYAN);
     ly += 12.f;
     FillRect(lx, ly, lx + 10.f, ly + 6.f, COL_YELLOW);
-    DrawText(lx + 13.f, ly - 2.f, "CPU DIE", 1.0f, COL_YELLOW);
+    DrawText(lx + 13.f, ly - 2.f,
+        (s_path == PATH_PIC_16) ? "CPU TEMP" : "CPU DIE", 1.0f, COL_YELLOW);
 
     // Sample count / time scale
     char scaleStr[32];
@@ -556,23 +587,36 @@ void TempMonitor_Tick(const DiagLogo& logo)
     float midY = GAUGE_Y + GAUGE_H * 0.5f - LINE_H * 0.5f;
     {
         const char* sLabel = (s_path == PATH_ADM1032) ? "ADM1032" :
+            (s_path == PATH_PIC_16 && s_xyclopsNoTemp) ? "XYCLOPS" :
             (s_path == PATH_PIC_16) ? "PIC/XCAL" :
             "SENSOR";
         DrawText(midX - TW(sLabel, 1.0f) * 0.5f, midY, sLabel, 1.0f, COL_DIM);
     }
 
     DrawGaugePanel(COL_L_X, "AMBIENT (BOARD)", (int)s_curAmb,
-        AMB_WARN, AMB_HOT, s_sensorOK);
-    DrawGaugePanel(COL_R_X, "CPU DIE", (int)s_curCPU,
-        CPU_WARN, CPU_HOT, s_sensorOK,
+        AMB_WARN, AMB_HOT, s_sensorOK && !s_xyclopsNoTemp);
+    DrawGaugePanel(COL_R_X,
+        (s_path == PATH_PIC_16) ? "CPU TEMP" : "CPU DIE",
+        (int)s_curCPU, CPU_WARN, CPU_HOT, s_sensorOK && !s_xyclopsNoTemp,
         true, (int)s_curFan * 2);
 
     // Graph section header
     HLine(GRAPH_Y - 14.f, LM, SW - LM, COL_BORDER);
     DrawText(LM, GRAPH_Y - 13.f, "TEMPERATURE HISTORY", 1.1f, COL_YELLOW);
 
-    // Sensor error overlay
-    if (!s_sensorOK)
+    // Sensor status overlay
+    if (s_xyclopsNoTemp)
+    {
+        // Xyclops (1.6 SMC) does not expose temp registers at 0x09/0x0A.
+        // Show informational message rather than a scary error.
+        DrawText(LM, GAUGE_Y + 20.f,
+            "N/A  -  Xyclops SMC detected", 1.3f, COL_GRAY);
+        DrawText(LM, GAUGE_Y + 38.f,
+            "Temperature registers (0x09/0x0A) not implemented", 1.15f, COL_DIM);
+        DrawText(LM, GAUGE_Y + 54.f,
+            "on 1.6 Xyclops hardware via this interface.", 1.15f, COL_DIM);
+    }
+    else if (!s_sensorOK)
     {
         const char* errMsg = (s_path == PATH_PIC_16)
             ? "PIC NOT RESPONDING  (SMBus 0x20 NAK)"
@@ -586,7 +630,9 @@ void TempMonitor_Tick(const DiagLogo& logo)
     // Right-aligned left of the badge so they don't overlap.
     // TW(g_videoModeStr) accounts for badge width at current advance.
     {
-        const char* pollHint = (s_path == PATH_PIC_16)
+        const char* pollHint = (s_path == PATH_PIC_16 && s_xyclopsNoTemp)
+            ? "Xyclops 1.6 SMC  -  temp N/A"
+            : (s_path == PATH_PIC_16)
             ? "500ms poll  PIC 0x20 (10-sample avg)"
             : "500ms poll  ADM1032 0x98";
         float badgeW = TW(g_videoModeStr, 1.3f);

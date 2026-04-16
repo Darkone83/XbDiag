@@ -538,20 +538,17 @@ static void DetectBoardRevision(SysData& d, BYTE nvRev)
     }
 
     // 1.6 / 1.6b  (P2L)
+    // NOTE: The previous implementation read NV2A PFB EMRS straps at
+    // 0xFD101000 to distinguish 1.6 (Samsung) from 1.6b (Hynix DRAM).
+    // This raw MMIO dereference into the PFB block causes a hard crash
+    // on 1.6 hardware when D3D context teardown leaves PFB in an unsafe
+    // state after dashboard handoff. The 1.6 vs 1.6b distinction is
+    // cosmetic — both are functionally identical for all diagnostic
+    // purposes and SmBusScan only checks for "1.6" prefix either way.
+    // Removed unconditionally. Report simply "1.6" for all P2L boards.
     if (b0 == 'P' && b1 == '2' && b2 == 'L')
     {
-        DWORD vendor = PciRead32(0, 1, 0, 0x00);
-        if ((vendor & 0xFFFF) == 0x10DE)
-        {
-            volatile ULONG* emrs = (volatile ULONG*)0xFD101000;
-            ULONG strap = (*emrs & 0x000C0000) >> 18;
-            StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal),
-                (strap == 3) ? "1.6b" : "1.6");
-        }
-        else
-        {
-            StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.6");
-        }
+        StrCopy(d.boardRevFinal, sizeof(d.boardRevFinal), "1.6");
         return;
     }
 
@@ -1431,7 +1428,7 @@ static void DumpBios()
     ULONG padSize = fullSize - readSize;  // always 512 bytes
 
     // ---- Open output file BEFORE mapping ROM (avoids heap corruption risk) ----
-    HANDLE hf = CreateFileA("\\bios.bin", GENERIC_WRITE, 0, NULL,
+    HANDLE hf = CreateFileA("D:\\bios.bin", GENERIC_WRITE, 0, NULL,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hf == INVALID_HANDLE_VALUE)
     {

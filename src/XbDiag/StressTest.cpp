@@ -54,6 +54,7 @@
 #include "StressTest.h"
 #include "StressTestCPU.h"
 #include "StressTestRAM.h"
+#include "StressTestGPU.h"
 #include "StressMath.h"
 #include "font.h"
 #include "input.h"
@@ -229,16 +230,26 @@ static void HandleInput()
     // Card navigation — only when nothing is running on either card
     bool anythingRunning = (s_state == SSTATE_RUNNING ||
         s_ramState == SSTATE_RUNNING ||
+        s_gpuState == SSTATE_RUNNING ||
         s_state == SSTATE_CONFIRM ||
-        s_ramState == SSTATE_CONFIRM);
+        s_ramState == SSTATE_CONFIRM ||
+        s_gpuState == SSTATE_CONFIRM);
     if (!anythingRunning)
     {
-        if (ST_EdgeDown(cur, s_stPrevBtns, BTN_DPAD_RIGHT)) s_card = CARD_RAM;
-        if (ST_EdgeDown(cur, s_stPrevBtns, BTN_DPAD_LEFT))  s_card = CARD_CPU;
+        if (ST_EdgeDown(cur, s_stPrevBtns, BTN_DPAD_RIGHT))
+        {
+            if (s_card == CARD_CPU) s_card = CARD_RAM;
+            else if (s_card == CARD_RAM) s_card = CARD_GPU;
+        }
+        if (ST_EdgeDown(cur, s_stPrevBtns, BTN_DPAD_LEFT))
+        {
+            if (s_card == CARD_GPU) s_card = CARD_RAM;
+            else if (s_card == CARD_RAM) s_card = CARD_CPU;
+        }
     }
 
-    // Back to menu — only from full idle on both cards
-    if (s_state == SSTATE_IDLE && s_ramState == SSTATE_IDLE)
+    // Back to menu — only from full idle on all cards
+    if (s_state == SSTATE_IDLE && s_ramState == SSTATE_IDLE && s_gpuState == SSTATE_IDLE)
     {
         if (ST_EdgeDown(cur, s_stPrevBtns, BTN_B) ||
             ST_EdgeDown(cur, s_stPrevBtns, BTN_BACK))
@@ -375,6 +386,56 @@ static void HandleInput()
         }
     }
 
+    // ---- GPU card input ----------------------------------------------------
+    if (s_card == CARD_GPU)
+    {
+        switch (s_gpuState)
+        {
+        case SSTATE_IDLE:
+            if (ST_EdgeDown(cur, s_stPrevBtns, BTN_A))
+            {
+                ST_GPU_OnStart();
+                s_gpuState = SSTATE_CONFIRM;
+            }
+            break;
+
+        case SSTATE_CONFIRM:
+            if (ST_EdgeDown(cur, s_stPrevBtns, BTN_B))
+            {
+                s_gpuState = SSTATE_IDLE; break;
+            }
+            if (lt > 128 && rt > 128)
+            {
+                s_gpuState = SSTATE_RUNNING;
+                s_gpuAbortHold = false;
+            }
+            break;
+
+        case SSTATE_RUNNING:
+        {
+            bool backHeld = (cur & BTN_BACK) != 0;
+            bool aHeld = (cur & BTN_A) != 0;
+            if (backHeld && aHeld)
+            {
+                if (!s_gpuAbortHold)
+                {
+                    s_gpuAbortHold = true;
+                    s_gpuAbortHoldStart = GetTickCount();
+                }
+                else if ((GetTickCount() - s_gpuAbortHoldStart) >= ABORT_HOLD_MS)
+                {
+                    ST_GPU_Stop();
+                    s_gpuState = SSTATE_IDLE;
+                    s_gpuAbortHold = false;
+                }
+            }
+            else
+                s_gpuAbortHold = false;
+        }
+        break;
+        }
+    }
+
     s_stPrevBtns = cur;
 }
 
@@ -465,13 +526,21 @@ void StressTest_Tick(const DiagLogo& logo)
             s_lastSample = now;
         }
 
-        g_pDevice->BeginScene();
-        if (s_card == CARD_CPU)
-            ST_CPU_Render(logo);
+        if (s_card == CARD_GPU)
+        {
+            // ST_GPU_Render owns BeginScene/EndScene/Present internally
+            ST_GPU_Render(logo);
+        }
         else
-            ST_RAM_Render(logo);
-        g_pDevice->EndScene();
-        g_pDevice->Present(NULL, NULL, NULL, NULL);
+        {
+            g_pDevice->BeginScene();
+            if (s_card == CARD_CPU)
+                ST_CPU_Render(logo);
+            else
+                ST_RAM_Render(logo);
+            g_pDevice->EndScene();
+            g_pDevice->Present(NULL, NULL, NULL, NULL);
+        }
     }
 
     // ── RAM stress step (time-sliced, runs every tick on RAM card) ───────────
@@ -479,6 +548,8 @@ void StressTest_Tick(const DiagLogo& logo)
     {
         ST_RAM_Step();
     }
+    // NOTE: GPU card has no separate step — ST_GPU_Render() handles both
+    // scene update and present in one call from the else branch above.
 }
 // ============================================================================
 // StressTest_AutoRun — headless CPU stress for XbSet automation

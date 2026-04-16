@@ -56,6 +56,21 @@ static const DriveMap k_drives[] =
     { "Z", "\\Device\\Harddisk0\\Partition5" },
 };
 
+// MU drive letter table — indexed by (port*2 + slot), 0-7.
+// Avoids HDD letters (C,E,F,G,X,Y,Z) and DVD (D).
+//   mu 0 = port0 slot0 = A   mu 1 = port0 slot1 = B
+//   mu 2 = port1 slot0 = I   mu 3 = port1 slot1 = J
+//   mu 4 = port2 slot0 = K   mu 5 = port2 slot1 = L
+//   mu 6 = port3 slot0 = M   mu 7 = port3 slot1 = H
+static const char k_muLetters[8] = { 'A', 'B', 'I', 'J', 'K', 'L', 'M', 'H' };
+
+char FE_MU_Letter(int port, int slot)
+{
+    int mu = port * 2 + slot;
+    if (mu < 0 || mu > 7) return '?';
+    return k_muLetters[mu];
+}
+
 static void MountHDDDrives()
 {
     char linkBuf[16];
@@ -81,7 +96,7 @@ static bool MountMUs()
         {
             if (!IsMUPresent(port, slot)) continue;
 
-            char driveLetter = 'A' + (char)(port * 2 + slot);
+            char driveLetter = FE_MU_Letter(port, slot);
             char devBuf[64];
             XBOX_STRING devName;
             devName.Length = 0;
@@ -128,7 +143,7 @@ static void MU_Remount(int port, int slot)
 
 bool FE_MU_Format(int port, int slot)
 {
-    char driveLetter = 'A' + (char)(port * 2 + slot);
+    char driveLetter = FE_MU_Letter(port, slot);
     char linkBuf[8];
     char devBuf[64];
     XBOX_STRING devName;
@@ -762,7 +777,7 @@ static bool MU_CreateFromXba(const char* xbaDest, int port, int slot,
 
     // Phase 3: copy tmp contents to MU root
     char muRoot[8];
-    muRoot[0] = 'A' + (char)(port * 2 + slot);
+    muRoot[0] = FE_MU_Letter(port, slot);
     muRoot[1] = ':'; muRoot[2] = '\\'; muRoot[3] = '\0';
 
     // Pre-scan copy source so the progress bar knows the combined total.

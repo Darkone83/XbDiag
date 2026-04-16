@@ -6,6 +6,7 @@
 // The destination picker (FOS_PICK_DEST) uses its own parallel entry list.
 
 #include "FileExplorerOps.h"
+#include "FileExplorerMU.h"
 #include "font.h"
 #include "input.h"
 #include <xtl.h>
@@ -41,7 +42,7 @@ static void PickLoadDriveList()
     }
 
     // Memory Units — use GetFileAttributesA on root (FindFirstFile fails on
-    // empty MUs).  Drive letter stored in sizeLow so the picker can open it.
+    // empty MUs).  sizeLow stores 200+mu index so the picker can open it.
     // Labels mirror the main browser so the user sees "P1 MMU1" etc.
     static const char* k_muLabels[8] = {
         "P1 MMU1", "P1 MMU2",
@@ -51,15 +52,16 @@ static void PickLoadDriveList()
     };
     for (int mu = 0; mu < 8 && s_pickEntryCount < MAX_ENTRIES; ++mu)
     {
+        int port = mu / 2, slot = mu % 2;
         char muRoot[8];
-        muRoot[0] = 'A' + (char)mu; muRoot[1] = ':'; muRoot[2] = '\\'; muRoot[3] = '\0';
+        muRoot[0] = FE_MU_Letter(port, slot); muRoot[1] = ':'; muRoot[2] = '\\'; muRoot[3] = '\0';
         DWORD attr = GetFileAttributesA(muRoot);
         if (attr != 0xFFFFFFFF && (attr & FILE_ATTRIBUTE_DIRECTORY))
         {
             FileEntry& e = s_pickEntries[s_pickEntryCount++];
             StrCopy(e.name, sizeof(e.name), k_muLabels[mu]);
             e.isDir = true;
-            e.sizeLow = (DWORD)('A' + mu);  // drive letter for picker navigation
+            e.sizeLow = (DWORD)(200 + mu);  // mu index offset for picker navigation
         }
     }
 }
@@ -214,9 +216,9 @@ static void EnterSelected()
 
     if (s_atRoot)
     {
-        // HDD drives: letter is name[0].  MU entries: letter stored in sizeLow.
-        char driveLetter = (e.sizeLow >= (DWORD)'A' && e.sizeLow <= (DWORD)'H')
-            ? (char)e.sizeLow
+        // HDD drives: letter is name[0].  MU entries: sizeLow is 200+mu index.
+        char driveLetter = (e.sizeLow >= 200 && e.sizeLow <= 207)
+            ? FE_MU_Letter((int)(e.sizeLow - 200) / 2, (int)(e.sizeLow - 200) % 2)
             : e.name[0];
         char drivePath[8];
         drivePath[0] = driveLetter; drivePath[1] = ':';

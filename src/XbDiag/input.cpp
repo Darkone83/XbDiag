@@ -41,6 +41,25 @@ void InitInput()
     s_rumbleLeft = 0;  // motors start off — no need to send a stop packet
     s_rumbleRight = 0;
     s_rumblePort = -1;
+
+    // XInitDevices queues insertion events for all devices already present at
+    // boot. Drain that initial batch now so g_muPresent is seeded correctly for
+    // MUs that were plugged in before we started. Without this, any MU already
+    // connected at boot is never seen by the change-based tracker in PumpInput,
+    // so IsMUPresent returns false for it and it never appears in the drive list.
+    {
+        DWORD ins = 0, rem = 0;
+        if (XGetDeviceChanges(XDEVICE_TYPE_MEMORY_UNIT, &ins, &rem))
+        {
+            for (int i = 0; i < MAX_PORTS; ++i)
+            {
+                DWORD maskA = 1u << i;
+                DWORD maskB = 1u << (i + 16);
+                if (ins & maskA) g_muPresent[i][0] = true;
+                if (ins & maskB) g_muPresent[i][1] = true;
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

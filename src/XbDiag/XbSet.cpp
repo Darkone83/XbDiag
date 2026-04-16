@@ -33,6 +33,7 @@
 #include "ControllerTest.h"
 #include "StressTest.h"
 #include "StressMath.h"
+#include "StressTestGPU.h"
 extern void StressTest_AutoRun(HANDLE hReport, DWORD durationMs);
 extern void RamStress_AutoRun(HANDLE hReport, DWORD durationMs);
 
@@ -103,10 +104,13 @@ bool XbSet_LoadSettings()
     g_autoSettings.runCtrlTest = false;
     g_autoSettings.runCpuStress = false;
     g_autoSettings.runRamStress = false;
+    g_autoSettings.runGpuStress = false;
     g_autoSettings.cpuStressHours = 0;
     g_autoSettings.cpuStressMins = 30;
     g_autoSettings.ramStressHours = 0;
     g_autoSettings.ramStressMins = 30;
+    g_autoSettings.gpuStressHours = 0;
+    g_autoSettings.gpuStressMins = 30;
     g_autoSettings.stressLoops = 1;
     g_autoSettings.altStressMode = false;
     g_autoSettings.shutdownAfter = false;
@@ -147,10 +151,13 @@ bool XbSet_LoadSettings()
         if (StrEq(key, "CTRLTEST"))     g_autoSettings.runCtrlTest = on;
         if (StrEq(key, "CPUSTRESS"))    g_autoSettings.runCpuStress = on;
         if (StrEq(key, "RAMSTRESS"))    g_autoSettings.runRamStress = on;
+        if (StrEq(key, "GPUSTRESS"))    g_autoSettings.runGpuStress = on;
         if (StrEq(key, "CPU_HRS"))      g_autoSettings.cpuStressHours = ParseInt(val, 0, 99, 0);
         if (StrEq(key, "CPU_MIN"))      g_autoSettings.cpuStressMins = ParseInt(val, 0, 59, 30);
         if (StrEq(key, "RAM_HRS"))      g_autoSettings.ramStressHours = ParseInt(val, 0, 99, 0);
         if (StrEq(key, "RAM_MIN"))      g_autoSettings.ramStressMins = ParseInt(val, 0, 59, 30);
+        if (StrEq(key, "GPU_HRS"))      g_autoSettings.gpuStressHours = ParseInt(val, 0, 99, 0);
+        if (StrEq(key, "GPU_MIN"))      g_autoSettings.gpuStressMins = ParseInt(val, 0, 59, 30);
         if (StrEq(key, "LOOPS"))        g_autoSettings.stressLoops = ParseInt(val, 1, 99, 1);
         if (StrEq(key, "ALT_STRESS"))   g_autoSettings.altStressMode = on;
         if (StrEq(key, "SHUTDOWN"))     g_autoSettings.shutdownAfter = on;
@@ -194,10 +201,13 @@ bool XbSet_SaveSettings()
     WL("CTRLTEST", g_autoSettings.runCtrlTest);
     WL("CPUSTRESS", g_autoSettings.runCpuStress);
     WL("RAMSTRESS", g_autoSettings.runRamStress);
+    WL("GPUSTRESS", g_autoSettings.runGpuStress);
     WN("CPU_HRS", g_autoSettings.cpuStressHours);
     WN("CPU_MIN", g_autoSettings.cpuStressMins);
     WN("RAM_HRS", g_autoSettings.ramStressHours);
     WN("RAM_MIN", g_autoSettings.ramStressMins);
+    WN("GPU_HRS", g_autoSettings.gpuStressHours);
+    WN("GPU_MIN", g_autoSettings.gpuStressMins);
     WN("LOOPS", g_autoSettings.stressLoops);
     WL("ALT_STRESS", g_autoSettings.altStressMode);
     WL("SHUTDOWN", g_autoSettings.shutdownAfter);
@@ -431,9 +441,10 @@ void XbSet_AutoRun(const DiagLogo& logo)
     const bool doAlt = g_autoSettings.altStressMode;
     const bool doCpu = g_autoSettings.runCpuStress;
     const bool doRam = g_autoSettings.runRamStress;
+    const bool doGpu = g_autoSettings.runGpuStress;
 
     // Total steps: non-stress modules run once, stress modules run once per loop
-    int stressStepsPerLoop = (doCpu ? 1 : 0) + (doRam ? 1 : 0);
+    int stressStepsPerLoop = (doCpu ? 1 : 0) + (doRam ? 1 : 0) + (doGpu ? 1 : 0);
     int total = 0;
     if (g_autoSettings.runSysInfo)   ++total;
     if (g_autoSettings.runVideoInfo) ++total;
@@ -450,10 +461,12 @@ void XbSet_AutoRun(const DiagLogo& logo)
     // Per-stress duration in ms
     DWORD cpuMs = DurToMs(g_autoSettings.cpuStressHours, g_autoSettings.cpuStressMins);
     DWORD ramMs = DurToMs(g_autoSettings.ramStressHours, g_autoSettings.ramStressMins);
+    DWORD gpuMs = DurToMs(g_autoSettings.gpuStressHours, g_autoSettings.gpuStressMins);
 
-    char cpuLabel[16], ramLabel[16];
+    char cpuLabel[16], ramLabel[16], gpuLabel[16];
     FmtDurLabel(g_autoSettings.cpuStressHours, g_autoSettings.cpuStressMins, cpuLabel, sizeof(cpuLabel));
     FmtDurLabel(g_autoSettings.ramStressHours, g_autoSettings.ramStressMins, ramLabel, sizeof(ramLabel));
+    FmtDurLabel(g_autoSettings.gpuStressHours, g_autoSettings.gpuStressMins, gpuLabel, sizeof(gpuLabel));
 
     HANDLE hf = CreateFileA(REPORT_PATH, GENERIC_WRITE, 0,
         NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -476,6 +489,11 @@ void XbSet_AutoRun(const DiagLogo& logo)
 
         StrCopy(line, sizeof(line), "RAM stress duration: ");
         StrCat2(line, sizeof(line), line, ramLabel);
+        StrCat2(line, sizeof(line), line, "\r\n");
+        WriteFile(hf, line, StrLen(line), &w, NULL);
+
+        StrCopy(line, sizeof(line), "GPU stress duration: ");
+        StrCat2(line, sizeof(line), line, gpuLabel);
         StrCat2(line, sizeof(line), line, "\r\n");
         WriteFile(hf, line, StrLen(line), &w, NULL);
 
@@ -550,13 +568,17 @@ void XbSet_AutoRun(const DiagLogo& logo)
     // Accumulators for cross-loop summary (only used when loops > 1)
     BYTE  acc_cpuMin = 255, acc_cpuMax = 0;
     BYTE  acc_fanMin = 255, acc_fanMax = 0;
-    DWORD acc_cpuPeakSum = 0;   // sum of per-loop peak temps for avg
+    DWORD acc_cpuPeakSum = 0;
     int   acc_cpuLoops = 0;
     bool  acc_thermalAny = false;
     DWORD acc_ramSweeps = 0;
     DWORD acc_ramErrors = 0;
     bool  acc_ramFailed = false;
     int   acc_ramLoops = 0;
+    DWORD acc_gpuLoops = 0;
+    float acc_gpuPeak = 0.f;
+    float acc_gpuMin = 9999.f;
+    int   acc_gpuRuns = 0;
 
     for (int loop = 0; loop < loops; ++loop)
     {
@@ -650,11 +672,47 @@ void XbSet_AutoRun(const DiagLogo& logo)
 
             ++step;
         }
+
+        if (doGpu)
+        {
+            char statusLabel[48];
+            StrCopy(statusLabel, sizeof(statusLabel), "GPU STRESS");
+            if (loopLabel[0]) { StrCat2(statusLabel, sizeof(statusLabel), statusLabel, "  "); StrCat2(statusLabel, sizeof(statusLabel), statusLabel, loopLabel); }
+
+            char subMsg[32];
+            StrCopy(subMsg, sizeof(subMsg), gpuLabel);
+
+            DrawAutoStatus(logo, statusLabel, step, total, subMsg);
+
+            if (reportOK)
+            {
+                char secName[48];
+                StrCopy(secName, sizeof(secName), "GPU STRESS TEST");
+                if (loopLabel[0]) { StrCat2(secName, sizeof(secName), secName, " - "); StrCat2(secName, sizeof(secName), secName, loopLabel); }
+                RSection(hf, secName);
+                GpuStress_AutoRun(hf, gpuMs);
+                DWORD _w; WriteFile(hf, "\r\n", 2, &_w, NULL);
+            }
+            else
+            {
+                GpuStress_AutoRun(INVALID_HANDLE_VALUE, gpuMs);
+            }
+
+            // Accumulate per-loop GPU results
+            acc_gpuLoops += GpuAutoRun_GetLoops();
+            float lPeak = GpuAutoRun_GetPeakFPS();
+            float lMin = GpuAutoRun_GetMinFPS();
+            if (lPeak > acc_gpuPeak) acc_gpuPeak = lPeak;
+            if (lMin < acc_gpuMin)  acc_gpuMin = lMin;
+            ++acc_gpuRuns;
+
+            ++step;
+        }
     }
 
     // ---- Multi-loop summary (only written when loops > 1) ----
 
-    if (loops > 1 && reportOK && (doCpu || doRam))
+    if (loops > 1 && reportOK && (doCpu || doRam || doGpu))
     {
         DWORD w;
         RSection(hf, "STRESS SUMMARY");
@@ -711,6 +769,27 @@ void XbSet_AutoRun(const DiagLogo& logo)
             WS("RAM total sweeps:    ", sw);
             WS("RAM total errors:    ", er);
             WS("RAM stress result:   ", acc_ramFailed ? "FAIL - errors detected" : "PASS");
+        }
+
+        if (doGpu && acc_gpuRuns > 0)
+        {
+            char gl[8], pk[12], mn[12];
+            IntToStr((int)acc_gpuLoops, gl, sizeof(gl));
+            WS("GPU scene loops:     ", gl);
+
+            char pkBuf[8]; IntToStr((int)acc_gpuPeak, pkBuf, sizeof(pkBuf));
+            StrCopy(pk, sizeof(pk), pkBuf); StrCat2(pk, sizeof(pk), pk, " fps");
+            WS("GPU peak FPS:        ", pk);
+
+            int iMin = (acc_gpuMin < 9000.f) ? (int)acc_gpuMin : 0;
+            char mnBuf[8]; IntToStr(iMin, mnBuf, sizeof(mnBuf));
+            StrCopy(mn, sizeof(mn), mnBuf); StrCat2(mn, sizeof(mn), mn, " fps");
+            WS("GPU min FPS:         ", mn);
+
+            WS("GPU stress result:   ",
+                (acc_gpuMin >= 20.f) ? "PASS" :
+                (acc_gpuMin >= 10.f) ? "WARNING - min FPS below 20" :
+                "FAIL - min FPS critically low");
         }
 
         WriteFile(hf, "\r\n", 2, &w, NULL);
@@ -807,7 +886,7 @@ void XbSet_AutoRun(const DiagLogo& logo)
 // Row types
 enum RowType {
     RT_BOOL, RT_CPU_HRS, RT_CPU_MIN, RT_RAM_HRS, RT_RAM_MIN,
-    RT_LOOPS, RT_ALT, RT_SHUTDOWN
+    RT_GPU_HRS, RT_GPU_MIN, RT_LOOPS, RT_ALT, RT_SHUTDOWN
 };
 
 struct SettingRow
@@ -834,13 +913,17 @@ static SettingRow s_rows[] =
     { "RAM STRESS",     "Repeated RAM sweeps",                      &g_autoSettings.runRamStress, RT_BOOL    },
     { "  RAM HOURS",    "RAM stress hours  [Left/Right]",           NULL,                         RT_RAM_HRS },
     { "  RAM MINS",     "RAM stress minutes  [Left/Right]",         NULL,                         RT_RAM_MIN },
+    { "GPU STRESS",     "Crystalline Grotto scene loop (NV2A load)",&g_autoSettings.runGpuStress, RT_BOOL    },
+    { "  GPU HOURS",    "GPU stress hours  [Left/Right]",           NULL,                         RT_GPU_HRS },
+    { "  GPU MINS",     "GPU stress minutes  [Left/Right]",         NULL,                         RT_GPU_MIN },
     { "STRESS LOOPS",   "Repeat stress sequence N times  [Left/Right]", NULL,                    RT_LOOPS   },
-    { "ALT STRESS",     "Interleave CPU+RAM loops (OFF=CPU-all-then-RAM-all)", &g_autoSettings.altStressMode, RT_ALT },
+    { "ALT STRESS",     "Interleave CPU+RAM+GPU loops",             &g_autoSettings.altStressMode, RT_ALT    },
     { "SHUTDOWN AFTER", "Power off Xbox on autorun completion",     &g_autoSettings.shutdownAfter, RT_SHUTDOWN },
 };
 static const int k_rowCount = sizeof(s_rows) / sizeof(s_rows[0]);
 
 static int  s_sel = 0;
+static int  s_scrollTop = 0;   // index of first visible row
 static bool s_saved = false;
 static bool s_saveFail = false;
 static bool s_deleted = false;
@@ -854,6 +937,7 @@ static bool EdgeDown(WORD cur, WORD prev, WORD btn)
 void XbSet_OnEnter()
 {
     s_sel = 0;
+    s_scrollTop = 0;
     s_saved = false;
     s_saveFail = false;
     s_deleted = false;
@@ -887,7 +971,23 @@ static void RenderXbSet(const DiagLogo& logo)
     HLine(y + LINE_H, LBL_X, SW - LM, COL_BORDER);
     y += LINE_H + 4.f;
 
-    for (int i = 0; i < k_rowCount; ++i)
+    // Compute how many rows fit in the usable area
+    const float usableH = BOT_BAR_Y - y;
+    const int visRows = (int)(usableH / ROW_H);
+
+    // Keep selection visible — scroll window tracks s_sel
+    if (s_sel < s_scrollTop) s_scrollTop = s_sel;
+    if (s_sel >= s_scrollTop + visRows) s_scrollTop = s_sel - visRows + 1;
+    if (s_scrollTop < 0) s_scrollTop = 0;
+
+    // Scroll indicator arrows
+    if (s_scrollTop > 0)
+        DrawText(SW - LM - 16.f, CONTENT_Y + 6.f, "\x1E", 1.2f, COL_DIM); // up arrow hint
+    if (s_scrollTop + visRows < k_rowCount)
+        DrawText(SW - LM - 16.f, BOT_BAR_Y - LINE_H - 2.f, "\x1F", 1.2f, COL_DIM); // down arrow hint
+
+    const int iEnd = (s_scrollTop + visRows < k_rowCount) ? s_scrollTop + visRows : k_rowCount;
+    for (int i = s_scrollTop; i < iEnd; ++i)
     {
         bool sel = (i == s_sel);
         if (sel)
@@ -902,7 +1002,8 @@ static void RenderXbSet(const DiagLogo& logo)
         DWORD lblCol = sel ? COL_WHITE : COL_GRAY;
 
         // Indented sub-rows (CPU/RAM duration) get a slightly dimmer base colour
-        if (rt == RT_CPU_HRS || rt == RT_CPU_MIN || rt == RT_RAM_HRS || rt == RT_RAM_MIN)
+        if (rt == RT_CPU_HRS || rt == RT_CPU_MIN || rt == RT_RAM_HRS || rt == RT_RAM_MIN ||
+            rt == RT_GPU_HRS || rt == RT_GPU_MIN)
             lblCol = sel ? COL_YELLOW : D3DCOLOR_XRGB(140, 130, 80);
 
         DrawText(LBL_X, y, s_rows[i].label, 1.2f, lblCol);
@@ -932,6 +1033,16 @@ static void RenderXbSet(const DiagLogo& logo)
         else if (rt == RT_RAM_MIN)
         {
             char vb[8]; IntToStr(g_autoSettings.ramStressMins, vb, sizeof(vb));
+            DrawText(CHK_X, y, vb, 1.35f, COL_CYAN);
+        }
+        else if (rt == RT_GPU_HRS)
+        {
+            char vb[8]; IntToStr(g_autoSettings.gpuStressHours, vb, sizeof(vb));
+            DrawText(CHK_X, y, vb, 1.35f, COL_CYAN);
+        }
+        else if (rt == RT_GPU_MIN)
+        {
+            char vb[8]; IntToStr(g_autoSettings.gpuStressMins, vb, sizeof(vb));
             DrawText(CHK_X, y, vb, 1.35f, COL_CYAN);
         }
         else if (rt == RT_LOOPS)
@@ -993,6 +1104,12 @@ void XbSet_Tick(const DiagLogo& logo)
             if (g_autoSettings.ramStressMins < 59) ++g_autoSettings.ramStressMins;
             else { g_autoSettings.ramStressMins = 0; if (g_autoSettings.ramStressHours < 99) ++g_autoSettings.ramStressHours; }
         }
+        if (rt == RT_GPU_HRS) { if (g_autoSettings.gpuStressHours < 99) ++g_autoSettings.gpuStressHours; }
+        if (rt == RT_GPU_MIN)
+        {
+            if (g_autoSettings.gpuStressMins < 59) ++g_autoSettings.gpuStressMins;
+            else { g_autoSettings.gpuStressMins = 0; if (g_autoSettings.gpuStressHours < 99) ++g_autoSettings.gpuStressHours; }
+        }
         if (rt == RT_LOOPS) { if (g_autoSettings.stressLoops < 99) ++g_autoSettings.stressLoops; }
     }
 
@@ -1010,6 +1127,12 @@ void XbSet_Tick(const DiagLogo& logo)
         {
             if (g_autoSettings.ramStressMins > 0) --g_autoSettings.ramStressMins;
             else if (g_autoSettings.ramStressHours > 0) { --g_autoSettings.ramStressHours; g_autoSettings.ramStressMins = 59; }
+        }
+        if (rt == RT_GPU_HRS) { if (g_autoSettings.gpuStressHours > 0) --g_autoSettings.gpuStressHours; }
+        if (rt == RT_GPU_MIN)
+        {
+            if (g_autoSettings.gpuStressMins > 0) --g_autoSettings.gpuStressMins;
+            else if (g_autoSettings.gpuStressHours > 0) { --g_autoSettings.gpuStressHours; g_autoSettings.gpuStressMins = 59; }
         }
         if (rt == RT_LOOPS) { if (g_autoSettings.stressLoops > 1) --g_autoSettings.stressLoops; }
     }

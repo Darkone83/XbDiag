@@ -15,6 +15,7 @@
 #include "font.h"
 #include "input.h"
 #include "DiagCommon.h"
+#include "FileExplorerMU.h"
 #include <xtl.h>
 #include <winsockx.h>
 
@@ -391,7 +392,7 @@ static void MapFtpPath(const char* virt, char* out, int outLen)
     {
         int port = a[1] - '1';          // 0-3
         int slot = a[6] - '1';          // 0-1
-        char letter = 'A' + (char)(port * 2 + slot);
+        char letter = FE_MU_Letter(port, slot);
         // Remaining path after the label (e.g. "/subdir" or "")
         const char* rest = a + 7;       // skip "P1-MMU1"
         out[0] = letter; out[1] = ':'; out[2] = '\\'; out[3] = '\0';
@@ -448,13 +449,13 @@ static void FtpDoListing()
                 FtpAppendListLine(driveName, true, 0);
             }
         }
-        // Memory Units A-H
+        // Memory Units
         for (int mu = 0; mu < 8; ++mu)
         {
             int port = mu / 2, slot = mu % 2;
             if (!IsMUPresent(port, slot)) continue;
             char muPat[8];
-            muPat[0] = 'A' + (char)mu; muPat[1] = ':'; muPat[2] = '\\'; muPat[3] = '\0';
+            muPat[0] = FE_MU_Letter(port, slot); muPat[1] = ':'; muPat[2] = '\\'; muPat[3] = '\0';
             // Use GetFileAttributesA — FindFirstFile("X:\\*") fails on empty MUs
             DWORD attr = GetFileAttributesA(muPat);
             if (attr != 0xFFFFFFFF && (attr & FILE_ATTRIBUTE_DIRECTORY))
@@ -1063,6 +1064,31 @@ void FtpServ_Tick()
             g_ftp.sendLen = 0; g_ftp.sendOff = 0;
             g_ftp.state = FTP_LISTEN;
             return;
+        }
+    }
+
+    // ---- Drain secondary connection attempts --------------------------------
+    // FileZilla opens a second ctrl connection for transfers while keeping the
+    // browsing connection open. Our server is single-session, so we accept and
+    // immediately reject any connection that arrives while already connected.
+    // This is critical: leaving it stuck in the listen backlog causes FileZilla
+    // to wait until its own connection timeout fires, which it reports as a
+    // disconnect. Sending 421 immediately tells FileZilla to reuse the existing
+    // session instead of waiting on the stalled second connection.
+    if ((g_ftp.state == FTP_CONNECTED || g_ftp.state == FTP_TRANSFER) &&
+        g_ftp.listenSock != INVALID_SOCKET)
+    {
+        SOCKADDR_IN ca; int caLen = sizeof(ca);
+        SOCKET cs = accept(g_ftp.listenSock, (SOCKADDR*)&ca, &caLen);
+        if (cs != INVALID_SOCKET)
+        {
+            // Send 421 synchronously — this socket is about to be closed so we
+            // can't rely on the async send-drain. Use a direct blocking send.
+            // The message is short enough to fit in one TCP segment.
+            const char* k_busy = "421 Only one session permitted.\r\n";
+            int len = 0; while (k_busy[len]) len++;
+            send(cs, k_busy, len, 0);
+            closesocket(cs);
         }
     }
 

@@ -543,6 +543,47 @@ extern "C"
         BOOLEAN WordFlag, PULONG Value);
     ULONG __stdcall HalWriteSMBusValue(UCHAR Address, UCHAR Command,
         BOOLEAN WordFlag, ULONG Value);
+    VOID  __stdcall KeStallExecutionProcessor(ULONG Microseconds);
+}
+
+// ============================================================================
+// SMBusControllerReset
+//
+// Clears any stuck state in the nForce SMBus controller before probing.
+// Required on softmodded consoles: the exploit payload hijacks execution
+// mid-game and may leave the SMBus controller with a pending transaction
+// (GS_INTER / busy bit set). HalReadSMBusValue's internal retry loop has
+// no hard timeout — it spins forever if the controller never clears, causing
+// the 100%-reproducible "reading data" hang seen on softmod hardware.
+//
+// The nForce SMBus I/O register block sits at base 0xC000:
+//   0xC000  Global Status  — write 1-bits to clear (W1C)
+//   0xC001  Global Status high byte
+//   0xC002  Global Enable
+//   0xC004  Host Address
+//   0xC008  Host Command
+//   0xC009  Host Data 0
+//
+// Writing 0xFF to 0xC000 clears all pending/error/in-progress status bits,
+// returning the controller to idle so the kernel's arbitration loop can
+// proceed normally on the next HalReadSMBusValue call.
+//
+// Safe to call unconditionally — a no-op on hardware that is already idle.
+// Call once at the top of ReadSysData() before any SMBus probing begins.
+// ============================================================================
+void SMBusControllerReset()
+{
+    // W1C — clear all status bits in the nForce SMBus global status register.
+    __asm
+    {
+        mov dx, 0xC000
+        mov al, 0xFF
+        out dx, al
+    }
+
+    // Allow the controller and any bus devices to fully settle.
+    // 2ms is conservative but harmless; PIC and ADM1032 need <100us.
+    KeStallExecutionProcessor(2000);
 }
 
 bool SMBusRead(BYTE addr, BYTE reg, BYTE& outVal)

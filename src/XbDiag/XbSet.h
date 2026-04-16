@@ -14,13 +14,12 @@
 // and results are written to D:\XbDiag.txt.
 //
 // Stress test modes:
-//   Normal:      CPU stress runs for cpuStress duration, then RAM stress.
-//                Sequence repeated stressLoops times total.
-//   Alt (interleaved): CPU loop then RAM loop alternating, stressLoops times.
-//   Loop count:  1-99. Each loop runs the full CPU+RAM sequence.
+//   Normal:      CPU stress runs for cpuStress duration, then RAM stress,
+//                then GPU stress. Sequence repeated stressLoops times total.
+//   Alt (interleaved): CPU/RAM/GPU loop alternating, stressLoops times.
+//   Loop count:  1-99. Each loop runs the full CPU+RAM+GPU sequence.
 //
-// Shutdown after completion: calls HalReturnToFirmware(HalPowerDownRoutine)
-// after the report is written.
+// Shutdown after completion: calls PIC16L power-off command after report.
 //
 // Controller test waits up to 60 seconds for [A] to confirm presence.
 // If no input arrives the test is skipped and noted in the report.
@@ -43,19 +42,20 @@ struct AutoSettings
     // Stress tests
     bool runCpuStress;
     bool runRamStress;
+    bool runGpuStress;
 
     // Per-stress durations (independent)
     int  cpuStressHours;   // 0-99
     int  cpuStressMins;    // 0-59  (min 1 min if hours==0)
     int  ramStressHours;   // 0-99
     int  ramStressMins;    // 0-59  (min 1 min if hours==0)
+    int  gpuStressHours;   // 0-99
+    int  gpuStressMins;    // 0-59  (min 1 min if hours==0)
 
-    // Stress loop count: run the CPU+RAM stress sequence this many times
+    // Stress loop count: run the CPU+RAM+GPU stress sequence this many times
     int  stressLoops;      // 1-99
 
-    // Alt stress mode: interleave CPU and RAM per loop
-    // false = all CPU loops then all RAM loops
-    // true  = CPU, RAM, CPU, RAM, ... per loop count
+    // Alt stress mode: interleave CPU/RAM/GPU loops
     bool altStressMode;
 
     // Shutdown Xbox after autorun report is written
