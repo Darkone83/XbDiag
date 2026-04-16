@@ -118,9 +118,8 @@ enum UpdateState
     UPST_UP_TO_DATE,
     UPST_AVAIL,
     UPST_RECV_XBA,      // downloading update.xba
-    UPST_EXTRACT_XBA,   // extracting update.xba
-    UPST_RECV_XBE,      // (kept for compat — unused in new flow)
-    UPST_RECV_VER2,
+    UPST_EXTRACT_XBA,   // extracting update.xba via Xba_Extract
+    UPST_RECV_VER2,     // settle wait + downloading XbDiag.ver
     UPST_WRITE_DONE,
     UPST_ERROR,
 };
@@ -460,6 +459,8 @@ void Update_SetPaths(const char* xbeDir)
 {
     if (xbeDir && xbeDir[0] != '\0')
     {
+        // k_xbeDest is used only as the XLaunchNewImage relaunch target after
+        // extraction completes. The XBA archive installs default.xbe itself.
         StrCopy(k_xbeDest, sizeof(k_xbeDest), xbeDir);
         AppendStr(k_xbeDest, sizeof(k_xbeDest), "default.xbe");
         StrCopy(s_verDest, sizeof(s_verDest), xbeDir);
@@ -589,7 +590,6 @@ static void Render(const DiagLogo& logo)
         case UPST_AVAIL:       ss = "Update available!  Press [A] to download"; sc = COL_YELLOW; break;
         case UPST_RECV_XBA:    ss = "Downloading update.xba...";      sc = COL_CYAN;   break;
         case UPST_EXTRACT_XBA: ss = "Extracting update...";           sc = COL_CYAN;   break;
-        case UPST_RECV_XBE:    ss = "Downloading update...";          sc = COL_CYAN;   break;
         case UPST_RECV_VER2:   ss = "Finalising update...";           sc = COL_CYAN;   break;
         case UPST_WRITE_DONE:  ss = "Update complete!  Relaunch the app for the new version."; sc = COL_GREEN; break;
         case UPST_ERROR:       ss = s_errorMsg; sc = COL_RED; break;
@@ -600,7 +600,7 @@ static void Render(const DiagLogo& logo)
     y += LH * 2.f;
 
     if (s_state == UPST_RECV_XBA || s_state == UPST_EXTRACT_XBA ||
-        s_state == UPST_RECV_XBE || s_state == UPST_WRITE_DONE)
+        s_state == UPST_WRITE_DONE)
     {
         const float BAR_W = SW - LM * 2.f, BAR_H = 22.f;
         const char* progLbl = (s_state == UPST_EXTRACT_XBA)
@@ -1092,7 +1092,7 @@ void Update_Tick(const DiagLogo& logo)
         {
             FE_MU_MountAll();
 
-            // Build base dir from k_xbeDest e.g. "D:\"
+            // Derive install directory from k_xbeDest (strip "default.xbe" suffix)
             char base[64]; StrCopy(base, sizeof(base), k_xbeDest);
             int blen = StrLen(base);
             for (int i = blen - 1; i >= 0; --i)
@@ -1234,7 +1234,6 @@ void Update_Tick(const DiagLogo& logo)
     case UPST_AVAIL:
     case UPST_RECV_XBA:
     case UPST_EXTRACT_XBA:
-    case UPST_RECV_XBE:
     case UPST_RECV_VER2:
     case UPST_WRITE_DONE:
     case UPST_ERROR:
