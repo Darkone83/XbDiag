@@ -37,6 +37,7 @@
 #include "FtpServ.h"
 #include "XbSet.h"
 #include "Update.h"
+#include "HttpRptSrv.h"
 #include "lcd.h"
 
 #include <xtl.h>
@@ -290,6 +291,10 @@ void __cdecl main()
     // Must be called after InitD3D() — that's where g_isTrueInterlaced is set.
     Font_SetSD(g_isTrueInterlaced);
 
+    // Note: CRT overscan compensation is baked into DiagCommon.h constants.
+    // BOT_BAR_H=64 / BOT_BAR_Y=416 places bottom bar text within the
+    // XDK-specified 7.5% title safe boundary on all CRT displays.
+
     InitInput();
 
     // Detect and initialise physical LCD display (if fitted at SMBus 0x3C).
@@ -336,6 +341,7 @@ void __cdecl main()
     // Kick off the background version check immediately after autorun.
     // The result is polled below before entering the main game loop.
     Update_StartBootCheck();
+    HttpRptSrv_Start();
 
     // Poll the update check while rendering a holding frame.
     // The check is fast (DNS + one TCP round trip) but non-blocking,
@@ -438,5 +444,6 @@ void __cdecl main()
         // ensures the listen socket accepts connections and keepalive NOOPs
         // are serviced even when the user has navigated away from FileExplorer.
         FtpServ_Tick();
+        HttpRptSrv_Poll();
     }
 }

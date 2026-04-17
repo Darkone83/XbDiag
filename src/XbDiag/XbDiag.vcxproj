@@ -29,6 +29,7 @@
     <ClCompile Include="HddBench.cpp" />
     <ClCompile Include="HddInfo.cpp" />
     <ClCompile Include="HddSmart.cpp" />
+    <ClCompile Include="HttpRtpSrv.cpp" />
     <ClCompile Include="input.cpp" />
     <ClCompile Include="Keyboard.cpp" />
     <ClCompile Include="Lcd.cpp" />
@@ -69,6 +70,7 @@
     <ClInclude Include="HddBench.h" />
     <ClInclude Include="HddInfo.h" />
     <ClInclude Include="HddSmart.h" />
+    <ClInclude Include="HttpRptSrv.h" />
     <ClInclude Include="input.h" />
     <ClInclude Include="Keyboard.h" />
     <ClInclude Include="Lcd.h" />

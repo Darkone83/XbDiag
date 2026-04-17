@@ -2116,6 +2116,60 @@ void SysInfo_GetLCDData(LCDData& out)
     out.macAddr = s_data.macAddr;
 }
 // ============================================================================
+// SysInfo_GetSnapshot — exposes s_data fields for the HTTP report server.
+// Returns false if data has not been loaded yet.
+// ============================================================================
+
+bool SysInfo_GetSnapshot(SysSnapshot& out)
+{
+    if (!s_dataLoaded)
+    {
+        out.cpuIC = "";
+        out.cpuSpeed = "";
+        out.cpuBrand = "";
+        out.memTotal = "";
+        out.memConfig = "";
+        out.boardRev = "";
+        out.serialNum = "";
+        out.modchip = "";
+        out.hdMod = "";
+        out.biosVer = "";
+        out.encName = "";
+        out.avPack = "";
+        out.tempCPU = "";
+        out.tempAmbient = "";
+        out.hddModel = "";
+        out.hddSize = "";
+        out.hddUDMA = "";
+        out.macAddr = "";
+        out.ipAddr = "";
+        out.gpuSpeed = "";
+        return false;
+    }
+    out.cpuIC = s_data.cpuIC;
+    out.cpuSpeed = s_data.cpuSpeedMHz;
+    out.cpuBrand = s_data.cpuBrand;
+    out.memTotal = s_data.memTotal;
+    out.memConfig = s_data.memConfig;
+    out.boardRev = s_data.boardRevFinal;
+    out.serialNum = s_data.serialNum;
+    out.modchip = s_data.modchipName;
+    out.hdMod = s_data.hdModVer;
+    out.biosVer = s_data.biosVer;
+    out.encName = s_data.encName;
+    out.avPack = s_data.avPack;
+    out.tempCPU = s_data.tempCPU;
+    out.tempAmbient = s_data.tempAmbient;
+    out.hddModel = s_data.hddModel;
+    out.hddSize = s_data.hddSizeGB;
+    out.hddUDMA = s_data.hddUDMA;
+    out.macAddr = s_data.macAddr;
+    out.ipAddr = s_data.ipAddr;
+    out.gpuSpeed = s_data.gpuSpeedMHz;
+    return true;
+}
+
+// ============================================================================
 // AutoRun — headless data gather + report write for XbSet automation
 // ============================================================================
 

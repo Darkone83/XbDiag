@@ -754,8 +754,11 @@ static void Render(const DiagLogo& logo)
                         }
                         if (fit == 0) fit = 1;
 
-                        // Draw this segment left-aligned if visible
-                        if (lineY + LINE_H > CT + LINE_H && lineY < CT + CH - 2.f)
+                        // Draw this segment only when fully inside the frame content area.
+                        // Top: line top must be at least 2px below the top border (CT).
+                        // Bottom: line bottom must not exceed the bottom border (CT + CH).
+                        // This prevents partial lines bleeding above or below the box edges.
+                        if (lineY >= CT + 2.f && lineY + LINE_H <= CT + CH)
                         {
                             char seg[128];
                             int copy = fit < 127 ? fit : 127;

@@ -34,8 +34,17 @@ extern LPDIRECT3DDEVICE8 g_pDevice;
 static const float SW = 640.0f;
 static const float SH = 480.0f;
 static const float TOP_BAR_H = 56.0f;
-static const float BOT_BAR_H = 30.0f;
-static const float BOT_BAR_Y = SH - BOT_BAR_H;
+
+// BOT_BAR_Y / BOT_BAR_H are set for CRT title-safe compliance.
+// Microsoft XDK guidelines specify 85% safe area = 7.5% inset per edge.
+// At 480 design units: unsafe zone starts at y > 444 (480 * 0.925).
+// Bottom bar text renders at: botY = BOT_BAR_Y + (BOT_BAR_H - textH) * 0.5
+// With BOT_BAR_H=64, BOT_BAR_Y=416: botY = 416 + (64-9.1)*0.5 = 443.4
+// This places hint text just inside the 7.5% title safe boundary on all CRTs.
+// Modules using BOT_BAR_Y as their content lower limit gain 34px of usable space
+// compared to the original BOT_BAR_Y=450.
+static const float BOT_BAR_H = 64.0f;
+static const float BOT_BAR_Y = SH - BOT_BAR_H;   // 416.0
 static const float CONTENT_Y = TOP_BAR_H + 2.0f;
 static const float TEXT_SCALE = 1.5f;
 static const float LINE_H = 18.0f;

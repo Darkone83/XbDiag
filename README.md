@@ -691,6 +691,25 @@ Requires a network connection and DHCP. Reports `NO LINK` if no IP address is av
 
 ---
 
+## Web Dashboard
+
+XbDiag includes a built-in HTTP server running on port 80, started automatically at boot alongside the FTP server. No configuration or user interaction is required — open a browser on any device on the same network and navigate to the Xbox's IP address.
+
+The IP address is shown in System Info under **Network** and on the Physical LCD if fitted.
+
+| Page | URL | Description |
+|------|-----|-------------|
+| System Info | `http://<ip>/sysinfo` | Live hardware snapshot — CPU, memory, board, video, thermal, storage, network. Auto-refreshes every 30 seconds. Shows live stress test data when a stress test is running. |
+| Report | `http://<ip>/report` | Views diagnostic report files saved to `D:\`. Auto-detects the most recent report. File switcher links to all text exports. |
+| Settings | `http://<ip>/settings` | Full automation settings editor — all module toggles, stress durations, loop count, and run options. Saves directly to `D:\XbDiag.set` using the same write path as the on-screen editor. |
+| About | `http://<ip>/about` | Version info and team credits. |
+
+Binary export files (`bios.bin`, `eeprom.bin`) can be downloaded directly from the Settings page — no FTP client required.
+
+The server is single-threaded and polled once per frame. It never stalls the UI. One connection is served at a time; subsequent requests queue naturally via the TCP listen backlog.
+
+---
+
 ## About
 
 <div align=center>
@@ -735,9 +754,12 @@ Place the built `default.xbe` and the `tex\` folder together in the same directo
 \
   default.xbe
   tex\
-    xb.dds      (XbDiag logo, shown in top bar on every screen)
-    dc.dds      (Darkone Customs credit logo)
-    tr.dds      (Team Resurgent credit logo)
+    xb.dds          (XbDiag logo, shown in top bar on every screen)
+    dc.dds          (Darkone Customs credit logo)
+    tr.dds          (Team Resurgent credit logo)
+    crystal_n.dds   (GPU Stress — crystal normal map)
+    crystal_cube.dds (GPU Stress — crystal environment cube map)
+    rock.dds        (GPU Stress — cave background rock texture)
 ```
 
 Diagnostic output files written by the tool:

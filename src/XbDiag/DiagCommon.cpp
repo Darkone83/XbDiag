@@ -446,10 +446,10 @@ void DrawPageChrome(const DiagLogo& logo,
     float divX = LOGO_CX + LOGO_DISP_W * 0.5f + 8.f;
     VLine(divX, 4.f, TOP_BAR_H - 4.f, COL_BORDER);
 
-    // --- Title in top bar (right-aligned) ---
+    // --- Title in top bar (right-aligned, respect LM margin) ---
     const float TS = 1.3f;
     float barTextY = (TOP_BAR_H - 7.f * TS) * 0.5f;
-    DrawTextR(SW - 10.f, barTextY, title, TS, COL_WHITE);
+    DrawTextR(SW - LM, barTextY, title, TS, COL_WHITE);
 
     // --- Hints in bottom bar ---
     // Badge is drawn right-aligned at SW-LM. Measure it first so we know
