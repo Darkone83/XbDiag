@@ -1007,9 +1007,9 @@ static void BuildSettings()
     if (s_saveAttempted)
     {
         if (s_saveOK)
-            BA("<div class='info ok'><strong>Settings saved</strong> to D:\\XbDiag.set</div>\n");
+            BA("<div class='info ok'><strong>Settings saved</strong> to XbDiag.set</div>\n");
         else
-            BA("<div class='info err'><strong>Save failed</strong> — could not write D:\\XbDiag.set</div>\n");
+            BA("<div class='info err'><strong>Save failed</strong> — could not write XbDiag.set</div>\n");
         s_saveAttempted = false;
     }
 
@@ -1060,14 +1060,14 @@ static void BuildSettings()
     // Sticky save bar
     BA("<div id=savebar>"
         "<button class=savebtn type=submit>&#10003; Save Settings</button>"
-        "<span style='font-size:12px;color:#3A4258'>Saves to D:\\XbDiag.set</span>"
+        "<span style='font-size:12px;color:#3A4258'>Saves to XbDiag.set</span>"
         "</div>\n");
 
     BA("</form>\n");
 
     // Export files section
     BA("<div class=sec style='margin-top:24px'>Export Files</div>");
-    BA("<div class=info>Files saved to <code>D:\\</code> by XbDiag modules. "
+    BA("<div class=info>Files saved to <code>xbe folder</code> by XbDiag modules. "
         "Enable FTP in File Explorer to transfer files to your PC. "
         "Binary files can be downloaded directly from this page.</div>\n");
 

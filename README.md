@@ -778,9 +778,9 @@ smbid.id       (created automatically if not present; user-editable SMBus device
 MU Utilities asset cache (downloaded on first use, retained for subsequent writes):
 
 ```
-D:\resources\SK.xba       (Skeleton Key archive — downloaded from update server on demand)
-D:\resources\ENDGAME.xba  (ENDGAME archive — downloaded from update server on demand)
-D:\resources\tmp\         (temporary extraction directory — created and cleaned up per operation)
+\resources\SK.xba       (Skeleton Key archive — downloaded from update server on demand)
+\resources\ENDGAME.xba  (ENDGAME archive — downloaded from update server on demand)
+\resources\tmp\         (temporary extraction directory — created and cleaned up per operation)
 ```
 
 ---
