@@ -179,6 +179,10 @@ void DrawPageChrome(const DiagLogo& logo,
 #define SMBADDR_EEPROM    0xA8   // 93LC56 EEPROM
 #define SMBADDR_ICS       0xD2   // ICS clock generator
 
+// Clears any pending/error/busy state in the nForce SMBus controller (W1C at 0xC000).
+// Call before any SMBus probe sequence that follows NAK-generating transactions.
+void SMBusControllerReset();
+
 // Returns true on ACK, writes value to outVal.  On NAK / error returns false.
 bool SMBusRead(BYTE addr, BYTE reg, BYTE& outVal);
 bool SMBusReadWord(BYTE addr, BYTE reg, WORD& outVal);
