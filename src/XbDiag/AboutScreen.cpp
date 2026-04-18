@@ -193,14 +193,17 @@ static void DrawCreditCard(float cx, float cy,
     VLine(x0, y0, y1, COL_BORDER);
     VLine(x1 - 1.f, y0, y1, COL_BORDER);
 
-    // Logo - centered horizontally, in upper ~60% of card
-    float logoCY = y0 + LOGO_DISP_H * 0.5f + 8.f;
+    // Logo + name block centered vertically within the card
+    // Block = LOGO_DISP_H + 6px gap + LINE_H text
+    const float NAME_S = 1.4f;
+    const float BLOCK_H = LOGO_DISP_H + 6.f + LINE_H;
+    float blockTop = cy - BLOCK_H * 0.5f;
+    float logoCY = blockTop + LOGO_DISP_H * 0.5f;
     DrawLogo(cardLogo, cx, logoCY, LOGO_DISP_W, LOGO_DISP_H, 255);
     DiagResetShader();
 
-    // Name below logo
-    const float NAME_S = 1.4f;
-    float nameY = y0 + LOGO_DISP_H + 18.f;
+    // Name centered below logo
+    float nameY = blockTop + LOGO_DISP_H + 6.f;
     DrawText(cx - TW(name, NAME_S) * 0.5f, nameY, name, NAME_S, COL_WHITE);
 
     // Tagline below name
@@ -419,34 +422,37 @@ static void Render(const DiagLogo& logo)
         "Darkone Customs", "");
 
     // -------------------------------------------------------------------------
-    // Fact ticker  -  centered in lower panel, above bot bar
+    // Fact ticker  -  centered in gap between card bottom and panel bottom
     // -------------------------------------------------------------------------
-    BYTE alpha = Ftoi(s_factAlpha * 220.f);
-    if (alpha > 0)
     {
-        DWORD fc = (((DWORD)alpha) << 24) | 0x00B8CCD8;
-        const char* fact = s_facts[s_factIdx];
-        float maxW = SW - LM * 2.f;
-
-        if (TW(fact, 1.15f) <= maxW)
+        float cardBot = panelCY + CARD_H * 0.5f;
+        float tickerY = cardBot + (panelBot - cardBot) * 0.5f - 7.f;
+        BYTE alpha = Ftoi(s_factAlpha * 220.f);
+        if (alpha > 0)
         {
-            DrawText((SW - TW(fact, 1.15f)) * 0.5f, BOT_BAR_Y - 24.f, fact, 1.15f, fc);
-        }
-        else
-        {
-            // Split at space nearest midpoint
-            int len = 0; while (fact[len]) ++len;
-            int split = len / 2;
-            while (split > 0 && fact[split] != ' ') --split;
+            DWORD fc = (((DWORD)alpha) << 24) | 0x00B8CCD8;
+            const char* fact = s_facts[s_factIdx];
+            float maxW = SW - LM * 2.f;
 
-            char line1[128];
-            int n = split < 127 ? split : 127;
-            for (int i = 0; i < n; ++i) line1[i] = fact[i];
-            line1[n] = '\0';
-            const char* line2 = fact + split + 1;
+            if (TW(fact, 1.15f) <= maxW)
+            {
+                DrawText((SW - TW(fact, 1.15f)) * 0.5f, tickerY, fact, 1.15f, fc);
+            }
+            else
+            {
+                int len = 0; while (fact[len]) ++len;
+                int split = len / 2;
+                while (split > 0 && fact[split] != ' ') --split;
 
-            DrawText((SW - TW(line1, 1.1f)) * 0.5f, BOT_BAR_Y - 30.f, line1, 1.1f, fc);
-            DrawText((SW - TW(line2, 1.1f)) * 0.5f, BOT_BAR_Y - 16.f, line2, 1.1f, fc);
+                char line1[128];
+                int n = split < 127 ? split : 127;
+                for (int i = 0; i < n; ++i) line1[i] = fact[i];
+                line1[n] = '\0';
+                const char* line2 = fact + split + 1;
+
+                DrawText((SW - TW(line1, 1.1f)) * 0.5f, tickerY - 7.f, line1, 1.1f, fc);
+                DrawText((SW - TW(line2, 1.1f)) * 0.5f, tickerY + 7.f, line2, 1.1f, fc);
+            }
         }
     }
 

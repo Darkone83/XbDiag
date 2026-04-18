@@ -37,13 +37,14 @@ static const float X_RIGHT = 540.f;   // right group center-X
 static const float X_MID = 320.f;   // screen center
 
 // Vertical rows from CONTENT_Y
-// CONTENT_Y=58, BOT_BAR_Y=450, usable height=392px
-// TrigBar: label(16) + bar(52) + value(10) = 78px needs ~40px offset minimum
-static const float Y_TRIG = 50.f;    // trigger bar center (label clears top chrome)
-static const float Y_META = 122.f;   // BACK/START  BLACK/WHITE row
-static const float Y_STICK = 185.f;   // analog stick center
-static const float Y_DPAD = 335.f;   // d-pad cluster center
-static const float Y_FACE = 335.f;   // face button cluster center
+// CONTENT_Y=58, BOT_BAR_Y=416, usable height=358px
+// Triggers sit alongside the port status strip (same vertical band, flanking left/right).
+// This frees space so sticks shift up and D-pad/buttons fit without clipping.
+static const float Y_TRIG = 34.f;   // trigger center = B+34=92, bar spans 66..118
+static const float Y_META = 108.f;  // BACK/START  BLACK/WHITE row center = 166
+static const float Y_STICK = 170.f;  // analog stick center = 228
+static const float Y_DPAD = 298.f;  // d-pad cluster center = 356
+static const float Y_FACE = 298.f;  // face button cluster center = 356
 
 // Button box
 static const float BW = 30.f;
@@ -222,8 +223,8 @@ static void TrigBar(float cx, float cy, const char* lbl, int val)
     VLine(x0, y0, y1, COL_BORDER);
     VLine(x1, y0, y1, COL_BORDER);
 
-    // Label above bar
-    DrawText(cx - TW(lbl, 1.2f) * 0.5f, y0 - 16.f, lbl, 1.2f, COL_GRAY);
+    // Label to the right of bar — avoids top chrome clip at either screen edge
+    DrawText(x1 + 4.f, cy - 6.f, lbl, 1.2f, COL_GRAY);
 
     // Raw value below bar
     char t[6]; IntToStr(val, t, sizeof(t));
@@ -1234,7 +1235,7 @@ static void Render(const DiagLogo& logo, WORD cur,
     }
 
     // =========================================================
-    // TRIGGER BARS  — LT left, RT right
+    // TRIGGER BARS  — flanking port strip left and right
     // =========================================================
 
     TrigBar(X_LEFT, B + Y_TRIG, "LT", lt);
@@ -1278,7 +1279,7 @@ static void Render(const DiagLogo& logo, WORD cur,
     // =========================================================
     {
         const char* hdr = "MEMORY UNITS";
-        float muHdrY = B + Y_META + 34.f;
+        float muHdrY = B + Y_META + 24.f;
         DrawText(X_MID - TW(hdr, 1.1f) * 0.5f, muHdrY, hdr, 1.1f, COL_YELLOW);
 
         // Four port columns, centred at X_MID

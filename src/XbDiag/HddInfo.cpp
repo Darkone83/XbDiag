@@ -1086,58 +1086,6 @@ static void Render(const DiagLogo& logo)
     }
     else DrawText(COL_L, y1, "Drive not detected", 1.2f, COL_RED);
 
-    // ---- LEFT: PARTITIONS ----
-    y1 += LH + GAP;
-    DrawText(COL_L, y1, "PARTITIONS", 1.2f, COL_YELLOW);
-    HLine(y1 + LH + 1.f, COL_L, COL_R - 12.f, COL_BORDER);
-    y1 += LH + 5.f;
-    {
-        bool anyPart = false;
-        for (int pi = 0; pi < 4; ++pi)
-        {
-            const HddData::PartInfo& p = d.parts[pi];
-            if (!p.present) continue;
-            anyPart = true;
-
-            // Label  e.g. "E:"
-            char label[4]; label[0] = p.letter; label[1] = ':'; label[2] = '\0';
-            DrawText(COL_L, y1, label, 1.2f, COL_GRAY);
-
-            // Usage bar: total width covers the value column space
-            const float BAR_X = COL_L + 22.f;
-            const float BAR_W = SW * 0.22f;  // ~140px at 640 — leaves room for free text
-            const float BAR_H = LH - 3.f;
-            float usedFrac = 1.f - p.freeRatio;
-            if (usedFrac < 0.f) usedFrac = 0.f;
-            if (usedFrac > 1.f) usedFrac = 1.f;
-
-            // Bar background
-            FillRect(BAR_X, y1, BAR_X + BAR_W, y1 + BAR_H,
-                D3DCOLOR_XRGB(18, 22, 45));
-            // Used portion — colour shifts green→orange→red based on fill
-            DWORD barCol;
-            if (usedFrac < 0.7f)      barCol = D3DCOLOR_XRGB(40, 160, 60);
-            else if (usedFrac < 0.9f) barCol = D3DCOLOR_XRGB(200, 140, 0);
-            else                      barCol = D3DCOLOR_XRGB(200, 50, 30);
-            if (usedFrac > 0.f)
-                FillRect(BAR_X, y1, BAR_X + BAR_W * usedFrac, y1 + BAR_H, barCol);
-            HLine(y1, BAR_X, BAR_X + BAR_W, COL_BORDER);
-            HLine(y1 + BAR_H, BAR_X, BAR_X + BAR_W, COL_BORDER);
-            VLine(BAR_X, y1, y1 + BAR_H, COL_BORDER);
-            VLine(BAR_X + BAR_W, y1, y1 + BAR_H, COL_BORDER);
-
-            // Free value to the right of bar
-            char freeLabel[32];
-            StrCopy(freeLabel, sizeof(freeLabel), p.freeStr);
-            StrCat2(freeLabel, sizeof(freeLabel), freeLabel, " free");
-            DrawText(BAR_X + BAR_W + 6.f, y1, freeLabel, 1.05f, COL_WHITE);
-
-            y1 += LH;
-        }
-        if (!anyPart)
-            DrawText(COL_L, y1, "No partitions found", 1.2f, COL_GRAY);
-    }
-
     // ---- RIGHT: SECURITY / EEPROM ----
     DrawText(COL_R, y2, "EEPROM SECURITY", 1.3f, COL_YELLOW);
     HLine(y2 + LH + 1.f, COL_R, SW - LM, COL_BORDER);
@@ -1174,6 +1122,53 @@ static void Render(const DiagLogo& logo)
     DrawKeyRow(COL_R, COL_VR, y2, "BYTES   :", d.onlineKey, 16, d.eepromOK);
     y2 += LH * 2.f + GAP;
 
+    // ---- RIGHT: PARTITIONS (below Online Key) ----
+    DrawText(COL_R, y2, "PARTITIONS", 1.2f, COL_YELLOW);
+    HLine(y2 + LH + 1.f, COL_R, SW - LM, COL_BORDER);
+    y2 += LH + 5.f;
+    {
+        bool anyPart = false;
+        for (int pi = 0; pi < 4; ++pi)
+        {
+            const HddData::PartInfo& p = d.parts[pi];
+            if (!p.present) continue;
+            anyPart = true;
+
+            // Label  e.g. "E:"
+            char label[4]; label[0] = p.letter; label[1] = ':'; label[2] = '\0';
+            DrawText(COL_R, y2, label, 1.2f, COL_GRAY);
+
+            // Usage bar — right column is narrower so bar width is fixed leaving room for label
+            const float BAR_X = COL_R + 22.f;
+            const float BAR_W = 120.f;
+            const float BAR_H = LH - 3.f;
+            float usedFrac = 1.f - p.freeRatio;
+            if (usedFrac < 0.f) usedFrac = 0.f;
+            if (usedFrac > 1.f) usedFrac = 1.f;
+
+            FillRect(BAR_X, y2, BAR_X + BAR_W, y2 + BAR_H,
+                D3DCOLOR_XRGB(18, 22, 45));
+            DWORD barCol;
+            if (usedFrac < 0.7f)      barCol = D3DCOLOR_XRGB(40, 160, 60);
+            else if (usedFrac < 0.9f) barCol = D3DCOLOR_XRGB(200, 140, 0);
+            else                      barCol = D3DCOLOR_XRGB(200, 50, 30);
+            if (usedFrac > 0.f)
+                FillRect(BAR_X, y2, BAR_X + BAR_W * usedFrac, y2 + BAR_H, barCol);
+            HLine(y2, BAR_X, BAR_X + BAR_W, COL_BORDER);
+            HLine(y2 + BAR_H, BAR_X, BAR_X + BAR_W, COL_BORDER);
+            VLine(BAR_X, y2, y2 + BAR_H, COL_BORDER);
+            VLine(BAR_X + BAR_W, y2, y2 + BAR_H, COL_BORDER);
+
+            char freeLabel[32];
+            StrCopy(freeLabel, sizeof(freeLabel), p.freeStr);
+            StrCat2(freeLabel, sizeof(freeLabel), freeLabel, " free");
+            DrawText(BAR_X + BAR_W + 6.f, y2, freeLabel, 1.05f, COL_WHITE);
+
+            y2 += LH;
+        }
+        if (!anyPart)
+            DrawText(COL_R, y2, "No partitions found", 1.2f, COL_GRAY);
+    }
 
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
