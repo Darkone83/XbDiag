@@ -693,6 +693,12 @@ Requires a network connection and DHCP. Reports `NO LINK` if no IP address is av
 
 ## Web Dashboard
 
+<div align=center>
+ 
+ <img src="https://github.com/Darkone83/XbDiag/blob/main/img/Web_Sysinfo.png" width=250><img src="https://github.com/Darkone83/XbDiag/blob/main/img/Web_Reports.png" width=250><img src="https://github.com/Darkone83/XbDiag/blob/main/img/Web_Settings.png" width=250><img src="https://github.com/Darkone83/XbDiag/blob/main/img/Web_About.png" width=250>
+
+</div>
+
 XbDiag includes a built-in HTTP server running on port 80, started automatically at boot alongside the FTP server. No configuration or user interaction is required — open a browser on any device on the same network and navigate to the Xbox's IP address.
 
 The IP address is shown in System Info under **Network** and on the Physical LCD if fitted.
