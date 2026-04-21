@@ -703,11 +703,15 @@ XbDiag includes a built-in HTTP server running on port 80, started automatically
 
 The IP address is shown in System Info under **Network** and on the Physical LCD if fitted.
 
+A navigation bar links all pages and highlights the active tab. The root URL (`/`) redirects to System Info.
+
 | Page | URL | Description |
 |------|-----|-------------|
 | System Info | `http://<ip>/sysinfo` | Live hardware snapshot — CPU, memory, board, video, thermal, storage, network. Auto-refreshes every 30 seconds. Shows live stress test data when a stress test is running. |
+| SMART | `http://<ip>/smart` | Decoded SMART attribute table for the installed HDD. Shows attribute ID, name, normalised CUR/WST/THR values, and decoded raw value. Rows highlighted red when a critical attribute threshold is tripped, amber for critical attributes not yet tripped. Requires HDD Info to have been run this session. |
 | Report | `http://<ip>/report` | Views diagnostic report files saved to `D:\`. Auto-detects the most recent report. File switcher links to all text exports. |
 | Settings | `http://<ip>/settings` | Full automation settings editor — all module toggles, stress durations, loop count, and run options. Saves directly to `D:\XbDiag.set` using the same write path as the on-screen editor. |
+| Power | `http://<ip>/power` | Console power control — Reset, Power Cycle, and Power Off via PIC SMBus register 0x02. All actions require a confirmation step before the command is sent. |
 | About | `http://<ip>/about` | Version info and team credits. |
 
 Binary export files (`bios.bin`, `eeprom.bin`) can be downloaded directly from the Settings page — no FTP client required.
