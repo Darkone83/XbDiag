@@ -15,8 +15,8 @@
 //   Back+White     = open automation settings (hidden)
 //
 // Status badges:
-//   "READY"     COL_GREEN  - module available
-//   (reserved for future "N/A" states on specific hardware)
+//   "READY"  pulsing green  - selected row only, breathing triangle-wave animation
+//   (no badge on unselected rows)
 
 #include "DiagMenu.h"
 #include "DiagCommon.h"
@@ -93,9 +93,9 @@ static WORD s_prevBtns = 0;       // for edge detection
 static const float ROW_H = 26.f;   // compact row height
 static const float ROW_PAD_Y = 6.f;    // text padding from top of row
 static const float LIST_TOP = CONTENT_Y;             // flush under top bar
-static const float IDX_X = 12.f;   // index number X
-static const float LABEL_X = 52.f;   // label text X
-static const float BADGE_RX = SW - 12.f; // READY badge right edge
+static const float IDX_X = LM;             // was 12.f
+static const float LABEL_X = LM + 24.f;      // was 52.f
+static const float BADGE_RX = SW - LM;       // was SW - 12.f
 static const float TS = 1.4f;   // row text scale
 
 // ============================================================================
@@ -204,8 +204,21 @@ static void Render(const DiagLogo& logo)
         // Label
         DrawText(LABEL_X, textY, k_items[i].label, TS, lblCol);
 
-        // READY badge right-aligned
-        DrawTextR(BADGE_RX, textY, "READY", 1.3f, sel ? COL_GREEN : COL_DIM);
+        // READY badge — only on selected row, breathing pulse
+        if (sel)
+        {
+            // Triangle wave: 0 -> 1 -> 0 over 1.6s cycle. No trig needed.
+            DWORD t = GetTickCount() % 1600;
+            float phase = (float)t / 1600.f;
+            float pulse = (phase < 0.5f) ? (phase * 2.f) : (2.f - phase * 2.f);
+
+            // Breathe from dim teal-green (low) to bright clean green (high)
+            BYTE r = (BYTE)(28 + Ftoi(pulse * 24.f));   //  28..52
+            BYTE g = (BYTE)(160 + Ftoi(pulse * 60.f));   // 160..220
+            BYTE b = (BYTE)(80 + Ftoi(pulse * 40.f));   //  80..120
+
+            DrawTextR(BADGE_RX, textY, "READY", 1.3f, D3DCOLOR_XRGB(r, g, b));
+        }
     }
 
     // Bottom border of list

@@ -434,7 +434,7 @@ void DrawPageChrome(const DiagLogo& logo,
     // comfortable padding; width matches to preserve 1:1 aspect ratio.
     const float LOGO_DISP_W = 48.f;
     const float LOGO_DISP_H = 48.f;
-    const float LOGO_CX = 20.f + LOGO_DISP_W * 0.5f;
+    const float LOGO_CX = LM + LOGO_DISP_W * 0.5f;  // was 20.f + ...; left edge now at LM
     const float LOGO_CY = TOP_BAR_H * 0.5f;
 
     DrawLogo(logo, LOGO_CX, LOGO_CY, LOGO_DISP_W, LOGO_DISP_H, 255);

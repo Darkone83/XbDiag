@@ -63,18 +63,18 @@ static const int   GRID_COLS = 16;
 static const int   GRID_ROWS = 8;
 
 static const float ROW_LBL_X = 8.f;     // "0x00" labels
-static const float GRID_LM = 46.f;    // left edge of first cell
+static const float GRID_LM = LM;             // was 46.f; now tracks DiagCommon LM
 static const float GRID_TOP = CONTENT_Y + 6.f;
 static const float CELL_W = 32.f;
 static const float CELL_H = 18.f;
-static const float CELL_GX = 2.f;
+static const float CELL_GX = 1.f;   // was 2.f; tightened by 1px to recover space for PROG bar at LM=48
 static const float CELL_GY = 2.f;
-static const float GRID_W = GRID_COLS * (CELL_W + CELL_GX) - CELL_GX;   // 542
+static const float GRID_W = GRID_COLS * (CELL_W + CELL_GX) - CELL_GX;   // 527
 static const float GRID_H = GRID_ROWS * (CELL_H + CELL_GY) - CELL_GY;   // 158
 
-// Progress bar sits just right of the grid
-static const float PROG_X = GRID_LM + GRID_W + 5.f;
+// Progress bar sits right of the grid, within SW-LM safe zone
 static const float PROG_W = 10.f;
+static const float PROG_X = GRID_LM + GRID_W + 4.f;  // grid right=575, bar 579..589, SW-LM=592
 
 // Divider between grid area and info area
 static const float DIV_Y = GRID_TOP + GRID_H + 5.f;   // ~227

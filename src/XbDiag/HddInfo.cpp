@@ -977,7 +977,7 @@ static void ExportData()
 
 void HddInfo_OnEnter()
 {
-    s_prevBtns = 0;
+    s_prevBtns = GetButtons();  // seed to prevent held-button phantom edges on entry
     s_view = VIEW_INFO;
     s_loaded = false;
     // Cleanup any leftover benchmark temp file from a prior visit

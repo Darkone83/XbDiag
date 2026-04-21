@@ -10,7 +10,7 @@
 //
 // Autorun sequence:
 //   SysInfo -> VideoInfo -> SmBusScan -> HddInfo -> RamTest -> TempMon
-//   -> EepromView -> ControllerTest (60s wait) -> Stress loop(s)
+//   -> EepromView -> ControllerTest (snapshot) -> Stress loop(s)
 //
 // Stress loop modes:
 //   Each loop runs: CPU stress (if enabled) then RAM stress (if enabled).
@@ -32,6 +32,7 @@
 #include "EepromView.h"
 #include "ControllerTest.h"
 #include "StressTest.h"
+#include "StressTestCPU.h"
 #include "StressMath.h"
 #include "StressTestGPU.h"
 extern void StressTest_AutoRun(HANDLE hReport, DWORD durationMs);
@@ -367,70 +368,6 @@ static void DrawAutoComplete(const DiagLogo& logo, bool ok, bool willShutdown)
 }
 
 // ============================================================================
-// Controller test with 60-second user-input wait
-// ============================================================================
-
-static bool CtrlTest_WithTimeout(const DiagLogo& logo,
-    int step, int total, HANDLE hReport)
-{
-    DWORD waitStart = GetTickCount();
-    WORD  prev = GetButtons();
-
-    while (true)
-    {
-        PumpInput();
-        DWORD elapsed = GetTickCount() - waitStart;
-        DWORD remain = (elapsed < 60000) ? (60000 - elapsed) / 1000 + 1 : 0;
-
-        g_pDevice->BeginScene();
-        DrawPageChrome(logo, "AUTO DIAGNOSTIC", "[A] Confirm    [B] Skip");
-
-        float py = CONTENT_Y + 30.f;
-        char stepBuf[32]; char sa[8], sb[8];
-        IntToStr(step, sa, sizeof(sa)); IntToStr(total, sb, sizeof(sb));
-        StrCopy(stepBuf, sizeof(stepBuf), "Step ");
-        StrCat2(stepBuf, sizeof(stepBuf), stepBuf, sa);
-        StrCat2(stepBuf, sizeof(stepBuf), stepBuf, " of ");
-        StrCat2(stepBuf, sizeof(stepBuf), stepBuf, sb);
-        DrawText(LM, py, stepBuf, 1.1f, COL_GRAY); py += LINE_H + 4.f;
-
-        DrawText(LM, py, "CONTROLLER TEST", 1.7f, COL_CYAN); py += LINE_H + 8.f;
-        DrawText(LM, py, "Connect controllers and press [A] to confirm.", 1.2f, COL_WHITE);
-        py += LINE_H + 4.f;
-        DrawText(LM, py, "Press [B] to skip this test.", 1.2f, COL_GRAY);
-        py += LINE_H + 10.f;
-
-        char secBuf[32];
-        StrCopy(secBuf, sizeof(secBuf), "Skipping in ");
-        char t[8]; IntToStr((int)remain, t, sizeof(t));
-        StrCat2(secBuf, sizeof(secBuf), secBuf, t);
-        StrCat2(secBuf, sizeof(secBuf), secBuf, "s...");
-        DrawText(LM, py, secBuf, 1.2f, COL_ORANGE);
-
-        g_pDevice->EndScene();
-        g_pDevice->Present(NULL, NULL, NULL, NULL);
-
-        WORD cur = GetButtons();
-        bool edgeA = ((cur & BTN_A) && !(prev & BTN_A));
-        bool edgeB = ((cur & BTN_B) && !(prev & BTN_B));
-        prev = cur;
-
-        if (edgeA)
-        {
-            ControllerTest_OnEnter();
-            RSection(hReport, "CONTROLLER TEST");
-            ControllerTest_AutoRun(hReport);
-            return true;
-        }
-        if (edgeB || elapsed >= 60000)
-        {
-            RSection(hReport, "CONTROLLER TEST");
-            RW(hReport, "Result:       ", "No input / skipped");
-            return false;
-        }
-    }
-}
-
 // ============================================================================
 // AutoRun engine
 // ============================================================================
@@ -558,9 +495,9 @@ void XbSet_AutoRun(const DiagLogo& logo)
     }
     if (g_autoSettings.runCtrlTest)
     {
-        if (reportOK) CtrlTest_WithTimeout(logo, step, total, hf);
-        else          CtrlTest_WithTimeout(logo, step, total, INVALID_HANDLE_VALUE);
-        ++step;
+        DrawAutoStatus(logo, "CONTROLLER TEST", step++, total);
+        if (reportOK) { RSection(hf, "CONTROLLER TEST"); ControllerTest_AutoRun(hf); DWORD _w; WriteFile(hf, "\r\n", 2, &_w, NULL); }
+        else            ControllerTest_AutoRun(INVALID_HANDLE_VALUE);
     }
 
     // ---- Stress loops ----
@@ -607,6 +544,11 @@ void XbSet_AutoRun(const DiagLogo& logo)
             if (loops > 1) { StrCat2(subMsg, sizeof(subMsg), subMsg, "  "); StrCat2(subMsg, sizeof(subMsg), subMsg, loopLabel); }
 
             DrawAutoStatus(logo, statusLabel, step, total, subMsg);
+
+            // AutoRun defaults — no wizard ran so set these explicitly.
+            // 90C is the safe ceiling for unattended runs; fan stays under SMC.
+            s_tempThreshold = 90;
+            ST_CPU_FanRelease();
 
             if (reportOK)
             {
@@ -906,7 +848,7 @@ static SettingRow s_rows[] =
     { "RAM TEST",       "One full quick sweep across all banks",    &g_autoSettings.runRamTest,   RT_BOOL    },
     { "TEMP MONITOR",   "5 temperature samples at 500ms intervals", &g_autoSettings.runTempMon,   RT_BOOL    },
     { "EEPROM",         "Read and decode EEPROM contents",          &g_autoSettings.runEeprom,    RT_BOOL    },
-    { "CTRL TEST",      "60s wait for input, skip if none",         &g_autoSettings.runCtrlTest,  RT_BOOL    },
+    { "CTRL TEST",      "Snapshot: port/MU presence, stick pos, stuck buttons",  &g_autoSettings.runCtrlTest,  RT_BOOL    },
     { "CPU STRESS",     "Timed CPU FPU burn",                       &g_autoSettings.runCpuStress, RT_BOOL    },
     { "  CPU HOURS",    "CPU stress hours  [Left/Right]",           NULL,                         RT_CPU_HRS },
     { "  CPU MINS",     "CPU stress minutes  [Left/Right]",         NULL,                         RT_CPU_MIN },

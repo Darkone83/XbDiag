@@ -107,7 +107,7 @@ static void CS_CreateVS()
 {
     LPXGBUFFER pCode = NULL, pErr = NULL;
     if (SUCCEEDED(XGAssembleShader("CrystalVS", cs_vsSource,
-        (UINT)strlen(cs_vsSource), 0, NULL, &pCode, &pErr, NULL, NULL, NULL, NULL)))
+        (UINT)StrLen(cs_vsSource), 0, NULL, &pCode, &pErr, NULL, NULL, NULL, NULL)))
     {
         g_pDevice->CreateVertexShader(cs_vsDecl,
             (const DWORD*)pCode->GetBufferPointer(), &cs_vsHandle, 0);

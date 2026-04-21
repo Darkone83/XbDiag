@@ -1577,30 +1577,126 @@ void ControllerTest_Tick(const DiagLogo& logo)
 
 void ControllerTest_AutoRun(HANDLE hReport)
 {
-    // Pump a few frames to let XGetDeviceChanges settle
+    // Pump frames to let XGetDeviceChanges settle before reading state.
+    // 10 frames at ~16ms each = ~160ms — enough for device enumeration.
     for (int i = 0; i < 10; ++i) { PumpInput(); Sleep(16); }
 
-    char line[64]; DWORD w;
+    if (!hReport || hReport == INVALID_HANDLE_VALUE) return;
+
+    char line[128]; DWORD w;
+    auto WL = [&](const char* a, const char* b)
+        {
+            StrCopy(line, sizeof(line), a);
+            StrCat2(line, sizeof(line), line, b);
+            StrCat2(line, sizeof(line), line, "\r\n");
+            WriteFile(hReport, line, StrLen(line), &w, NULL);
+        };
+
     int found = 0;
 
     for (int port = 0; port < 4; ++port)
     {
-        char portCh[4]; IntToStr(port + 1, portCh, sizeof(portCh));
         bool conn = IsPortConnected(port);
 
-        StrCopy(line, sizeof(line), "Port ");
-        StrCat2(line, sizeof(line), line, portCh);
-        StrCat2(line, sizeof(line), line, ":         ");
-        StrCat2(line, sizeof(line), line, conn ? "Controller connected" : "Empty");
-        StrCat2(line, sizeof(line), line, "\r\n");
-        WriteFile(hReport, line, StrLen(line), &w, NULL);
+        char portLabel[8];
+        StrCopy(portLabel, sizeof(portLabel), "Port ");
+        char pn[4]; IntToStr(port + 1, pn, sizeof(pn));
+        StrCat2(portLabel, sizeof(portLabel), portLabel, pn);
 
-        if (conn) ++found;
+        if (!conn)
+        {
+            WL(portLabel, ":         Empty");
+            continue;
+        }
+
+        ++found;
+
+        // Controller type
+        ControllerType ct = GetControllerType(port);
+        const char* ctStr = (ct == CT_DUKE) ? "Duke" :
+            (ct == CT_TYPE_S) ? "Type-S" : "Unknown type";
+        char ctLine[48];
+        StrCopy(ctLine, sizeof(ctLine), "Controller connected (");
+        StrCat2(ctLine, sizeof(ctLine), ctLine, ctStr);
+        StrCat2(ctLine, sizeof(ctLine), ctLine, ")");
+        WL(portLabel, ctLine);
+
+        // MU slots
+        char muLabel[16];
+        StrCopy(muLabel, sizeof(muLabel), portLabel);
+        StrCat2(muLabel, sizeof(muLabel), muLabel, " MU-A:    ");
+        WL(muLabel, IsMUPresent(port, 0) ? "Present" : "Empty");
+
+        StrCopy(muLabel, sizeof(muLabel), portLabel);
+        StrCat2(muLabel, sizeof(muLabel), muLabel, " MU-B:    ");
+        WL(muLabel, IsMUPresent(port, 1) ? "Present" : "Empty");
+
+        // Stick snapshot — set active port, read raw sticks once
+        SetActivePort(port);
+        PumpInput();
+
+        int lx = 0, ly = 0, rx = 0, ry = 0;
+        GetRawSticks(lx, ly, rx, ry);
+
+        // Express as percentage of full range for readability
+        // Raw range: -32768..32767. Divide by 327 gives approx -100..100.
+        int lxPct = lx / 328;
+        int lyPct = ly / 328;
+        int rxPct = rx / 328;
+        int ryPct = ry / 328;
+
+        char stickBuf[64];
+        char n1[8], n2[8], n3[8], n4[8];
+        IntToStr(lxPct, n1, sizeof(n1));
+        IntToStr(lyPct, n2, sizeof(n2));
+        IntToStr(rxPct, n3, sizeof(n3));
+        IntToStr(ryPct, n4, sizeof(n4));
+        StrCopy(stickBuf, sizeof(stickBuf), "L(");
+        StrCat2(stickBuf, sizeof(stickBuf), stickBuf, n1);
+        StrCat2(stickBuf, sizeof(stickBuf), stickBuf, "%,");
+        StrCat2(stickBuf, sizeof(stickBuf), stickBuf, n2);
+        StrCat2(stickBuf, sizeof(stickBuf), stickBuf, "%)  R(");
+        StrCat2(stickBuf, sizeof(stickBuf), stickBuf, n3);
+        StrCat2(stickBuf, sizeof(stickBuf), stickBuf, "%,");
+        StrCat2(stickBuf, sizeof(stickBuf), stickBuf, n4);
+        StrCat2(stickBuf, sizeof(stickBuf), stickBuf, "%)");
+
+        char stickLabel[16];
+        StrCopy(stickLabel, sizeof(stickLabel), portLabel);
+        StrCat2(stickLabel, sizeof(stickLabel), stickLabel, " Sticks:  ");
+        WL(stickLabel, stickBuf);
+
+        // Button snapshot — report any buttons held at rest (stuck or held)
+        WORD btns = GetButtons();
+        if (btns != 0)
+        {
+            // Build a string of held button names
+            char heldBuf[80];
+            heldBuf[0] = '\0';
+            struct { WORD mask; const char* name; } k[] = {
+                { BTN_A,     "A"     }, { BTN_B,     "B"     },
+                { BTN_X,     "X"     }, { BTN_Y,     "Y"     },
+                { BTN_BLACK, "Black" }, { BTN_WHITE, "White" },
+                { BTN_START, "Start" }, { BTN_BACK,  "Back"  },
+                { BTN_LTHUMB,"LThumb"}, { BTN_RTHUMB,"RThumb"},
+                { BTN_DPAD_UP,"DUp"  }, { BTN_DPAD_DOWN,"DDn"},
+                { BTN_DPAD_LEFT,"DLt"}, { BTN_DPAD_RIGHT,"DRt"},
+            };
+            for (int ki = 0; ki < 14; ++ki)
+            {
+                if (btns & k[ki].mask)
+                {
+                    if (heldBuf[0]) StrCat2(heldBuf, sizeof(heldBuf), heldBuf, " ");
+                    StrCat2(heldBuf, sizeof(heldBuf), heldBuf, k[ki].name);
+                }
+            }
+            char btnLabel[16];
+            StrCopy(btnLabel, sizeof(btnLabel), portLabel);
+            StrCat2(btnLabel, sizeof(btnLabel), btnLabel, " BtnsHeld:");
+            WL(btnLabel, heldBuf);
+        }
     }
 
     char tot[4]; IntToStr(found, tot, sizeof(tot));
-    StrCopy(line, sizeof(line), "Total found:  ");
-    StrCat2(line, sizeof(line), line, tot);
-    StrCat2(line, sizeof(line), line, "\r\n");
-    WriteFile(hReport, line, StrLen(line), &w, NULL);
+    WL("Controllers:  ", tot);
 }

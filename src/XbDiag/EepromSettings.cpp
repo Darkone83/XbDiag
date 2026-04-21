@@ -641,7 +641,7 @@ static void RenderEdit(const DiagLogo& logo)
     if (s_editCard > 0)
         DrawText(EEP_LM2, y, "<  [Left]", 1.1f, COL_GRAY);
     if (s_editCard < 3)
-        DrawText(SW - LM - 72.f, y, "[Right]  >", 1.1f, COL_GRAY);
+        DrawText(SW - LM - 80.f, y, "[Right]  >", 1.1f, COL_GRAY);
     y += ROW + 2.f;
     HLine(y - 2.f, EEP_LM2, SW - LM, COL_BORDER);
 

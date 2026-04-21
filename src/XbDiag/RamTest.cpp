@@ -131,7 +131,7 @@ static DWORD       s_availPhysMB = 0;
 static DWORD       s_usedMB = 0;
 
 static TestState   s_testState = STATE_IDLE;
-static WORD        s_prevBtns = 0;
+static WORD        s_prevBtns = GetButtons();  // seed to prevent held-button phantom edges on entry
 static bool        s_skipFirstTick = true;
 
 // CSV export state — reset each time a new test starts
@@ -233,7 +233,7 @@ static void ResetStressBank()
 
 void RamTest_OnEnter()
 {
-    s_prevBtns = 0;
+    s_prevBtns = GetButtons();  // seed to prevent held-button phantom edges on entry
     s_skipFirstTick = true;
 
     if (s_stressBase)

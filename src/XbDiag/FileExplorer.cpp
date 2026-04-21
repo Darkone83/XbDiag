@@ -501,7 +501,7 @@ static void Render(const DiagLogo& logo)
     const float SIZE_X = SW - LM - WIDGET_W - 12.f;  // leave room for widget
     const float NAME_W = SIZE_X - NAME_X - 8.f;       // available name width
     // Approx chars that fit in NAME_W at scale 1.2 (each char ~7px)
-    const int   NAME_MAX_CHARS = (int)(NAME_W / 7.f);
+    const int   NAME_MAX_CHARS = Ftoi(NAME_W / 7.f);
 
     for (int i = 0; i < ROWS_VISIBLE; ++i)
     {

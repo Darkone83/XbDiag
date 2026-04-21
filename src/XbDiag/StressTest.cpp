@@ -233,7 +233,9 @@ static void HandleInput()
         s_gpuState == SSTATE_RUNNING ||
         s_state == SSTATE_CONFIRM ||
         s_ramState == SSTATE_CONFIRM ||
-        s_gpuState == SSTATE_CONFIRM);
+        s_gpuState == SSTATE_CONFIRM ||
+        s_state == SSTATE_THRESHOLD ||
+        s_state == SSTATE_FAN);
     if (!anythingRunning)
     {
         if (ST_EdgeDown(cur, s_stPrevBtns, BTN_DPAD_RIGHT))
@@ -254,6 +256,7 @@ static void HandleInput()
         if (ST_EdgeDown(cur, s_stPrevBtns, BTN_B) ||
             ST_EdgeDown(cur, s_stPrevBtns, BTN_BACK))
         {
+            ST_CPU_FanRelease();  // restore SMC fan control before leaving
             s_stPrevBtns = cur;
             RequestState(MSTATE_MENU);
             return;
@@ -290,7 +293,35 @@ static void HandleInput()
             }
             if (ST_EdgeDown(cur, s_stPrevBtns, BTN_A))
             {
-                s_state = SSTATE_CONFIRM;
+                s_state = SSTATE_FAN;
+            }
+            break;
+
+        case SSTATE_FAN:
+            if (ST_EdgeDown(cur, s_stPrevBtns, BTN_B))
+            {
+                ST_CPU_FanCancel();
+                s_state = SSTATE_THRESHOLD; break;  // back one step
+            }
+            if (ST_EdgeDown(cur, s_stPrevBtns, BTN_X))
+            {
+                ST_CPU_FanToggleAuto(); break;
+            }
+            if (!ST_CPU_FanIsAuto())
+            {
+                if (ST_EdgeDown(cur, s_stPrevBtns, BTN_LTRIG))
+                {
+                    ST_CPU_FanStep(-1); break;
+                }
+                if (ST_EdgeDown(cur, s_stPrevBtns, BTN_RTRIG))
+                {
+                    ST_CPU_FanStep(+1); break;
+                }
+            }
+            if (ST_EdgeDown(cur, s_stPrevBtns, BTN_A))
+            {
+                ST_CPU_FanApply();
+                s_state = SSTATE_CONFIRM;  // proceed to final confirm
             }
             break;
 
@@ -482,6 +513,16 @@ void StressTest_Tick(const DiagLogo& logo)
         // ── Render at ~10fps ─────────────────────────────────────────────────
         if (now >= s_nextRender)
         {
+            // Reapply manual fan override every render tick (500ms).
+            // Must write mode reg 0x05=1 before speed reg 0x06 — without
+            // setting mode to manual the SMC ignores the speed write entirely.
+            if (!ST_CPU_FanIsAuto())
+            {
+                BYTE fanRaw = (BYTE)(ST_CPU_FanGetPct() / 2);
+                SMBusWrite(SMBADDR_PIC, 0x05, 1);
+                SMBusWrite(SMBADDR_PIC, 0x06, fanRaw);
+            }
+
             g_pDevice->BeginScene();
             ST_CPU_Render(logo);
             g_pDevice->EndScene();
@@ -562,6 +603,10 @@ void StressTest_AutoRun(HANDLE hReport, DWORD durationMs)
 {
     // Full init — seeds working buffer, resets all sensor state
     StressTest_OnEnter();
+
+    // Guarantee SMC fan control — s_fanAuto may be false if the user ran an
+    // interactive session with a manual override in the same process lifetime.
+    ST_CPU_FanRelease();
 
     // Wire up running state directly — bypass threshold/confirm UI
     s_state = SSTATE_RUNNING;

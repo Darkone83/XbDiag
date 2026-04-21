@@ -13,7 +13,14 @@
 #include <xtl.h>
 
 // ============================================================================
-// CPU MHz via MCPX CPUMPLL (PCI 0:3:0 offset 0x6C) + MSR 0x2A ratio.
+// Fan override state
+// s_fanAuto = true  → SMC controls fan (default)
+// s_fanAuto = false → manual target written to PIC reg 0x06
+// s_fanTargetPct is in 5% steps (0, 5, 10, ... 100)
+// ============================================================================
+
+static bool s_fanAuto = true;
+static int  s_fanTargetPct = 0;    // last applied manual target; 0 = min
 // Exact value, no SMBus dependency, works on all CPU variants including
 // Tualatin upgrades where the ICS clock generator may be absent or replaced.
 // CPUMPLL is cached on first call — the PLL config never changes at runtime.
@@ -164,6 +171,10 @@ static void TakeSample()
         {
             s_state = SSTATE_IDLE;
             s_thermalAbort = true;
+            // Release manual fan override — SMC must resume thermal control
+            // immediately on abort. Without this the fan stays locked at the
+            // manual target while the CPU is already over threshold.
+            ST_CPU_FanRelease();
         }
 
         BYTE load = (s_state == SSTATE_RUNNING) ? s_measuredLoad : 0;
@@ -493,15 +504,98 @@ static void DrawThresholdOverlay()
 }
 
 // ============================================================================
-// DrawConfirmOverlay — modal prompt, drawn on top of everything
+// DrawFanOverlay — fan speed picker, same modal pattern as threshold overlay
+// ============================================================================
+
+static void DrawFanOverlay()
+{
+    float ow = 400.f;
+    float oh = 160.f;
+    float ox = SW * 0.5f - ow * 0.5f;
+    float oy = SH * 0.5f - oh * 0.5f;
+
+    FillRectGrad(ox, oy, ox + ow, oy + oh,
+        D3DCOLOR_XRGB(20, 28, 70), D3DCOLOR_XRGB(12, 16, 46));
+    HLine(oy, ox, ox + ow, COL_CYAN);
+    HLine(oy + oh, ox, ox + ow, COL_CYAN);
+    VLine(ox, oy, oy + oh, COL_BORDER);
+    VLine(ox + ow, oy, oy + oh, COL_BORDER);
+
+    const char* title = "SET FAN SPEED";
+    DrawText(ox + (ow - TW(title, 1.25f)) * 0.5f, oy + 8.f, title, 1.25f, COL_YELLOW);
+
+    // ---- Mode row: AUTO / MANUAL pill ----------------------------------------
+    float modeY = oy + 32.f;
+    float pillW = 70.f;
+    float pillH = 20.f;
+    float autoX = ox + ow * 0.5f - pillW - 8.f;
+    float manX = ox + ow * 0.5f + 8.f;
+
+    // AUTO pill
+    FillRectGrad(autoX, modeY, autoX + pillW, modeY + pillH,
+        s_fanAuto ? D3DCOLOR_XRGB(30, 100, 60) : D3DCOLOR_XRGB(18, 25, 55),
+        s_fanAuto ? D3DCOLOR_XRGB(16, 60, 30) : D3DCOLOR_XRGB(12, 16, 38));
+    HLine(modeY, autoX, autoX + pillW, s_fanAuto ? COL_GREEN : COL_BORDER);
+    HLine(modeY + pillH, autoX, autoX + pillW, s_fanAuto ? COL_GREEN : COL_BORDER);
+    VLine(autoX, modeY, modeY + pillH, s_fanAuto ? COL_GREEN : COL_BORDER);
+    VLine(autoX + pillW, modeY, modeY + pillH, s_fanAuto ? COL_GREEN : COL_BORDER);
+    DrawText(autoX + (pillW - TW("AUTO", 1.1f)) * 0.5f, modeY + 4.f,
+        "AUTO", 1.1f, s_fanAuto ? COL_GREEN : COL_DIM);
+
+    // MANUAL pill
+    FillRectGrad(manX, modeY, manX + pillW, modeY + pillH,
+        !s_fanAuto ? D3DCOLOR_XRGB(60, 40, 10) : D3DCOLOR_XRGB(18, 25, 55),
+        !s_fanAuto ? D3DCOLOR_XRGB(35, 22, 5) : D3DCOLOR_XRGB(12, 16, 38));
+    HLine(modeY, manX, manX + pillW, !s_fanAuto ? COL_ORANGE : COL_BORDER);
+    HLine(modeY + pillH, manX, manX + pillW, !s_fanAuto ? COL_ORANGE : COL_BORDER);
+    VLine(manX, modeY, modeY + pillH, !s_fanAuto ? COL_ORANGE : COL_BORDER);
+    VLine(manX + pillW, modeY, modeY + pillH, !s_fanAuto ? COL_ORANGE : COL_BORDER);
+    DrawText(manX + (pillW - TW("MANUAL", 1.1f)) * 0.5f, modeY + 4.f,
+        "MANUAL", 1.1f, !s_fanAuto ? COL_ORANGE : COL_DIM);
+
+    // ---- Value row -----------------------------------------------------------
+    float valY = oy + 64.f;
+
+    if (s_fanAuto)
+    {
+        const char* autoMsg = "SMC controls fan speed";
+        DrawText(ox + (ow - TW(autoMsg, 1.1f)) * 0.5f, valY + 10.f, autoMsg, 1.1f, COL_GRAY);
+    }
+    else
+    {
+        // Big percentage value
+        char pBuf[8];  IntToStr(s_fanTargetPct, pBuf, sizeof(pBuf));
+        char pDisp[12]; StrCopy(pDisp, sizeof(pDisp), pBuf);
+        StrCat2(pDisp, sizeof(pDisp), pDisp, "%");
+
+        DWORD pCol = (s_fanTargetPct >= 80) ? COL_RED
+            : (s_fanTargetPct >= 50) ? COL_ORANGE
+            : COL_GREEN;
+
+        float valW = TW(pDisp, 2.6f);
+        DrawText(ox + (ow - valW) * 0.5f, valY, pDisp, 2.6f, pCol);
+
+        // Arrow hints flanking value
+        DrawText(ox + (ow - valW) * 0.5f - 22.f, valY + 8.f, "<", 2.0f, COL_GRAY);
+        DrawText(ox + (ow + valW) * 0.5f + 6.f, valY + 8.f, ">", 2.0f, COL_GRAY);
+    }
+
+    // ---- Hint rows ----------------------------------------------------------
+    const char* h1 = s_fanAuto
+        ? "[X] Switch to Manual"
+        : "[LT] -5%    [RT] +5%    [X] Switch to Auto";
+    const char* h2 = "[A] Next    [B] Back";
+    DrawText(ox + (ow - TW(h1, 1.0f)) * 0.5f, oy + oh - 30.f, h1, 1.0f, COL_GRAY);
+    DrawText(ox + (ow - TW(h2, 1.0f)) * 0.5f, oy + oh - 14.f, h2, 1.0f, COL_GRAY);
+}
 // ============================================================================
 
 static void DrawConfirmOverlay()
 {
-    float ox = SW * 0.5f - 160.f;
-    float oy = SH * 0.5f - 50.f;
-    float ow = 320.f;
-    float oh = 100.f;
+    float ox = SW * 0.5f - 180.f;
+    float oy = SH * 0.5f - 62.f;
+    float ow = 360.f;
+    float oh = 124.f;
 
     FillRectGrad(ox, oy, ox + ow, oy + oh,
         D3DCOLOR_XRGB(20, 28, 70), D3DCOLOR_XRGB(12, 16, 46));
@@ -511,16 +605,46 @@ static void DrawConfirmOverlay()
     VLine(ox + ow, oy, oy + oh, COL_CYAN);
 
     const char* t1 = "START CPU STRESS TEST?";
-    DrawText(ox + (ow - TW(t1, 1.3f)) * 0.5f, oy + 10.f, t1, 1.3f, COL_WHITE);
+    DrawText(ox + (ow - TW(t1, 1.3f)) * 0.5f, oy + 8.f, t1, 1.3f, COL_WHITE);
+
+    // Settings recap — show what the wizard configured
+    {
+        // Temp threshold
+        char thrBuf[16]; char thrNum[8];
+        IntToStr(s_tempThreshold, thrNum, sizeof(thrNum));
+        StrCopy(thrBuf, sizeof(thrBuf), "ABORT TEMP: ");
+        StrCat2(thrBuf, sizeof(thrBuf), thrBuf, thrNum);
+        StrCat2(thrBuf, sizeof(thrBuf), thrBuf, "C");
+        DWORD thrCol = (s_tempThreshold >= 85) ? COL_RED
+            : (s_tempThreshold >= 75) ? COL_ORANGE : COL_GREEN;
+        DrawText(ox + (ow - TW(thrBuf, 1.1f)) * 0.5f, oy + 32.f, thrBuf, 1.1f, thrCol);
+
+        // Fan setting
+        char fanBuf[24];
+        if (s_fanAuto)
+        {
+            StrCopy(fanBuf, sizeof(fanBuf), "FAN: AUTO (SMC)");
+        }
+        else
+        {
+            char pctNum[8];
+            IntToStr(s_fanTargetPct, pctNum, sizeof(pctNum));
+            StrCopy(fanBuf, sizeof(fanBuf), "FAN: MANUAL ");
+            StrCat2(fanBuf, sizeof(fanBuf), fanBuf, pctNum);
+            StrCat2(fanBuf, sizeof(fanBuf), fanBuf, "%");
+        }
+        DWORD fanCol = s_fanAuto ? COL_GREEN : COL_ORANGE;
+        DrawText(ox + (ow - TW(fanBuf, 1.1f)) * 0.5f, oy + 50.f, fanBuf, 1.1f, fanCol);
+    }
 
     const char* t2 = "Hold  LT + RT  simultaneously";
-    DrawText(ox + (ow - TW(t2, 1.2f)) * 0.5f, oy + 34.f, t2, 1.2f, COL_YELLOW);
+    DrawText(ox + (ow - TW(t2, 1.15f)) * 0.5f, oy + 74.f, t2, 1.15f, COL_YELLOW);
 
     const char* t3 = "to begin the test";
-    DrawText(ox + (ow - TW(t3, 1.2f)) * 0.5f, oy + 52.f, t3, 1.2f, COL_YELLOW);
+    DrawText(ox + (ow - TW(t3, 1.15f)) * 0.5f, oy + 90.f, t3, 1.15f, COL_YELLOW);
 
     const char* t4 = "[B]  Cancel";
-    DrawText(ox + (ow - TW(t4, 1.1f)) * 0.5f, oy + 76.f, t4, 1.1f, COL_GRAY);
+    DrawText(ox + (ow - TW(t4, 1.05f)) * 0.5f, oy + oh - 16.f, t4, 1.05f, COL_GRAY);
 }
 
 // ============================================================================
@@ -609,7 +733,8 @@ static void RenderCPUCard(const DiagLogo& logo)
 {
     const char* hint =
         (s_state == SSTATE_IDLE) ? "[A] Start Test    [B] Back    [Right] RAM / GPU" :
-        (s_state == SSTATE_THRESHOLD) ? "[LT] Lower    [RT] Raise    [A] Continue    [B] Cancel" :
+        (s_state == SSTATE_THRESHOLD) ? "[LT] Lower    [RT] Raise    [A] Next    [B] Cancel" :
+        (s_state == SSTATE_FAN) ? "[X] Auto/Manual    [LT/RT] Adjust    [A] Next    [B] Back" :
         (s_state == SSTATE_CONFIRM) ? "[LT+RT] Confirm    [B] Cancel" :
         "[Right] RAM / GPU    Hold [Back+A] 5s to Abort";
 
@@ -726,11 +851,13 @@ static void RenderCPUCard(const DiagLogo& logo)
                 1.0f, COL_DIM);
     }
 
-    // ---- Threshold picker, then confirm overlay (drawn last, on top) ----
+    // ---- Threshold picker, confirm overlay, fan overlay (drawn last, on top) ----
     if (s_state == SSTATE_THRESHOLD)
         DrawThresholdOverlay();
     else if (s_state == SSTATE_CONFIRM)
         DrawConfirmOverlay();
+    else if (s_state == SSTATE_FAN)
+        DrawFanOverlay();
 }
 
 // ============================================================================
@@ -740,3 +867,57 @@ static void RenderCPUCard(const DiagLogo& logo)
 void ST_CPU_TakeSample() { TakeSample(); }
 void ST_CPU_ReadMHz() { s_curMHz = ReadCPUMHz(); }
 void ST_CPU_Render(const DiagLogo& logo) { RenderCPUCard(logo); }
+
+// Fan overlay input helpers — called from StressTest.cpp tick
+void ST_CPU_FanToggleAuto()
+{
+    s_fanAuto = !s_fanAuto;
+}
+
+void ST_CPU_FanStep(int delta)
+{
+    // delta is +1 or -1 representing one 5% step
+    if (s_fanAuto) return;
+    s_fanTargetPct += delta * 5;
+    if (s_fanTargetPct < 0)   s_fanTargetPct = 0;
+    if (s_fanTargetPct > 100) s_fanTargetPct = 100;
+}
+
+void ST_CPU_FanApply()
+{
+    if (s_fanAuto)
+    {
+        // Release back to SMC automatic control:
+        // Write 0 to fan mode reg 0x05 first, then 0 to speed reg 0x06.
+        SMBusWrite(SMBADDR_PIC, 0x05, 0);
+        SMBusWrite(SMBADDR_PIC, 0x06, 0);
+    }
+    else
+    {
+        // Manual override — per xboxdevwiki PIC register table:
+        //   0x05 = fan mode: 0=automatic, 1=custom speed from reg 0x06
+        //   0x06 = fan speed: 0..50 (multiply by 2 for 0-100%)
+        // Mode MUST be set to 1 before the speed write or the SMC ignores it.
+        BYTE raw = (BYTE)(s_fanTargetPct / 2);
+        SMBusWrite(SMBADDR_PIC, 0x05, 1);
+        SMBusWrite(SMBADDR_PIC, 0x06, raw);
+    }
+}
+
+void ST_CPU_FanCancel()
+{
+    // Cancel without applying — mode reverts to auto, SMC resumes control.
+    s_fanAuto = true;
+}
+
+void ST_CPU_FanRelease()
+{
+    // Called on module exit — restore SMC automatic fan control.
+    // Must write 0 to mode reg 0x05 to hand control back to the SMC.
+    s_fanAuto = true;
+    SMBusWrite(SMBADDR_PIC, 0x05, 0);
+    SMBusWrite(SMBADDR_PIC, 0x06, 0);
+}
+
+bool ST_CPU_FanIsAuto() { return s_fanAuto; }
+int  ST_CPU_FanGetPct() { return s_fanTargetPct; }

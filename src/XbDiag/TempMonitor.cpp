@@ -667,11 +667,24 @@ void TempMonitor_AutoRun(HANDLE hReport)
             WriteFile(hReport, line, StrLen(line), &w, NULL);
         };
 
-    // Warmup: call TakeSample() until path is detected (up to 10 x 200ms = 2s)
-    for (int i = 0; i < 10 && s_path == PATH_UNKNOWN; ++i)
+    // Warmup: detect path then prime the accumulator.
+    // PATH_ADM1032: one call detects path and reads temps immediately.
+    // PATH_PIC_16:  requires AVG_SAMPLES (10) successful TakeSample() calls
+    //               before s_sensorOK goes true — the accumulator must fill
+    //               before any valid reading is committed.
+    // Run up to AVG_SAMPLES * 3 iterations so the PIC path always completes
+    // at least one full accumulation cycle before measurement begins.
     {
-        TakeSample();
-        Sleep(200);
+        int i;
+        for (i = 0; i < AVG_SAMPLES * 3; ++i)
+        {
+            TakeSample();
+            Sleep(200);
+            // ADM1032: path known and sensorOK after first successful read
+            if (s_path == PATH_ADM1032 && s_sensorOK) break;
+            // PIC_16: wait until accumulator has committed at least once
+            if (s_path == PATH_PIC_16 && s_avg_count == 0 && s_sensorOK) break;
+        }
     }
 
     if (s_path == PATH_UNKNOWN)

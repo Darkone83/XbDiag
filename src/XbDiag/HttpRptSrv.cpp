@@ -8,11 +8,12 @@
 //
 // Pages:
 //   GET  /sysinfo   -- hardware snapshot (auto-refresh every 30s)
+//   GET  /smart     -- decoded SMART attribute table (requires HddInfo run first)
 //   GET  /report    -- report file viewer with auto-detect + download links
-//   GET  /settings  -- XbSet editor (GET=view, POST=save)
+//   GET  /settings  -- XbSet editor (GET=view, GET /save=save)
+//   GET  /power     -- console power control (reset / power cycle / power off)
 //   GET  /about     -- about page with branding
 //   GET  /download  -- binary file download streamed in chunks
-//   POST /settings  -- save XbDiag.set
 //
 // RXDK constraints:
 //   No sprintf/sscanf/strlen -- DiagCommon helpers throughout
@@ -25,6 +26,8 @@
 #include "Update.h"
 #include "XbSet.h"
 #include "StressTest.h"
+#include "HddInfo.h"
+#include "HddSmart.h"
 #include "DiagCommon.h"
 #include <xtl.h>
 #include <winsockx.h>
@@ -586,6 +589,70 @@ static void EmitCSS()
         "#savebar{margin:0 -16px;padding:12px 16px}"
         ".about-logos{gap:24px}"
         "}"
+        /* ── SMART table ────────────────────────────────────────── */
+        ".smart-tbl{width:100%;border-collapse:collapse;font-size:12px;"
+        "font-family:'JetBrains Mono',monospace}"
+        ".smart-tbl th{padding:8px 12px;text-align:left;"
+        "font-size:9px;font-weight:700;letter-spacing:2px;text-transform:uppercase;"
+        "color:rgba(80,220,255,.3);border-bottom:1px solid rgba(80,220,255,.1)}"
+        ".smart-tbl td{padding:8px 12px;border-bottom:1px solid rgba(80,220,255,.04);"
+        "color:#8A9AB0;vertical-align:middle}"
+        ".smart-tbl tr:last-child td{border-bottom:none}"
+        ".smart-tbl tr:hover td{background:rgba(80,220,255,.02)}"
+        ".smart-tbl .id{color:#2A3860;width:36px}"
+        ".smart-tbl .name{color:#6A8098}"
+        ".smart-tbl .cur,.smart-tbl .wst,.smart-tbl .thr{width:40px;text-align:center;color:#3A4870}"
+        ".smart-tbl .val{color:#7A9898}"
+        ".smart-tbl tr.crit td{background:rgba(255,80,96,.04)}"
+        ".smart-tbl tr.crit .name{color:#FF5060}"
+        ".smart-tbl tr.crit .val{color:#FF7080}"
+        ".smart-tbl tr.warn td{background:rgba(255,160,40,.03)}"
+        ".smart-tbl tr.warn .name{color:#FFA028}"
+
+        /* ── Power buttons ──────────────────────────────────────── */
+        ".pwr-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;max-width:600px}"
+        ".pwr-btn{"
+        "display:flex;flex-direction:column;align-items:center;justify-content:center;"
+        "gap:10px;padding:28px 20px;"
+        "border-radius:12px;border:1px solid;"
+        "cursor:pointer;text-decoration:none;"
+        "transition:all .2s;text-align:center}"
+        ".pwr-icon{font-size:28px}"
+        ".pwr-label{font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase}"
+        ".pwr-desc{font-size:10px;opacity:.6;letter-spacing:.3px}"
+        ".pwr-reset{"
+        "background:rgba(80,220,255,.04);border-color:rgba(80,220,255,.15);color:#50DCFF}"
+        ".pwr-reset:hover{"
+        "background:rgba(80,220,255,.1);border-color:rgba(80,220,255,.4);"
+        "box-shadow:0 0 20px rgba(80,220,255,.1)}"
+        ".pwr-cycle{"
+        "background:rgba(255,160,40,.04);border-color:rgba(255,160,40,.15);color:#FFA028}"
+        ".pwr-cycle:hover{"
+        "background:rgba(255,160,40,.1);border-color:rgba(255,160,40,.4);"
+        "box-shadow:0 0 20px rgba(255,160,40,.1)}"
+        ".pwr-off{"
+        "background:rgba(255,80,96,.04);border-color:rgba(255,80,96,.15);color:#FF5060}"
+        ".pwr-off:hover{"
+        "background:rgba(255,80,96,.1);border-color:rgba(255,80,96,.4);"
+        "box-shadow:0 0 20px rgba(255,80,96,.1)}"
+        ".pwr-confirm{"
+        "background:rgba(255,80,96,.08);border:1px solid rgba(255,80,96,.3);"
+        "border-radius:12px;padding:24px;margin-top:16px;max-width:420px}"
+        ".pwr-confirm-msg{color:#FF8090;font-size:14px;margin-bottom:16px}"
+        ".pwr-confirm-btns{display:flex;gap:12px}"
+        ".pwr-yes{"
+        "flex:1;padding:10px;border-radius:8px;border:1px solid rgba(255,80,96,.4);"
+        "background:rgba(255,80,96,.12);color:#FF5060;"
+        "font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;"
+        "cursor:pointer;text-decoration:none;text-align:center;transition:all .2s}"
+        ".pwr-yes:hover{background:rgba(255,80,96,.22)}"
+        ".pwr-no{"
+        "flex:1;padding:10px;border-radius:8px;border:1px solid rgba(80,220,255,.15);"
+        "background:rgba(80,220,255,.04);color:#50DCFF;"
+        "font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;"
+        "cursor:pointer;text-decoration:none;text-align:center;transition:all .2s}"
+        ".pwr-no:hover{background:rgba(80,220,255,.1)}"
+
         "</style>");
 }
 
@@ -621,8 +688,10 @@ static void PageStart(const char* title, const char* tab,
     // Nav
     BA("<div id=nav>");
     BA("<a class='tab"); if (SEq(tab, "si")) BA(" on"); BA("' href=/sysinfo>System Info</a>");
+    BA("<a class='tab"); if (SEq(tab, "sm")) BA(" on"); BA("' href=/smart>SMART</a>");
     BA("<a class='tab"); if (SEq(tab, "rp")) BA(" on"); BA("' href=/report>Report</a>");
     BA("<a class='tab"); if (SEq(tab, "st")) BA(" on"); BA("' href=/settings>Settings</a>");
+    BA("<a class='tab"); if (SEq(tab, "pw")) BA(" on"); BA("' href=/power>Power</a>");
     BA("<a class='tab"); if (SEq(tab, "ab")) BA(" on"); BA("' href=/about>About</a>");
     BA("</div><div id=body>");
 }
@@ -2172,6 +2241,197 @@ static const char* s_img_dc =
 "AnBpLAH4ixz/B2AHiKkJaBwLAAAAAElFTkSuQmCC";
 
 // ============================================================================
+// BuildSmart
+// ============================================================================
+
+static void BuildSmart()
+{
+    int rowCount = HddSmart_GetRowCount();
+
+    PageStart("SMART", "sm", NULL);
+
+    if (!s_data.ataOK)
+    {
+        BA("<div class='info err'><strong>No drive detected.</strong> "
+            "Run HDD Info from the main menu first, then return here.</div>");
+        PageEnd();
+        return;
+    }
+    if (!s_data.smartOK)
+    {
+        BA("<div class='info err'><strong>SMART not available.</strong> ");
+        if (!s_data.smartSupported)
+            BA("Drive does not support SMART.");
+        else
+            BA("SMART read failed — ATA command returned an error.");
+        BA("</div>");
+        PageEnd();
+        return;
+    }
+    if (rowCount == 0)
+    {
+        BA("<div class='info'><strong>No SMART attributes.</strong> "
+            "Navigate to HDD Info &rarr; SMART tab to load the data, "
+            "then reload this page.</div>");
+        PageEnd();
+        return;
+    }
+
+    // Drive header
+    BA("<div class=sec>Drive</div>");
+    BA("<div class=card><div class=card-body>");
+    Row("Model", s_data.model, "cy");
+    Row("Serial", s_data.serial, "");
+    BA("</div></div>");
+
+    // SMART table
+    BA("<div class=sec>Attributes</div>");
+    BA("<div class=card><div class=card-body style='padding:0'>");
+    BA("<table class=smart-tbl>"
+        "<thead><tr>"
+        "<th>ID</th><th>Attribute</th>"
+        "<th>CUR</th><th>WST</th><th>THR</th>"
+        "<th>Value</th>"
+        "</tr></thead><tbody>");
+
+    {
+        int i;
+        for (i = 0; i < rowCount; ++i)
+        {
+            char idBuf[6], nameBuf[48], valBuf[32];
+            bool isCrit, isTripped;
+            char curBuf[8], wstBuf[8], thrBuf[8];
+
+            if (!HddSmart_GetRow(i,
+                idBuf, sizeof(idBuf),
+                nameBuf, sizeof(nameBuf),
+                valBuf, sizeof(valBuf),
+                &isCrit, &isTripped))
+                continue;
+
+            {
+                int cur = 0, wst = 0, thr = 0;
+                HddSmart_GetRowRaw(i, &cur, &wst, &thr);
+                IntToStr(cur, curBuf, sizeof(curBuf));
+                IntToStr(wst, wstBuf, sizeof(wstBuf));
+                IntToStr(thr, thrBuf, sizeof(thrBuf));
+            }
+
+            if (isTripped)
+                BA("<tr class=crit>");
+            else if (isCrit)
+                BA("<tr class=warn>");
+            else
+                BA("<tr>");
+
+            BA("<td class=id>"); BAE(idBuf); BA("</td>");
+            BA("<td class=name>"); BAE(nameBuf); BA("</td>");
+            BA("<td class=cur>"); BAE(curBuf); BA("</td>");
+            BA("<td class=wst>"); BAE(wstBuf); BA("</td>");
+            BA("<td class=thr>"); BAE(thrBuf); BA("</td>");
+            BA("<td class=val>"); BAE(valBuf); BA("</td>");
+            BA("</tr>\n");
+        }
+    }
+
+    BA("</tbody></table>");
+    BA("</div></div>");
+
+    BA("<div class='info' style='margin-top:12px'>"
+        "<strong>CUR</strong> = current normalised value &nbsp;&bull;&nbsp; "
+        "<strong>WST</strong> = worst ever &nbsp;&bull;&nbsp; "
+        "<strong>THR</strong> = manufacturer threshold &nbsp;&bull;&nbsp; "
+        "<span style='color:#FF5060'>Red row</span> = threshold tripped"
+        "</div>");
+
+    PageEnd();
+}
+
+// ============================================================================
+// BuildPower
+// ============================================================================
+
+static void BuildPower(const char* query)
+{
+    char action[16];
+    char confirm[4];
+    bool hasConfirm;
+
+    GetParam(query, "action", action, sizeof(action));
+    hasConfirm = GetParam(query, "confirm", confirm, sizeof(confirm)) &&
+        SEq(confirm, "1");
+
+    // Execute if confirmed
+    if (hasConfirm && action[0])
+    {
+        BYTE picCmd = 0;
+        if (SEq(action, "reset"))     picCmd = 0x01;
+        else if (SEq(action, "powercycle")) picCmd = 0x40;
+        else if (SEq(action, "poweroff"))  picCmd = 0x80;
+
+        if (picCmd)
+        {
+            SMBusWrite(SMBADDR_PIC, 0x02, picCmd);
+            // Power off won't get here — but reset/cycle might briefly
+        }
+    }
+
+    PageStart("Power", "pw", NULL);
+
+    // Confirmation prompt if action requested but not yet confirmed
+    if (action[0] && !hasConfirm)
+    {
+        const char* actionLabel =
+            SEq(action, "reset") ? "Reset Xbox" :
+            SEq(action, "powercycle") ? "Power Cycle Xbox" :
+            SEq(action, "poweroff") ? "Power Off Xbox" : "Unknown";
+
+        BA("<div class=sec>Confirm</div>");
+        BA("<div class=pwr-confirm>");
+        BA("<div class=pwr-confirm-msg>Are you sure you want to <strong>");
+        BAE(actionLabel);
+        BA("</strong>?</div>");
+        BA("<div class=pwr-confirm-btns>");
+        BA("<a class=pwr-yes href='/power?action=");
+        BAE(action);
+        BA("&confirm=1'>Yes, proceed</a>");
+        BA("<a class=pwr-no href=/power>Cancel</a>");
+        BA("</div></div>");
+        PageEnd();
+        return;
+    }
+
+    // Main power page
+    BA("<div class=sec>Console Control</div>");
+    BA("<div class='info' style='margin-bottom:18px'>"
+        "Sends a command directly to the PIC (SMC) via SMBus register 0x02. "
+        "Commands execute immediately after confirmation.</div>");
+
+    BA("<div class=pwr-grid>");
+
+    BA("<a class='pwr-btn pwr-reset' href='/power?action=reset'>"
+        "<span class=pwr-icon>&#x21BA;</span>"
+        "<span class=pwr-label>Reset</span>"
+        "<span class=pwr-desc>Warm reboot</span>"
+        "</a>");
+
+    BA("<a class='pwr-btn pwr-cycle' href='/power?action=powercycle'>"
+        "<span class=pwr-icon>&#x23FB;</span>"
+        "<span class=pwr-label>Power Cycle</span>"
+        "<span class=pwr-desc>Off then on</span>"
+        "</a>");
+
+    BA("<a class='pwr-btn pwr-off' href='/power?action=poweroff'>"
+        "<span class=pwr-icon>&#x23FC;</span>"
+        "<span class=pwr-label>Power Off</span>"
+        "<span class=pwr-desc>Shutdown</span>"
+        "</a>");
+
+    BA("</div>");
+    PageEnd();
+}
+
+// ============================================================================
 // BuildAbout
 // ============================================================================
 
@@ -2456,6 +2716,10 @@ static void ServeClient(SOCKET c)
     {
         BuildSysInfo(); SendHTML(c);
     }
+    else if (SEq(path, "/smart"))
+    {
+        BuildSmart(); SendHTML(c);
+    }
     else if (SEq(path, "/report"))
     {
         char fname[64];
@@ -2477,6 +2741,10 @@ static void ServeClient(SOCKET c)
     else if (SEq(path, "/about"))
     {
         BuildAbout(); SendHTML(c);
+    }
+    else if (SEq(path, "/power"))
+    {
+        BuildPower(query); SendHTML(c);
     }
     else if (SEq(path, "/download"))
     {

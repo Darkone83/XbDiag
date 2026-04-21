@@ -21,8 +21,9 @@
 //
 // Shutdown after completion: calls PIC16L power-off command after report.
 //
-// Controller test waits up to 60 seconds for [A] to confirm presence.
-// If no input arrives the test is skipped and noted in the report.
+// Controller test runs as an automated snapshot -- no user interaction required.
+// Records port/MU presence, stick positions at rest, and stuck buttons.
+// For in-depth testing use the interactive Controller Test module directly.
 // ============================================================================
 
 struct AutoSettings
@@ -36,7 +37,7 @@ struct AutoSettings
     bool runTempMon;
     bool runEeprom;
 
-    // Interactive — waits up to 60s for input, skips if none
+    // Automated snapshot -- no user input required
     bool runCtrlTest;
 
     // Stress tests

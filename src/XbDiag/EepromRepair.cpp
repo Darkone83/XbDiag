@@ -290,10 +290,22 @@ struct RepairItem
 
 static RepairItem s_repItems[16];
 static int        s_repCount = 0;
+static int        s_repScroll = 0;  // first visible row index
+
+// Geometry shared between render and input — must match RenderRepair layout exactly.
+// firstRowY: CONTENT_Y + 4 (start) + (LINE_H+6) warning + 4 hline + LINE_H header + 3 separator
+// ROW_H: LINE_H + 3
+// These are macros rather than static consts so they evaluate at call time using
+// the runtime CONTENT_Y and LINE_H values, which are already compile-time constants
+// in DiagCommon.h — the macro just avoids repeating the arithmetic.
+#define REP_FIRST_ROW_Y  (CONTENT_Y + 4.f + (LINE_H + 6.f) + 4.f + LINE_H + 3.f)
+#define REP_ROW_H        (LINE_H + 3.f)
+#define REP_VIS_ROWS     Ftoi((BOT_BAR_Y - REP_FIRST_ROW_Y) / REP_ROW_H)
 
 static void RepairBuildDiag()
 {
     s_repCount = 0;
+    s_repScroll = 0;
 
     auto add = [](const char* lbl, const char* desc, bool ok, bool canFix) {
         s_repItems[s_repCount].label = lbl;
@@ -536,9 +548,9 @@ static void RenderRepair(const DiagLogo& logo)
     else if (s_repRan)
         hint = "[A] Re-scan    [B] Back";
     else if (RepairBadCount() > 0)
-        hint = "[A] Repair issues    [B] Back";
+        hint = "[UP/DN] Scroll    [A] Repair issues    [B] Back";
     else
-        hint = "[B] Back — no repairable issues";
+        hint = "[UP/DN] Scroll    [B] Back";
 
     DrawPageChrome(logo, "EEPROM - REPAIR", hint);
 
@@ -596,8 +608,24 @@ static void RenderRepair(const DiagLogo& logo)
     HLine(y, 0.f, SW, D3DCOLOR_XRGB(18, 22, 48));
     y += 3.f;
 
-    const float ROW_H = LINE_H + 3.f;
-    for (int i = 0; i < s_repCount; ++i)
+    const float ROW_H = REP_ROW_H;
+
+    // Compute how many rows fit between the header and the bottom bar.
+    // firstRowY is where the loop starts; BOT_BAR_Y is the hard lower limit.
+    const float firstRowY = y;
+    const int   visRows = REP_VIS_ROWS;
+
+    // Clamp scroll so the last page is always full if possible
+    int maxScroll = s_repCount - visRows;
+    if (maxScroll < 0) maxScroll = 0;
+    if (s_repScroll > maxScroll) s_repScroll = maxScroll;
+    if (s_repScroll < 0)         s_repScroll = 0;
+
+    // "^ more" indicator in the header row when scrolled down
+    if (s_repScroll > 0)
+        DrawTextR(SW - LM, y - LINE_H, "^ more", 0.95f, COL_DIM);
+
+    for (int i = s_repScroll; i < s_repCount && i < s_repScroll + visRows; ++i)
     {
         const RepairItem& ri = s_repItems[i];
 
@@ -640,49 +668,65 @@ static void RenderRepair(const DiagLogo& logo)
         y += ROW_H;
     }
 
-    y += 6.f;
-
-    if (s_repRan)
+    // "v N more" indicator below last visible row
+    int below = s_repCount - (s_repScroll + visRows);
+    if (below > 0)
     {
-        int fixed = 0, failed = 0;
-        for (int i = 0; i < s_repCount; ++i)
-        {
-            if (s_repItems[i].state == REP_FIXED) ++fixed;
-            if (s_repItems[i].state == REP_FAIL)  ++failed;
-        }
-        char msg[80]; char fa[6], fb[6];
-        IntToStr(fixed, fa, sizeof(fa)); IntToStr(failed, fb, sizeof(fb));
-        StrCopy(msg, sizeof(msg), "Complete: ");
-        StrCat2(msg, sizeof(msg), msg, fa);
-        StrCat2(msg, sizeof(msg), msg, " item(s) repaired");
-        if (failed > 0)
-        {
-            StrCat2(msg, sizeof(msg), msg, ",  ");
-            StrCat2(msg, sizeof(msg), msg, fb);
-            StrCat2(msg, sizeof(msg), msg, " failed");
-        }
-        DrawText(LM, y, msg, 1.2f, failed ? COL_ORANGE : COL_GREEN);
-        y += LINE_H + 2.f;
-        DrawText(LM, y,
-            "Press [A] to re-scan and confirm, or [B] to return to decoded view.",
-            1.05f, COL_DIM);
+        char moreBuf[24]; char moreNum[8];
+        IntToStr(below, moreNum, sizeof(moreNum));
+        StrCopy(moreBuf, sizeof(moreBuf), "v ");
+        StrCat2(moreBuf, sizeof(moreBuf), moreBuf, moreNum);
+        StrCat2(moreBuf, sizeof(moreBuf), moreBuf, " more");
+        DrawText(SW - LM - TW(moreBuf, 0.95f), y + 1.f, moreBuf, 0.95f, COL_DIM);
     }
-    else if (RepairBadCount() == 0)
-    {
-        int infoCount = 0;
-        for (int i = 0; i < s_repCount; ++i)
-            if (s_repItems[i].state == REP_INFO) ++infoCount;
 
-        DrawText(LM, y, "All repairable fields are valid.", 1.2f, COL_GREEN);
-        if (infoCount > 0)
+    // Summary text — only when all rows visible (no clipping below)
+    if (below <= 0)
+    {
+        y += 6.f;
+
+        if (s_repRan)
         {
+            int fixed = 0, failed = 0;
+            for (int i = 0; i < s_repCount; ++i)
+            {
+                if (s_repItems[i].state == REP_FIXED) ++fixed;
+                if (s_repItems[i].state == REP_FAIL)  ++failed;
+            }
+            char msg[80]; char fa[6], fb[6];
+            IntToStr(fixed, fa, sizeof(fa)); IntToStr(failed, fb, sizeof(fb));
+            StrCopy(msg, sizeof(msg), "Complete: ");
+            StrCat2(msg, sizeof(msg), msg, fa);
+            StrCat2(msg, sizeof(msg), msg, " item(s) repaired");
+            if (failed > 0)
+            {
+                StrCat2(msg, sizeof(msg), msg, ",  ");
+                StrCat2(msg, sizeof(msg), msg, fb);
+                StrCat2(msg, sizeof(msg), msg, " failed");
+            }
+            DrawText(LM, y, msg, 1.2f, failed ? COL_ORANGE : COL_GREEN);
             y += LINE_H + 2.f;
             DrawText(LM, y,
-                "! Security hash is invalid (detect only). "
-                "Usually caused by EEPROM corruption or wrong kernel version.",
-                1.05f, COL_ORANGE);
+                "Press [A] to re-scan and confirm, or [B] to return to decoded view.",
+                1.05f, COL_DIM);
         }
-    }
+        else if (RepairBadCount() == 0)
+        {
+            int infoCount = 0;
+            for (int i = 0; i < s_repCount; ++i)
+                if (s_repItems[i].state == REP_INFO) ++infoCount;
+
+            DrawText(LM, y, "All repairable fields are valid.", 1.2f, COL_GREEN);
+            if (infoCount > 0)
+            {
+                y += LINE_H + 2.f;
+                DrawText(LM, y,
+                    "! Security hash is invalid (detect only). "
+                    "Usually caused by EEPROM corruption or wrong kernel version.",
+                    1.05f, COL_ORANGE);
+            }
+        }
+    } // end if (below <= 0)
 
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
@@ -780,6 +824,18 @@ static void RepairHandleInput(WORD cur, WORD prev, const DiagLogo& logo)
     if (Edge(cur, prev, BTN_B) || Edge(cur, prev, BTN_BACK))
     {
         s_eepView = VIEW_DECODED;
+        return;
+    }
+    if (Edge(cur, prev, BTN_DPAD_UP))
+    {
+        if (s_repScroll > 0) --s_repScroll;
+        return;
+    }
+    if (Edge(cur, prev, BTN_DPAD_DOWN))
+    {
+        int maxScroll = s_repCount - REP_VIS_ROWS;
+        if (maxScroll < 0) maxScroll = 0;
+        if (s_repScroll < maxScroll) ++s_repScroll;
         return;
     }
     if (Edge(cur, prev, BTN_A) && RepairBadCount() > 0)

@@ -289,11 +289,11 @@ static void DrawScroller(float baseY)
         // Rainbow: hue cycles with character index + time
         // H in [0,1], full saturation, full value -> RGB
         float hue = (float)i * (1.f / 24.f) + s_scrollTime * 0.18f;
-        hue = hue - (float)(int)hue;   // frac(), C89-safe
+        hue = hue - (float)Ftoi(hue);   // frac(), no __ftol2_sse
 
         // HSV->RGB: S=1, V=1
         float h6 = hue * 6.f;
-        int   hi = (int)h6;
+        int   hi = Ftoi(h6);
         float f = h6 - (float)hi;
         // p=0, q=1-f, t=f  (S=V=1 simplification)
         float r = 0.f, g = 0.f, b = 0.f;

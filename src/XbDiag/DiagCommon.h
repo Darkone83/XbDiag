@@ -49,7 +49,7 @@ static const float CONTENT_Y = TOP_BAR_H + 2.0f;
 static const float TEXT_SCALE = 1.5f;
 static const float LINE_H = 18.0f;
 static const float GROUP_GAP = 10.0f;
-static const float LM = 32.0f;
+static const float LM = 48.0f;
 static const float VM = 200.0f;
 
 // Video mode info - set by DetectVideoMode() in main.cpp

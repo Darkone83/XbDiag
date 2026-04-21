@@ -43,7 +43,7 @@ static const float CY = CONTENT_Y + 6.f;
 static const float COL_L = LM;
 static const float COL_R = SW * 0.5f + 4.f;
 static const float COL_VL = COL_L + 110.f;
-static const float COL_VR = COL_R + 110.f;
+static const float COL_VR = COL_R + 64.f;   // was +110; tightened to fit longest value at LM=48
 static const float LH = LINE_H - 1.f;
 static const float GAP = 8.f;
 

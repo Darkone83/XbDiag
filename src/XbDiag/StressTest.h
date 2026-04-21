@@ -12,7 +12,7 @@
 // Shared types
 // ============================================================================
 
-enum StressState { SSTATE_IDLE = 0, SSTATE_THRESHOLD, SSTATE_CONFIRM, SSTATE_RUNNING };
+enum StressState { SSTATE_IDLE = 0, SSTATE_THRESHOLD, SSTATE_FAN, SSTATE_CONFIRM, SSTATE_RUNNING };
 enum StressCard { CARD_CPU = 0, CARD_RAM = 1, CARD_GPU = 2 };
 
 // ============================================================================

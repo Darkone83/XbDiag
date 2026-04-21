@@ -3,66 +3,14 @@
 //
 // Renders the SMART attribute table and exports D:\smart.txt.
 // All data comes from s_data.smartBuf (populated by LoadData in HddInfo.cpp).
+// Attribute names, raw format decode, and vendor overrides via HddSmartDB.hpp.
 
 #include "HddSmart.h"
 #include "HddInfo.h"
+#include "HddSmartDB.hpp"
 #include "font.h"
 #include "input.h"
 #include <xtl.h>
-
-// ============================================================================
-// SMART attribute name table
-// ============================================================================
-
-static const char* SmartAttrName(BYTE id)
-{
-    switch (id)
-    {
-    case 0x01: return "Read Error Rate";
-    case 0x02: return "Throughput Perf";
-    case 0x03: return "Spin-Up Time";
-    case 0x04: return "Start/Stop Count";
-    case 0x05: return "Reallocated Sects";
-    case 0x07: return "Seek Error Rate";
-    case 0x08: return "Seek Time Perf";
-    case 0x09: return "Power-On Hours";
-    case 0x0A: return "Spin Retry Count";
-    case 0x0B: return "Calibration Retry";
-    case 0x0C: return "Power Cycle Count";
-    case 0xAA: return "Available Reservd";
-    case 0xAB: return "Program Fail Count";
-    case 0xAC: return "Erase Fail Count";
-    case 0xAD: return "Wear Level Count";
-    case 0xAE: return "Unexpected Poweroff";
-    case 0xB8: return "End-to-End Error";
-    case 0xBB: return "Uncorr ECC Count";
-    case 0xBC: return "Command Timeout";
-    case 0xBD: return "High Fly Writes";
-    case 0xBE: return "Temp Difference";
-    case 0xBF: return "G-Sense Errors";
-    case 0xC0: return "Unsafe Shutdowns";
-    case 0xC1: return "Load/Unload Cycles";
-    case 0xC2: return "Temperature";
-    case 0xC3: return "Hardware ECC Recov";
-    case 0xC4: return "Realloc Event Cnt";
-    case 0xC5: return "Pending Sectors";
-    case 0xC6: return "Uncorrectable Sects";
-    case 0xC7: return "UDMA CRC Errors";
-    case 0xC8: return "Write Error Rate";
-    case 0xCA: return "Data Addr Mark Errs";
-    case 0xCB: return "Run Out Cancel";
-    case 0xF0: return "Head Flying Hours";
-    case 0xF1: return "Total LBA Written";
-    case 0xF2: return "Total LBA Read";
-    case 0xFE: return "Free Fall Protect";
-    default:   return NULL;
-    }
-}
-
-static bool SmartAttrCritical(BYTE id)
-{
-    return (id == 0x05 || id == 0xC5 || id == 0xC6);
-}
 
 // ============================================================================
 // SMART constants
@@ -108,8 +56,8 @@ void HddSmart_Export()
         return;
     }
 
-    const char* col = "\r\nID    Name                 Cur  Wst  Thr  Raw\r\n"
-        "----  -------------------  ---  ---  ---  ------------\r\n";
+    const char* col = "\r\nID    Name                 Cur  Wst  Thr  Value\r\n"
+        "----  -------------------  ---  ---  ---  --------------------\r\n";
     WriteFile(hf, col, StrLen(col), &w, NULL);
 
     const BYTE* p = d.smartBuf + 2;
@@ -128,19 +76,33 @@ void HddSmart_Export()
         char wstStr[4]; IntToStr(wst, wstStr, sizeof(wstStr));
         char thrStr[4]; IntToStr(thr, thrStr, sizeof(thrStr));
 
-        char rawStr[20]; rawStr[0] = '\0';
-        char rb[4];
-        for (int j = 5; j >= 0; --j)
+        // Decoded raw value via DB
+        char rawStr[24];
+        const SmartAttrDef* def = SmartDB_Lookup(d.model, id);
+        if (def)
+            SmartDB_FormatRaw(def->fmt, raw, rawStr, sizeof(rawStr));
+        else
         {
-            IntToHex(raw[j], 2, rb, sizeof(rb));
-            StrCat2(rawStr, sizeof(rawStr), rawStr, rb);
-            if (j > 0) StrCat2(rawStr, sizeof(rawStr), rawStr, " ");
+            // fallback hex
+            char rb[4]; int j;
+            rawStr[0] = '\0';
+            for (j = 5; j >= 0; --j)
+            {
+                IntToHex(raw[j], 2, rb, sizeof(rb));
+                StrCat2(rawStr, sizeof(rawStr), rawStr, rb);
+                if (j > 0) StrCat2(rawStr, sizeof(rawStr), rawStr, " ");
+            }
         }
 
-        const char* name = SmartAttrName(id);
+        // Attribute name via DB
         char nameBuf[22];
-        if (name) StrCopy(nameBuf, sizeof(nameBuf), name);
-        else { StrCopy(nameBuf, sizeof(nameBuf), "Attr 0x"); StrCat2(nameBuf, sizeof(nameBuf), nameBuf, idStr); }
+        if (def && def->name)
+            StrCopy(nameBuf, sizeof(nameBuf), def->name);
+        else
+        {
+            StrCopy(nameBuf, sizeof(nameBuf), "Attr 0x");
+            StrCat2(nameBuf, sizeof(nameBuf), nameBuf, idStr);
+        }
         int nl = (int)StrLen(nameBuf);
         while (nl < 20) { nameBuf[nl++] = ' '; }
         nameBuf[20] = '\0';
@@ -179,6 +141,7 @@ void HddSmart_Export()
 
 struct SmartRow { BYTE id; BYTE cur; BYTE wst; BYTE thr; BYTE raw[6]; };
 static SmartRow s_smartRows[SMART_MAX_ATTRS];
+static int      s_smartRowCount = 0;  // populated by HddSmart_Render, read by HTTP server
 
 static int  s_smartScroll = 0;
 static bool s_smartScrollRst = true;
@@ -244,6 +207,7 @@ void HddSmart_Render(const DiagLogo& logo)
             ++rowCount;
         }
     }
+    s_smartRowCount = rowCount;
 
     // ---- Scroll reset on entry ------------------------------------------
     if (s_smartScrollRst) { s_smartScroll = 0; s_smartScrollRst = false; }
@@ -297,7 +261,7 @@ void HddSmart_Render(const DiagLogo& logo)
     DrawText(CX_CUR, y, "CUR", 1.1f, COL_GRAY);
     DrawText(CX_WST, y, "WST", 1.1f, COL_GRAY);
     DrawText(CX_THR, y, "THR", 1.1f, COL_GRAY);
-    DrawText(CX_RAW, y, "RAW VALUE", 1.1f, COL_GRAY);
+    DrawText(CX_RAW, y, "VALUE", 1.1f, COL_GRAY);
     y += LH2 - 2.f;
     HLine(y, LM, SW - LM, COL_BORDER);
     y += 3.f;
@@ -315,13 +279,12 @@ void HddSmart_Render(const DiagLogo& logo)
         char wstStr[4];
         char thrStr[4];
         char nameBuf[22];
-        char rawStr[20];
-        char rb[4];
+        char rawStr[24];
         bool isCrit;
         bool rawNonZero;
         bool highlight;
-        const char* name;
-        int rj, rk;
+        const SmartAttrDef* def;
+        int rj;
         const SmartRow& r = s_smartRows[ri];
 
         IntToHex(r.id, 2, idStr, sizeof(idStr));
@@ -329,32 +292,51 @@ void HddSmart_Render(const DiagLogo& logo)
         IntToStr(r.wst, wstStr, sizeof(wstStr));
         IntToStr(r.thr, thrStr, sizeof(thrStr));
 
-        isCrit = SmartAttrCritical(r.id);
+        def = SmartDB_Lookup(d.model, r.id);
+
+        isCrit = def ? def->critical : false;
         rawNonZero = false;
         for (rj = 0; rj < 6; ++rj) if (r.raw[rj]) { rawNonZero = true; break; }
-        highlight = isCrit && rawNonZero;
+
+        // Highlight only when the manufacturer's threshold is actually tripped:
+        // normalized VALUE <= THRESHOLD means the drive itself considers this a fail.
+        // thr == 0 means no threshold defined — skip to avoid false positives.
+        // This prevents flagging red on attributes like C7/A8 where the raw count
+        // is nonzero but the drive's own normalized value is still above threshold.
+        highlight = isCrit && (r.thr > 0) && (r.cur <= r.thr);
 
         if (highlight)
             FillRect(LM - 2.f, y - 1.f, SW - LM + 2.f, y + LH2 - 2.f,
                 D3DCOLOR_XRGB(48, 12, 12));
 
-        name = SmartAttrName(r.id);
-        if (name) StrCopy(nameBuf, sizeof(nameBuf), name);
-        else { StrCopy(nameBuf, sizeof(nameBuf), "Attr 0x"); StrCat2(nameBuf, sizeof(nameBuf), nameBuf, idStr); }
+        if (def && def->name)
+            StrCopy(nameBuf, sizeof(nameBuf), def->name);
+        else
+        {
+            StrCopy(nameBuf, sizeof(nameBuf), "Attr 0x");
+            StrCat2(nameBuf, sizeof(nameBuf), nameBuf, idStr);
+        }
+
+        // Decoded raw value — DB format, fallback to hex
+        if (def)
+            SmartDB_FormatRaw(def->fmt, r.raw, rawStr, sizeof(rawStr));
+        else
+        {
+            char rb[4]; int rk;
+            rawStr[0] = '\0';
+            for (rk = 5; rk >= 0; --rk)
+            {
+                IntToHex(r.raw[rk], 2, rb, sizeof(rb));
+                StrCat2(rawStr, sizeof(rawStr), rawStr, rb);
+                if (rk > 0) StrCat2(rawStr, sizeof(rawStr), rawStr, " ");
+            }
+        }
 
         DrawText(CX_ID, y, idStr, 1.05f, COL_DIM);
         DrawText(CX_NAME, y, nameBuf, 1.1f, highlight ? COL_RED : COL_WHITE);
         DrawText(CX_CUR, y, curStr, 1.05f, COL_CYAN);
         DrawText(CX_WST, y, wstStr, 1.05f, COL_GRAY);
         DrawText(CX_THR, y, thrStr, 1.05f, COL_DIM);
-
-        rawStr[0] = '\0';
-        for (rk = 5; rk >= 0; --rk)
-        {
-            IntToHex(r.raw[rk], 2, rb, sizeof(rb));
-            StrCat2(rawStr, sizeof(rawStr), rawStr, rb);
-            if (rk > 0) StrCat2(rawStr, sizeof(rawStr), rawStr, " ");
-        }
         DrawText(CX_RAW, y, rawStr, 1.0f, rawNonZero ? COL_YELLOW : COL_DIM);
         y += LH2;
     }
@@ -386,4 +368,64 @@ void HddSmart_Render(const DiagLogo& logo)
 
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
+}
+
+// ============================================================================
+// HTTP server accessors -- expose decoded SMART rows without duplicating the DB
+// ============================================================================
+
+int HddSmart_GetRowCount()
+{
+    return s_smartRowCount;
+}
+
+bool HddSmart_GetRow(int idx,
+    char* idBuf, int idLen,
+    char* nameBuf, int nameLen,
+    char* valBuf, int valLen,
+    bool* outCrit, bool* outTripped)
+{
+    const SmartAttrDef* def;
+    const char* name;
+    bool isCrit;
+    bool tripped;
+
+    if (idx < 0 || idx >= s_smartRowCount) return false;
+    {
+        const SmartRow& r = s_smartRows[idx];
+
+        IntToHex((unsigned)r.id, 2, idBuf, idLen);
+
+        def = SmartDB_Lookup(s_data.model, r.id);
+        name = def ? def->name : NULL;
+        if (name)
+            StrCopy(nameBuf, nameLen, name);
+        else
+        {
+            char hex[4];
+            StrCopy(nameBuf, nameLen, "Attr 0x");
+            IntToHex((unsigned)r.id, 2, hex, sizeof(hex));
+            StrCat2(nameBuf, nameLen, nameBuf, hex);
+        }
+
+        if (def)
+            SmartDB_FormatRaw(def->fmt, r.raw, valBuf, valLen);
+        else
+            SmartDB_FormatRaw(RF_HEX, r.raw, valBuf, valLen);
+
+        isCrit = def ? def->critical : false;
+        tripped = isCrit && r.thr > 0 && r.cur <= r.thr;
+        *outCrit = isCrit;
+        *outTripped = tripped;
+    }
+    return true;
+}
+
+bool HddSmart_GetRowRaw(int idx, int* cur, int* wst, int* thr)
+{
+    if (idx < 0 || idx >= s_smartRowCount) return false;
+    *cur = (int)s_smartRows[idx].cur;
+    *wst = (int)s_smartRows[idx].wst;
+    *thr = (int)s_smartRows[idx].thr;
+    return true;
 }
