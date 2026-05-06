@@ -24,7 +24,7 @@ If you use, modify, copy, redistribute, or include substantial portions of XbDia
 
 Preferred attribution:
 
-> Portions of this software are based on XbDiag by Patrick Foley / Darkone83.  
+> Portions of this software are based on XbDiag by Darkone83.  
 > Original project: https://github.com/Darkone83/XbDiag  
 > Licensed under the MIT License.
 
