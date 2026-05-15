@@ -95,6 +95,10 @@ Opened with `[X]` from the main view. Uses JEDEC autoselect to identify the TSOP
 
 ### X-Volt Power Rail Monitor (Optional)
 
+<div align=center>
+<img src="https://github.com/Darkone83/XbDiag/blob/main/img/XVolt_Sysinfo.png" width=450><img src="https://github.com/Darkone83/XbDiag/blob/main/img/XVolt.png" width=450>
+</div>
+
 If an X-Volt Xbox power rail monitor is present on the same LAN, XbDiag discovers it automatically via UDP broadcast — no configuration required. When a device is found a compact **X-VOLT POWER RAILS** section appears at the bottom of the right column showing live voltage readings for all three rails, colour-coded per rail. The section disappears automatically when the device goes offline.
 
 Pressing `[WHITE]` opens a full-screen overlay with per-rail bar graphs, current draw values, the source device IP, and a **RAIL FAULT** banner if any rail is outside tolerance. The `[WHITE]` hint only appears when an X-Volt device has been discovered.
