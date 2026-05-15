@@ -106,13 +106,11 @@ static void TakeSample()
     // present on 1.6 boards).
     if (!s_pathKnown)
     {
-        BYTE dummy = 0;
-        s_is16 = SMBusRead(0xE0, 0x00, dummy);  // Xcalibur at 0x70<<1=0xE0
-        // Only commit once PIC responds — avoids locking wrong is16 if
-        // the bus is busy at first sample time.
+        // Probe ADM1032 directly -- present on 1.0-1.5, absent on 1.6.
+        // Matches TempMonitor detection confirmed working on all revisions.
         BYTE probe = 0;
-        if (SMBusRead(SMBADDR_PIC, 0x09, probe))
-            s_pathKnown = true;
+        s_is16 = !SMBusRead(SMBADDR_ADM1032, 0x00, probe);
+        s_pathKnown = true;
     }
 
     // ---- Fan readback (PIC reg 0x10) ---------------------------------------
@@ -122,12 +120,12 @@ static void TakeSample()
     s_fanOK = false;
     {
         BYTE fanRaw = 0;
-        if (SMBusRead(SMBADDR_PIC, 0x10, fanRaw) && fanRaw <= 50)
+        if (SMBusRead(SMBADDR_PIC, 0x10, fanRaw))
         {
             s_curFan = fanRaw;
             s_fanOK = true;
         }
-        else if (SMBusRead(SMBADDR_PIC, 0x06, fanRaw) && fanRaw <= 50)
+        else if (SMBusRead(SMBADDR_PIC, 0x06, fanRaw))
         {
             s_curFan = fanRaw;
             s_fanOK = true;
@@ -141,8 +139,20 @@ static void TakeSample()
     // 1.6 MB correction: val*0.8 - 3.556 (matches xbox_smbus_poll.cpp exactly).
     {
         BYTE cpu = 0, mb = 0;
-        bool cpuOK = SMBusRead(SMBADDR_PIC, 0x09, cpu);
-        bool mbOK = SMBusRead(SMBADDR_PIC, 0x0A, mb);
+        bool cpuOK = false, mbOK = false;
+
+        if (!s_is16)
+        {
+            // 1.0-1.5: ADM1032 reg 0x01 = CPU die, reg 0x00 = local/ambient
+            cpuOK = SMBusRead(SMBADDR_ADM1032, 0x01, cpu);
+            mbOK = SMBusRead(SMBADDR_ADM1032, 0x00, mb);
+        }
+        else
+        {
+            // 1.6: PIC regs 0x09 (CPU) + 0x0A (board)
+            cpuOK = SMBusRead(SMBADDR_PIC, 0x09, cpu);
+            mbOK = SMBusRead(SMBADDR_PIC, 0x0A, mb);
+        }
 
         s_sensorOK = cpuOK;
         s_mbOK = mbOK;

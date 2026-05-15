@@ -78,6 +78,10 @@
 #include <xtl.h>
 #include <winsockx.h>
 
+// Kernel status helpers — IoCreateSymbolicLink returns NTSTATUS
+typedef LONG NTSTATUS;
+#define NT_SUCCESS(Status) ((NTSTATUS)(Status) >= 0)
+
 extern void RequestState(int newState);
 static const int MSTATE_MENU = 0;
 
@@ -92,6 +96,7 @@ int       s_scroll = 0;
 bool      s_atRoot = true;
 char      s_path[MAX_PATH_LEN] = {};
 static bool s_skipFirstTick = true;
+static bool s_shadowCMounted = false;  // true if N: -> real C (Partition14 or Partition6) mounted
 static WORD s_prevBtns = 0;
 // Set true whenever a MU modal opens so the first input tick is consumed
 // before accepting [A]/[B] — prevents analog button re-assertion auto-fire.
@@ -188,19 +193,19 @@ static void LoadDriveList()
     // Ensure HDD partitions and any inserted MUs are mapped to drive letters
     FE_MU_MountAll();
 
-    // HDD drives — always probed
+    // HDD drives — always probed.
+    // Use GetFileAttributesA on the root path rather than FindFirstFile("X:\\*")
+    // because FindFirstFile fails on empty volumes — which X: and Y: cache
+    // partitions almost always are. GetFileAttributesA succeeds on any
+    // accessible volume root regardless of whether it contains files.
     const char* hddDrives[] = { "C", "D", "E", "F", "G", "X", "Y", "Z" };
     for (int d = 0; d < 8 && s_entryCount < MAX_ENTRIES; ++d)
     {
-        char pattern[8];
-        pattern[0] = hddDrives[d][0]; pattern[1] = ':'; pattern[2] = '\\';
-        pattern[3] = '*'; pattern[4] = '\0';
-
-        WIN32_FIND_DATA fd;
-        HANDLE h = FindFirstFile(pattern, &fd);
-        if (h != INVALID_HANDLE_VALUE)
+        char root[6];
+        root[0] = hddDrives[d][0]; root[1] = ':'; root[2] = '\\'; root[3] = '\0';
+        DWORD attr = GetFileAttributesA(root);
+        if (attr != 0xFFFFFFFF && (attr & FILE_ATTRIBUTE_DIRECTORY))
         {
-            FindClose(h);
             FileEntry& e = s_entries[s_entryCount++];
             e.name[0] = hddDrives[d][0]; e.name[1] = ':'; e.name[2] = '\0';
             e.isDir = true;
@@ -233,6 +238,73 @@ static void LoadDriveList()
             e.isDir = true;
             e.sizeLow = (DWORD)(200 + mu);  // mu index offset — not a drive letter, not a file size
         }
+    }
+    // ShadowC detection — NKPatcher/Rocky5 replaces the kernel Partition2
+    // device with a virtual disk image. The real C is remapped internally:
+    //   Rocky5 NKP11 : ACTUAL_C_DRIVE 14  -> \Device\Harddisk0\Partition14
+    //   Older NKP10  : may use Partition6
+    // We probe known NKPatcher config directories on E:, then try each known
+    // real-C partition in order until N:\ becomes accessible.
+    if (!s_shadowCMounted)
+    {
+        // Probe known NKPatcher config directories
+        bool nkDetected = false;
+        {
+            static const char* k_nkp[] = {
+                "E:\\NKP11\\",
+                "E:\\NKP10\\",
+                "E:\\NKPatcher\\",
+                NULL
+            };
+            for (int ki = 0; k_nkp[ki] && !nkDetected; ++ki)
+            {
+                DWORD a = GetFileAttributesA(k_nkp[ki]);
+                if (a != 0xFFFFFFFF && (a & FILE_ATTRIBUTE_DIRECTORY))
+                    nkDetected = true;
+            }
+        }
+
+        if (nkDetected)
+        {
+            // Known real-C partition numbers and their path lengths
+            static const char* k_parts[] = {
+                "\\Device\\Harddisk0\\Partition14",  // Rocky5 NKP11 (29 chars)
+                "\\Device\\Harddisk0\\Partition6",   // older NKPatcher (28 chars)
+                NULL
+            };
+            static const int k_lens[] = { 29, 28, 0 };
+
+            static const char k_lnk[] = "\\??\\N:";
+            XBOX_STRING sLnk = { 6, 7, (char*)k_lnk };
+            IoDeleteSymbolicLink(&sLnk);  // clear any stale mapping first
+
+            for (int pi = 0; k_parts[pi] && !s_shadowCMounted; ++pi)
+            {
+                XBOX_STRING sDev = {
+                    (USHORT)k_lens[pi],
+                    (USHORT)(k_lens[pi] + 1),
+                    (char*)k_parts[pi]
+                };
+                NTSTATUS st = (NTSTATUS)IoCreateSymbolicLink(&sLnk, &sDev);
+                if (!NT_SUCCESS(st)) continue;
+
+                // Verify N:\ actually accessible before declaring success
+                DWORD na = GetFileAttributesA("N:\\");
+                if (na != 0xFFFFFFFF && (na & FILE_ATTRIBUTE_DIRECTORY))
+                    s_shadowCMounted = true;
+                else
+                    IoDeleteSymbolicLink(&sLnk);  // not right, try next
+            }
+        }
+    }
+
+    // Add N: to drive list if mount succeeded
+    if (s_shadowCMounted && s_entryCount < MAX_ENTRIES)
+    {
+        FileEntry& e = s_entries[s_entryCount++];
+        StrCopy(e.name, sizeof(e.name), "N: (Real C)");
+        e.isDir = true;
+        e.sizeLow = 0;
     }
 }
 
@@ -304,7 +376,27 @@ static void LoadDirectory(const char* path)
 
 static void GoUp()
 {
-    if (s_atRoot) { RequestState(MSTATE_MENU); return; }
+    if (s_atRoot)
+    {
+        // Clean up N: (ShadowC real C) if we mounted it this session
+        if (s_shadowCMounted)
+        {
+            static const char* k_lnk = "\\??\\N:";
+            char lnkBuf[8];
+            int ll;
+            int j;
+            XBOX_STRING sLnk;
+            ll = 0; while (k_lnk[ll]) ll++;
+            for (j = 0; j < ll; ++j) lnkBuf[j] = k_lnk[j];
+            sLnk.Length = (USHORT)ll;
+            sLnk.MaximumLength = (USHORT)(ll + 1);
+            sLnk.Buffer = lnkBuf;
+            IoDeleteSymbolicLink(&sLnk);
+            s_shadowCMounted = false;
+        }
+        RequestState(MSTATE_MENU);
+        return;
+    }
 
     int len = 0; while (s_path[len]) len++;
     int end = len;
@@ -375,6 +467,7 @@ void FileExplorer_OnEnter()
 {
     s_prevBtns = 0;
     s_skipFirstTick = true;
+    s_shadowCMounted = false;
 
     // Reset file operation state — stale state from a previous session
     // causes the operations list error when re-entering after other modules.
@@ -501,7 +594,7 @@ static void Render(const DiagLogo& logo)
     const float SIZE_X = SW - LM - WIDGET_W - 12.f;  // leave room for widget
     const float NAME_W = SIZE_X - NAME_X - 8.f;       // available name width
     // Approx chars that fit in NAME_W at scale 1.2 (each char ~7px)
-    const int   NAME_MAX_CHARS = Ftoi(NAME_W / 7.f);
+    const int   NAME_MAX_CHARS = (int)(NAME_W / 7.f);
 
     for (int i = 0; i < ROWS_VISIBLE; ++i)
     {

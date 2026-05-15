@@ -35,7 +35,7 @@
 //                 reg 0x0A = board temperature (°C)
 //               Xcalibur readings are noisy — average 10 samples.
 //
-//   Fallback:   If neither path responds, show ERR.
+//   Fallback:   If neither path responds, show friendly wait message.
 //
 // Thresholds:
 //   Ambient:  <50=OK  50-65=WARM  >65=HOT
@@ -123,7 +123,7 @@ static SensorPath s_path = PATH_UNKNOWN;
 
 // Set true when PATH_PIC_16 is active but 0x09/0x0A NAK —
 // Xyclops (1.6 SMC) does not expose temp registers at these offsets.
-// Suppresses the generic NAK error and shows a specific informational message.
+// Shows a targeted informational message rather than a generic error.
 static bool s_xyclopsNoTemp = false;
 
 // 10-sample accumulator for 1.6 PIC averaging
@@ -312,7 +312,7 @@ static void DrawGaugePanel(float px, const char* label,
     if (!ok)
     {
         DrawText(px + BIG_X_OFF, GAUGE_Y + BIG_Y_OFF + 14.f,
-            "SENSOR ERR", 1.6f, COL_RED);
+            "Please wait...", 1.4f, COL_DIM);
         return;
     }
 
@@ -618,10 +618,15 @@ void TempMonitor_Tick(const DiagLogo& logo)
     }
     else if (!s_sensorOK)
     {
-        const char* errMsg = (s_path == PATH_PIC_16)
-            ? "PIC NOT RESPONDING  (SMBus 0x20 NAK)"
-            : "ADM1032 NOT RESPONDING  (SMBus 0x98 NAK)";
-        DrawText(LM, GAUGE_Y + GAUGE_H * 0.5f, errMsg, 1.3f, COL_RED);
+        // Sensor path not yet confirmed or accumulator still filling —
+        // show a friendly wait message centred in the graph area where
+        // it is clearly visible rather than buried in the gauge panels.
+        const char* waitMsg = (s_path == PATH_UNKNOWN)
+            ? "Please wait — reading sensor..."
+            : "Please wait — reading temperature data...";
+        float msgY = GRAPH_Y + GRAPH_H * 0.5f - LINE_H * 0.5f;
+        float msgX = GRAPH_X + (GRAPH_W - TW(waitMsg, 1.3f)) * 0.5f;
+        DrawText(msgX, msgY, waitMsg, 1.3f, COL_DIM);
     }
 
     DrawGraph();

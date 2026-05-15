@@ -736,7 +736,8 @@ static void LoadData()
         // bits are set. Bit 2 alone can be set on some third-party drives in a
         // transient/malformed state — PrometheOS correctly requires bit 1 as well.
         d.securitySupported = (w[128] & 0x01) != 0;
-        d.isLocked = ((w[128] & 0x02) != 0) && ((w[128] & 0x04) != 0);
+        d.secEnabled = (w[128] & 0x02) != 0;
+        d.isLocked = d.secEnabled && ((w[128] & 0x04) != 0);
 
         // SMART support: word 82 bit 0 = SMART feature set supported
         d.smartSupported = (w[82] & 0x01) != 0;
@@ -834,31 +835,75 @@ static void LoadData()
             {
                 d.parts[pi].present = true;
 
-                // Total GB (one decimal)
-                DWORD totalMB = (DWORD)(total.QuadPart / (1024ULL * 1024ULL));
-                DWORD totalGB = totalMB / 1024;
-                DWORD totalDec = (totalMB % 1024) * 10 / 1024;
                 char t[12];
-                IntToStr((int)totalGB, t, sizeof(t));
-                StrCopy(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), t);
-                StrCat2(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), d.parts[pi].totalStr, ".");
-                IntToStr((int)totalDec, t, sizeof(t));
-                StrCat2(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), d.parts[pi].totalStr, t);
-                StrCat2(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), d.parts[pi].totalStr, " GB");
 
-                // Free GB (one decimal)
+                // Total — show MB if under 1GB, GB with one decimal otherwise
+                DWORD totalMB = (DWORD)(total.QuadPart / (1024ULL * 1024ULL));
+                if (totalMB < 1024)
+                {
+                    IntToStr((int)totalMB, t, sizeof(t));
+                    StrCopy(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), t);
+                    StrCat2(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), d.parts[pi].totalStr, " MB");
+                }
+                else
+                {
+                    DWORD totalGB = totalMB / 1024;
+                    DWORD totalDec = (totalMB % 1024) * 10 / 1024;
+                    IntToStr((int)totalGB, t, sizeof(t));
+                    StrCopy(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), t);
+                    StrCat2(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), d.parts[pi].totalStr, ".");
+                    IntToStr((int)totalDec, t, sizeof(t));
+                    StrCat2(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), d.parts[pi].totalStr, t);
+                    StrCat2(d.parts[pi].totalStr, sizeof(d.parts[pi].totalStr), d.parts[pi].totalStr, " GB");
+                }
+
+                // Free — same threshold
                 DWORD freeMB = (DWORD)(free.QuadPart / (1024ULL * 1024ULL));
-                DWORD freeGB = freeMB / 1024;
-                DWORD freeDec = (freeMB % 1024) * 10 / 1024;
-                IntToStr((int)freeGB, t, sizeof(t));
-                StrCopy(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), t);
-                StrCat2(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), d.parts[pi].freeStr, ".");
-                IntToStr((int)freeDec, t, sizeof(t));
-                StrCat2(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), d.parts[pi].freeStr, t);
-                StrCat2(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), d.parts[pi].freeStr, " GB");
+                if (freeMB < 1024)
+                {
+                    IntToStr((int)freeMB, t, sizeof(t));
+                    StrCopy(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), t);
+                    StrCat2(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), d.parts[pi].freeStr, " MB");
+                }
+                else
+                {
+                    DWORD freeGB = freeMB / 1024;
+                    DWORD freeDec = (freeMB % 1024) * 10 / 1024;
+                    IntToStr((int)freeGB, t, sizeof(t));
+                    StrCopy(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), t);
+                    StrCat2(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), d.parts[pi].freeStr, ".");
+                    IntToStr((int)freeDec, t, sizeof(t));
+                    StrCat2(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), d.parts[pi].freeStr, t);
+                    StrCat2(d.parts[pi].freeStr, sizeof(d.parts[pi].freeStr), d.parts[pi].freeStr, " GB");
+                }
                 // Ratio for bar render
                 if (total.QuadPart > 0)
                     d.parts[pi].freeRatio = (float)((double)free.QuadPart / (double)total.QuadPart);
+
+                // Cluster size via XGetDiskClusterSizeA (Xbox.h)
+                // Returns bytes per cluster. Validate: minimum recommended size
+                // doubles every 256GB per XbPartitioner guidance:
+                //   <= 256 GB : 16 KB clusters
+                //   <= 512 GB : 32 KB clusters
+                //   <= 1024 GB: 64 KB clusters  etc.
+                DWORD clusterBytes = XGetDiskClusterSizeA(path);
+                d.parts[pi].clusterKB = 0;
+                d.parts[pi].clusterOK = true;
+                if (clusterBytes > 0)
+                {
+                    int clKB = (int)(clusterBytes / 1024);
+                    d.parts[pi].clusterKB = clKB;
+
+                    DWORD totalGB = totalMB / 1024;
+                    int minClKB = 16;
+                    DWORD threshold = 256;
+                    while (totalGB > threshold && minClKB < 512)
+                    {
+                        minClKB *= 2;
+                        threshold *= 2;
+                    }
+                    d.parts[pi].clusterOK = (clKB >= minClKB);
+                }
             }
         }
     }
@@ -931,8 +976,15 @@ static void ExportData()
     StrCat2(line, sizeof(line), line, d.lba48sectors);
     StrCat2(line, sizeof(line), line, "\r\n");
     WriteFile(hf, line, StrLen(line), &w, NULL);
-    StrCopy(line, sizeof(line), "HDD Locked:     ");
-    StrCat2(line, sizeof(line), line, d.isLocked ? "YES" : "NO");
+    StrCopy(line, sizeof(line), "HDD Security:   ");
+    if (!d.securitySupported)
+        StrCat2(line, sizeof(line), line, "Not Supported");
+    else if (!d.secEnabled)
+        StrCat2(line, sizeof(line), line, "Not Enabled");
+    else if (d.isLocked)
+        StrCat2(line, sizeof(line), line, "Locked");
+    else
+        StrCat2(line, sizeof(line), line, "Enabled / Unlocked");
     StrCat2(line, sizeof(line), line, "\r\n");
     WriteFile(hf, line, StrLen(line), &w, NULL);
     StrCopy(line, sizeof(line), "\r\nEEPROM\r\n------\r\n");
@@ -1077,12 +1129,36 @@ static void Render(const DiagLogo& logo)
     y1 += LH + 5.f;
     if (d.ataOK)
     {
-        DrawRow(COL_L, COL_VL, y1, "SUPPORT :",
-            d.securitySupported ? "YES" : "NO",
-            d.securitySupported ? COL_WHITE : COL_GRAY);   y1 += LH;
-        DrawRow(COL_L, COL_VL, y1, "LOCKED  :",
-            d.isLocked ? "YES" : "NO",
-            d.isLocked ? COL_RED : COL_GREEN);
+        // Derive a single status string that makes sense to an end user.
+        // On a working softmod the BIOS unlocks the drive at boot so it will
+        // always read unlocked here — what matters is whether security is enabled.
+        const char* secStr;
+        DWORD       secCol;
+        if (!d.securitySupported)
+        {
+            secStr = "Not Supported";
+            secCol = COL_GRAY;
+        }
+        else if (!d.secEnabled)
+        {
+            // Security not enabled — normal for hardmodded consoles with
+            // replacement HDDs which ship without security set.
+            secStr = "Not Enabled";
+            secCol = COL_WHITE;
+        }
+        else if (d.isLocked)
+        {
+            // Still locked — BIOS did not unlock before XbDiag ran.
+            secStr = "Locked";
+            secCol = COL_RED;
+        }
+        else
+        {
+            // Enabled and unlocked — normal healthy softmod state.
+            secStr = "Enabled / Unlocked";
+            secCol = COL_GREEN;
+        }
+        DrawRow(COL_L, COL_VL, y1, "SECURITY:", secStr, secCol);
     }
     else DrawText(COL_L, y1, "Drive not detected", 1.2f, COL_RED);
 
@@ -1159,10 +1235,29 @@ static void Render(const DiagLogo& logo)
             VLine(BAR_X, y2, y2 + BAR_H, COL_BORDER);
             VLine(BAR_X + BAR_W, y2, y2 + BAR_H, COL_BORDER);
 
-            char freeLabel[32];
+            // Total size centred inside the bar
+            float totalTW = TW(p.totalStr, 1.0f);
+            float totalX = BAR_X + (BAR_W - totalTW) * 0.5f;
+            float totalY = y2 + (BAR_H - 10.f) * 0.5f;
+            DrawText(totalX, totalY, p.totalStr, 1.0f,
+                D3DCOLOR_ARGB(180, 220, 220, 220));
+
+            // Free space above, cluster size below — two sub-lines within the bar row
+            float textX = BAR_X + BAR_W + 6.f;
+
+            char freeLabel[20];
             StrCopy(freeLabel, sizeof(freeLabel), p.freeStr);
             StrCat2(freeLabel, sizeof(freeLabel), freeLabel, " free");
-            DrawText(BAR_X + BAR_W + 6.f, y2, freeLabel, 1.05f, COL_WHITE);
+            DrawText(textX, y2, freeLabel, 1.0f, COL_WHITE);
+
+            if (p.clusterKB > 0)
+            {
+                char clStr[16];
+                IntToStr(p.clusterKB, clStr, sizeof(clStr));
+                StrCat2(clStr, sizeof(clStr), clStr, "KB cls");
+                DWORD clCol = p.clusterOK ? COL_GREEN : COL_RED;
+                DrawText(textX, y2 + LH * 0.52f, clStr, 0.9f, clCol);
+            }
 
             y2 += LH;
         }
@@ -1290,6 +1385,26 @@ void HddInfo_AutoRun(HANDLE hReport)
     HddWriteLine(hReport, "Capacity:     ", d.ataOK ? d.capacity : "N/A");
     HddWriteLine(hReport, "Interface:    ", d.ataOK ? d.udmaMode : "N/A");
     HddWriteLine(hReport, "Type:         ", d.ataOK ? d.rpmStr : "N/A");
+
+    // Partition cluster sizes
+    {
+        const char* letters = "CEFG";
+        for (int pi = 0; pi < 4; ++pi)
+        {
+            const HddData::PartInfo& p = d.parts[pi];
+            if (!p.present || p.clusterKB <= 0) continue;
+            char line[48];
+            char let[4]; let[0] = letters[pi]; let[1] = ':'; let[2] = ' '; let[3] = '\0';
+            char clStr[12];
+            IntToStr(p.clusterKB, clStr, sizeof(clStr));
+            StrCopy(line, sizeof(line), let);
+            StrCat2(line, sizeof(line), line, clStr);
+            StrCat2(line, sizeof(line), line, "KB clusters");
+            if (!p.clusterOK)
+                StrCat2(line, sizeof(line), line, " [UNDERSIZED]");
+            HddWriteLine(hReport, "Cluster:      ", line);
+        }
+    }
 
     // Run benchmark if drive present
     if (d.ataOK)

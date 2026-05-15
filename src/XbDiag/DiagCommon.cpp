@@ -220,6 +220,19 @@ void DrawTextR(float rightX, float y, const char* s, float sc, DWORD col)
     ScaledDrawText(rightX - TW(s, sc), y, s, sc, col);
 }
 
+void DrawTextC(float cx, float y, const char* s, float sc, DWORD col)
+{
+    ScaledDrawText(cx - TW(s, sc) * 0.5f, y, s, sc, col);
+}
+
+// ── Runtime calibration margin globals ───────────────────────────────────────
+// Initialised to compile-time defaults. ScreenCalib_Init() overwrites these
+// from screen.set on boot.
+float g_marginL = LM;
+float g_marginR = LM;
+float g_marginT = CONTENT_Y;
+float g_marginB = BOT_BAR_Y;
+
 void DrawLabelValue(float x, float y,
     const char* label, const char* value,
     float sc, DWORD labelCol, DWORD valueCol)
@@ -413,29 +426,33 @@ void DrawPageChrome(const DiagLogo& logo,
     g_pDevice->Clear(0, NULL, D3DCLEAR_TARGET,
         COL_BG, 1.f, 0);
 
+    // Calibrated positions -- all chrome elements derived from margin globals.
+    // g_marginT = top of content area (top bar sits above it).
+    // g_marginB = bottom of content area (bottom bar sits below it).
+    // g_marginL/R = left/right content insets.
+    float topBarT = g_marginT - TOP_BAR_H;   // top edge of top bar
+    float topBarB = g_marginT;                // bottom edge of top bar
+    float botBarT = g_marginB;                // top edge of bottom bar
+    float botBarB = g_marginB + BOT_BAR_H;   // bottom edge of bottom bar
+
     // --- Top bar ---
-    FillRectGrad(0.f, 0.f, SW, TOP_BAR_H,
+    FillRectGrad(g_marginL, topBarT, SW - g_marginR, topBarB,
         D3DCOLOR_XRGB(30, 55, 110),
         D3DCOLOR_XRGB(18, 35, 75));
-    HLine(TOP_BAR_H, 0.f, SW, COL_BORDER);
-
-    // Accent line just below top bar
-    HLine(TOP_BAR_H + 1.f, 0.f, SW, D3DCOLOR_XRGB(60, 100, 200));
+    HLine(topBarB, g_marginL, SW - g_marginR, COL_BORDER);
+    HLine(topBarB + 1.f, g_marginL, SW - g_marginR, D3DCOLOR_XRGB(60, 100, 200));
 
     // --- Bottom bar ---
-    HLine(BOT_BAR_Y - 1.f, 0.f, SW, COL_BORDER);
-    FillRectGrad(0.f, BOT_BAR_Y, SW, SH,
+    HLine(botBarT - 1.f, g_marginL, SW - g_marginR, COL_BORDER);
+    FillRectGrad(g_marginL, botBarT, SW - g_marginR, botBarB,
         D3DCOLOR_XRGB(18, 18, 35),
         D3DCOLOR_XRGB(10, 10, 22));
 
-    // --- Logo (top-left) ---
-    // Source texture is 256x256 (square). Display size must also be square
-    // or the logo gets squashed. Height fits inside the 58px top bar with
-    // comfortable padding; width matches to preserve 1:1 aspect ratio.
+    // --- Logo (top-left, respects left margin) ---
     const float LOGO_DISP_W = 48.f;
     const float LOGO_DISP_H = 48.f;
-    const float LOGO_CX = LM + LOGO_DISP_W * 0.5f;  // was 20.f + ...; left edge now at LM
-    const float LOGO_CY = TOP_BAR_H * 0.5f;
+    const float LOGO_CX = g_marginL + 4.f + LOGO_DISP_W * 0.5f;
+    const float LOGO_CY = topBarT + TOP_BAR_H * 0.5f;
 
     DrawLogo(logo, LOGO_CX, LOGO_CY, LOGO_DISP_W, LOGO_DISP_H, 255);
 
@@ -444,39 +461,29 @@ void DrawPageChrome(const DiagLogo& logo,
 
     // Divider after logo
     float divX = LOGO_CX + LOGO_DISP_W * 0.5f + 8.f;
-    VLine(divX, 4.f, TOP_BAR_H - 4.f, COL_BORDER);
+    VLine(divX, topBarT + 4.f, topBarB - 4.f, COL_BORDER);
 
-    // --- Title in top bar (right-aligned, respect LM margin) ---
+    // --- Title in top bar (right-aligned) ---
     const float TS = 1.3f;
-    float barTextY = (TOP_BAR_H - 7.f * TS) * 0.5f;
-    DrawTextR(SW - LM, barTextY, title, TS, COL_WHITE);
+    float barTextY = topBarT + (TOP_BAR_H - 7.f * TS) * 0.5f;
+    DrawTextR(SW - g_marginR, barTextY, title, TS, COL_WHITE);
 
     // --- Hints in bottom bar ---
-    // Badge is drawn right-aligned at SW-LM. Measure it first so we know
-    // exactly how much horizontal space is available for the hint string.
-    // If the hint is too wide we truncate it with "..." rather than letting
-    // it collide with the badge — this handles 576i PAL whose badge string
-    // "576i PAL" is twice as wide as "480i".
-    float botY = BOT_BAR_Y + (BOT_BAR_H - 7.f * 1.3f) * 0.5f;
+    float botY = botBarT + (BOT_BAR_H - 7.f * 1.3f) * 0.5f;
 
     DWORD badgeCol = g_isHD ? COL_CYAN : COL_GRAY;
     float badgeTW = TW(g_videoModeStr, 1.3f);
-    float badgeX = SW - LM - badgeTW;          // left edge of badge in design space
+    float badgeX = SW - g_marginR - badgeTW;
 
-    // Safe right edge for hints: leave at least 8px gap before the badge
     float hintMax = badgeX - 8.f;
     float hintTW = TW(hints, 1.3f);
 
     if (hintTW <= hintMax)
     {
-        // Fits cleanly — draw as-is
-        DrawText(LM, botY, hints, 1.3f, COL_YELLOW);
+        DrawText(g_marginL, botY, hints, 1.3f, COL_YELLOW);
     }
     else
     {
-        // Truncate with "..." to fit within hintMax design pixels.
-        // Each char = Font_GetAdvance() * 1.3 design px.
-        // Reserve space for 3 trailing dots (same width as "...").
         float charW = Font_GetAdvance() * 1.3f;
         float dotsTW = charW * 3.f;
         float bodyMax = hintMax - dotsTW;
@@ -484,7 +491,6 @@ void DrawPageChrome(const DiagLogo& logo,
         if (bodyMax > 0.f)
             maxChars = Ftoi(bodyMax / charW);
 
-        // Build truncated string into a local buffer (longest hint is ~70 chars)
         char truncBuf[80];
         int  srcLen = StrLen(hints);
         int  copy = maxChars < srcLen ? maxChars : srcLen;
@@ -494,11 +500,11 @@ void DrawPageChrome(const DiagLogo& logo,
         truncBuf[copy + 2] = '.';
         truncBuf[copy + 3] = '\0';
 
-        DrawText(LM, botY, truncBuf, 1.3f, COL_YELLOW);
+        DrawText(g_marginL, botY, truncBuf, 1.3f, COL_YELLOW);
     }
 
     // --- SD / HD badge (bottom bar, right) ---
-    DrawTextR(SW - LM, botY, g_videoModeStr, 1.3f, badgeCol);
+    DrawTextR(SW - g_marginR, botY, g_videoModeStr, 1.3f, badgeCol);
 }
 
 // ============================================================================

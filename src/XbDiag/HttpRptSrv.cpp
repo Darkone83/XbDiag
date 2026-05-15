@@ -22,6 +22,8 @@
 //   MSVC 2003 / C89 declaration ordering
 
 #include "HttpRptSrv.h"
+#include "HttpFiles.h"
+#include "HttpCap.h"
 #include "SysInfo.h"
 #include "Update.h"
 #include "XbSet.h"
@@ -108,14 +110,14 @@ static const char* k_img_dc = NULL;
 // Buffer helpers
 // ============================================================================
 
-static void BA(const char* s)
+void BA(const char* s)
 {
     int i;
     for (i = 0; s[i] && s_bufLen < k_bufSize - 1; ++i)
         s_buf[s_bufLen++] = s[i];
 }
 
-static void BAE(const char* s)
+void BAE(const char* s)
 {
     int i;
     if (!s) return;
@@ -129,7 +131,7 @@ static void BAE(const char* s)
     }
 }
 
-static void BAI(int v) { char t[16]; IntToStr(v, t, sizeof(t)); BA(t); }
+void BAI(int v) { char t[16]; IntToStr(v, t, sizeof(t)); BA(t); }
 static void BAB(bool v) { BA(v ? "1" : "0"); }
 
 // ============================================================================
@@ -576,8 +578,8 @@ static void EmitCSS()
         "#hdr-inner{padding:10px 0}"
         "#hdr{padding:0 16px}"
         ".badge,.hdr-status .badge{display:none}"
-        "#nav{padding:0 16px}"
-        ".tab{padding:10px 14px;font-size:11px;letter-spacing:.5px}"
+        "#nav{padding:0 8px;flex-wrap:wrap;overflow-x:auto}"
+        ".tab{padding:8px 10px;font-size:10px;letter-spacing:.3px}"
         ".row{grid-template-columns:110px 1fr;padding:8px 14px}"
         ".card-head,.scard-head{padding:10px 14px}"
         ".card-body,.scard-body .srow{padding-left:14px;padding-right:14px}"
@@ -608,8 +610,6 @@ static void EmitCSS()
         ".smart-tbl tr.crit .val{color:#FF7080}"
         ".smart-tbl tr.warn td{background:rgba(255,160,40,.03)}"
         ".smart-tbl tr.warn .name{color:#FFA028}"
-
-        /* ── Power buttons ──────────────────────────────────────── */
         ".pwr-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;max-width:600px}"
         ".pwr-btn{"
         "display:flex;flex-direction:column;align-items:center;justify-content:center;"
@@ -656,7 +656,7 @@ static void EmitCSS()
         "</style>");
 }
 
-static void PageStart(const char* title, const char* tab,
+void PageStart(const char* title, const char* tab,
     const char* extraHead = NULL)
 {
     s_bufLen = 0;
@@ -689,6 +689,8 @@ static void PageStart(const char* title, const char* tab,
     BA("<div id=nav>");
     BA("<a class='tab"); if (SEq(tab, "si")) BA(" on"); BA("' href=/sysinfo>System Info</a>");
     BA("<a class='tab"); if (SEq(tab, "sm")) BA(" on"); BA("' href=/smart>SMART</a>");
+    BA("<a class='tab"); if (SEq(tab, "lv")) BA(" on"); BA("' href=/live?live=0>Live</a>");
+    BA("<a class='tab"); if (SEq(tab, "fi")) BA(" on"); BA("' href=/files>Files</a>");
     BA("<a class='tab"); if (SEq(tab, "rp")) BA(" on"); BA("' href=/report>Report</a>");
     BA("<a class='tab"); if (SEq(tab, "st")) BA(" on"); BA("' href=/settings>Settings</a>");
     BA("<a class='tab"); if (SEq(tab, "pw")) BA(" on"); BA("' href=/power>Power</a>");
@@ -696,7 +698,7 @@ static void PageStart(const char* title, const char* tab,
     BA("</div><div id=body>");
 }
 
-static void PageEnd()
+void PageEnd()
 {
     BA("</div>"
         "<div id=ftr>"
@@ -801,10 +803,6 @@ static void BuildSysInfo()
     Row("Serial", snap.serialNum, "");
     Row("Modchip", snap.modchip, "");
     Row("HD Mod", snap.hdMod, "");
-    CardEnd();
-
-    CardStartC("BIOS", "#3A4258");
-    Row("Version", snap.biosVer, "");
     CardEnd();
 
     BA("</div>");
@@ -979,6 +977,7 @@ static void BuildReport(const char* fname)
             BA("<div class=info>File is empty.</div>\n");
         else
         {
+            // Check if this is a CSV file -- render as table, not raw text
             BA("<pre class=rpt>"); BAE(s_fileReadBuf); BA("</pre>\n");
             if (nr >= (DWORD)(k_fileReadSize - 1))
                 BA("<div class=info>Truncated at 32 KB for display.</div>\n");
@@ -2569,7 +2568,7 @@ static int ParseContentLength(const char* buf, int len)
     return 0;
 }
 
-static void SendHTML(SOCKET c)
+void SendHTML(SOCKET c)
 {
     char hdr[256];
     char cl[16];
@@ -2719,6 +2718,120 @@ static void ServeClient(SOCKET c)
     else if (SEq(path, "/smart"))
     {
         BuildSmart(); SendHTML(c);
+    }
+    else if (SEq(path, "/screenshot"))
+    {
+        HttpCap_RequestFrame();
+        HttpCap_ServeScreenshot(c);
+    }
+    else if (path[1] == 'l' && path[2] == 'i' && path[3] == 'v' && path[4] == 'e')
+    {
+        char live[4]; live[0] = '\0';
+        GetParam(query, "live", live, sizeof(live));
+        if (live[0] == '\0') StrCopy(live, sizeof(live), "0");
+        HttpCap_ServeLivePage(c, live);
+    }
+    else if (SEq(path, "/files"))
+    {
+        HttpFiles_BuildPage(); SendHTML(c);
+    }
+    else if (SEq(path, "/list"))
+    {
+        HttpFiles_ServeList(c, query);
+    }
+    else if (SEq(path, "/delete"))
+    {
+        HttpFiles_ServeDelete(c, query);
+    }
+    else if (SEq(path, "/mkdir"))
+    {
+        HttpFiles_ServeMkdir(c, query);
+    }
+    else if (SEq(path, "/filedownload"))
+    {
+        HttpFiles_ServeDownload(c, query);
+    }
+    else if (SEq(path, "/upload"))
+    {
+        // Extend timeout for uploads -- large files need more time between recv() calls
+        int uploadTmo = 60000;
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&uploadTmo, sizeof(uploadTmo));
+        // Streaming upload — write body to disk as it arrives.
+        // The initial req buffer may only contain part of the body for large files.
+        // Use Content-Length to know when to stop receiving.
+        char destPath[128]; destPath[0] = '\0';
+        HttpFiles_GetParam(query, "path", destPath, sizeof(destPath));
+
+        char realPath[128];
+        if (!HttpFiles_SafePath(destPath, realPath, sizeof(realPath)))
+        {
+            send(c, "HTTP/1.0 400 Bad Request\r\nContent-Length: 0\r\n\r\n", 47, 0);
+        }
+        else
+        {
+            int cl = ParseContentLength(req, rlen);
+
+            // Find header/body boundary in initial buffer
+            int hdrEnd = -1;
+            for (int bi = 0; bi < rlen - 3; ++bi)
+            {
+                if (req[bi] == '\r' && req[bi + 1] == '\n' &&
+                    req[bi + 2] == '\r' && req[bi + 3] == '\n')
+                {
+                    hdrEnd = bi + 4; break;
+                }
+            }
+
+            HANDLE hf = CreateFileA(realPath, GENERIC_WRITE, 0, NULL,
+                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hf == INVALID_HANDLE_VALUE)
+            {
+                send(c, "HTTP/1.0 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n", 56, 0);
+            }
+            else
+            {
+                int written = 0;
+                const int CHUNK = 524288;
+
+                char* uploadBuf = (char*)GlobalAlloc(GMEM_FIXED, CHUNK);
+                if (!uploadBuf)
+                {
+                    CloseHandle(hf);
+                    DeleteFileA(realPath);
+                    send(c, "HTTP/1.0 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n", 56, 0);
+                }
+                else
+                {
+                    // Write bytes already in the initial request buffer
+                    if (hdrEnd >= 0 && hdrEnd < rlen)
+                    {
+                        int avail = rlen - hdrEnd;
+                        DWORD w = 0;
+                        WriteFile(hf, req + hdrEnd, (DWORD)avail, &w, NULL);
+                        written += (int)w;
+                    }
+
+                    // Receive remaining bytes -- stop when cl satisfied or connection closes
+                    while (cl <= 0 || written < cl)
+                    {
+                        int remaining = cl > 0 ? cl - written : CHUNK;
+                        int want = remaining < CHUNK ? remaining : CHUNK;
+                        int n = recv(c, uploadBuf, want, 0);
+                        if (n <= 0) break;
+                        DWORD w = 0;
+                        WriteFile(hf, uploadBuf, (DWORD)n, &w, NULL);
+                        written += (int)w;
+                    }
+
+                    GlobalFree(uploadBuf);
+                    CloseHandle(hf);
+
+                    // Send response -- XHR onload fires on any completed response
+                    send(c, "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                        "Content-Length: 12\r\nConnection: close\r\n\r\n{\"ok\":true}", 75, 0);
+                }
+            }
+        }
     }
     else if (SEq(path, "/report"))
     {

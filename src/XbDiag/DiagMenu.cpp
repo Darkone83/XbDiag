@@ -20,6 +20,7 @@
 
 #include "DiagMenu.h"
 #include "DiagCommon.h"
+#include "ScreenCalib.h"
 #include "font.h"
 #include "input.h"
 #include "Update.h"
@@ -120,7 +121,7 @@ static bool EdgeDown(WORD cur, WORD prev, WORD btn)
     return ((cur & btn) != 0) && ((prev & btn) == 0);
 }
 
-static void HandleInput()
+static void HandleInput(const DiagLogo& logo)
 {
     WORD cur = GetButtons();
 
@@ -151,6 +152,19 @@ static void HandleInput()
         bool whiteEdge = whiteHeld && !(s_prevBtns & BTN_WHITE);
         if (backHeld && whiteHeld && (backEdge || whiteEdge))
             RequestState(MSTATE_XBSET);
+    }
+
+    if (EdgeDown(cur, s_prevBtns, BTN_BLACK))
+    {
+        ScreenCalib_Run(logo);
+        // Wait until all buttons are physically released before resuming --
+        // prevents [A] confirm from calibration triggering a menu selection.
+        while (GetButtons() != 0)
+        {
+            PumpInput();
+            Sleep(10);
+        }
+        s_prevBtns = 0;
     }
 
     s_prevBtns = cur;
@@ -261,6 +275,6 @@ static void Render(const DiagLogo& logo)
 
 void DiagMenu_Tick(const DiagLogo& logo)
 {
-    HandleInput();
+    HandleInput(logo);
     Render(logo);
 }

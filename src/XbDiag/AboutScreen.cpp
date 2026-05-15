@@ -81,7 +81,7 @@ static const DWORD FACT_FADE_MS = 500;
 
 static const char k_scrollText[] =
 "LuckyXmods -=- Equinox -=- Andr0 -=- Haguero -=- Harcroft -=- "
-"Wolfgang von Douchenozzle -=- The XBOX-Scene Discord -=- "
+"Wolfgang von Douchenozzle -=- Bomb Bloke -=- The XBOX-Scene Discord -=- "
 "The OG Xbox Community      ";
 
 static float s_scrollX = 0.f;   // current left edge of scroller text (pixels)
@@ -354,33 +354,32 @@ static void Render(const DiagLogo& logo)
     const char* k_p1 = "A hardware diagnostic suite for the original Xbox console.";
     const char* k_p2 = "Inspect RAM, SMBus, EEPROM, temperatures, video and storage.";
 
-    DrawText((SW - TW(k_p1, 1.3f)) * 0.5f, y, k_p1, 1.3f, COL_GRAY);
+    DrawTextC(g_marginL + (SW - g_marginL - g_marginR) * 0.5f, y, k_p1, 1.3f, COL_GRAY);
     y += LINE_H + 2.f;
-    DrawText((SW - TW(k_p2, 1.2f)) * 0.5f, y, k_p2, 1.2f, COL_DIM);
+    DrawTextC(g_marginL + (SW - g_marginL - g_marginR) * 0.5f, y, k_p2, 1.2f, COL_DIM);
     y += LINE_H + GROUP_GAP;
 
     // -------------------------------------------------------------------------
     // Rule
     // -------------------------------------------------------------------------
-    HLine(y, LM, SW - LM, COL_BORDER);
+    HLine(y, g_marginL, SW - g_marginR, COL_BORDER);
     y += 8.f;
 
     // -------------------------------------------------------------------------
     // Target row only
     // -------------------------------------------------------------------------
     const float LS = 1.3f;
-    const float VM2 = 210.f;
 
-    DrawText(LM, y, "TARGET HARDWARE :", LS, COL_GRAY);
-    DrawText(VM2, y, "Original Xbox  Rev 1.0 - 1.6  |  Debug kit", LS, COL_WHITE);
+    DrawText(g_marginL, y, "TARGET HARDWARE :", LS, COL_GRAY);
+    DrawText(g_marginL + 162.f, y, "Original Xbox  Rev 1.0 - 1.6  |  Debug kit", LS, COL_WHITE);
     y += LINE_H;
 
-    DrawText(LM, y, "MODULES         :", LS, COL_GRAY);
-    DrawText(VM2, y, "SysInfo  RAM Test  SMBus Scan  Temp Monitor", LS, COL_WHITE);
+    DrawText(g_marginL, y, "MODULES         :", LS, COL_GRAY);
+    DrawText(g_marginL + 162.f, y, "SysInfo  RAM Test  SMBus Scan  Temp Monitor", LS, COL_WHITE);
     y += LINE_H;
-    DrawText(VM2, y, "HDD Info  EEPROM  Video Out  Stress Test", LS, COL_WHITE);
+    DrawText(g_marginL + 162.f, y, "HDD Info  EEPROM  Video Out  Stress Test", LS, COL_WHITE);
     y += LINE_H;
-    DrawText(VM2, y, "File Explorer  Controller Test  Update Check", LS, COL_WHITE);
+    DrawText(g_marginL + 162.f, y, "File Explorer  Controller Test  Update Check", LS, COL_WHITE);
     y += LINE_H + 6.f;
 
     // -------------------------------------------------------------------------
@@ -390,7 +389,7 @@ static void Render(const DiagLogo& logo)
     {
         const char* k_thanks = "Special Thanks To:";
         const float LABEL_S = 1.1f;
-        DrawText((SW - TW(k_thanks, LABEL_S)) * 0.5f, y, k_thanks, LABEL_S, COL_WHITE);
+        DrawTextC(g_marginL + (SW - g_marginL - g_marginR) * 0.5f, y, k_thanks, LABEL_S, COL_WHITE);
         y += LINE_H + 2.f;
         DrawScroller(y);
     }
@@ -412,7 +411,7 @@ static void Render(const DiagLogo& logo)
     // -------------------------------------------------------------------------
     float panelCY = panelTop + (panelBot - panelTop) * 0.5f;
     float totalCardsW = CARD_W * 2.f + CARD_GAP;
-    float leftCX = (SW - totalCardsW) * 0.5f + CARD_W * 0.5f;
+    float leftCX = g_marginL + (SW - g_marginL - g_marginR - totalCardsW) * 0.5f + CARD_W * 0.5f;
     float rightCX = leftCX + CARD_W + CARD_GAP;
 
     DrawCreditCard(leftCX, panelCY, s_trLogo,
@@ -436,7 +435,7 @@ static void Render(const DiagLogo& logo)
 
             if (TW(fact, 1.15f) <= maxW)
             {
-                DrawText((SW - TW(fact, 1.15f)) * 0.5f, tickerY, fact, 1.15f, fc);
+                DrawTextC(g_marginL + (SW - g_marginL - g_marginR) * 0.5f, tickerY, fact, 1.15f, fc);
             }
             else
             {
@@ -450,8 +449,8 @@ static void Render(const DiagLogo& logo)
                 line1[n] = '\0';
                 const char* line2 = fact + split + 1;
 
-                DrawText((SW - TW(line1, 1.1f)) * 0.5f, tickerY - 7.f, line1, 1.1f, fc);
-                DrawText((SW - TW(line2, 1.1f)) * 0.5f, tickerY + 7.f, line2, 1.1f, fc);
+                DrawTextC(g_marginL + (SW - g_marginL - g_marginR) * 0.5f, tickerY - 7.f, line1, 1.1f, fc);
+                DrawTextC(g_marginL + (SW - g_marginL - g_marginR) * 0.5f, tickerY + 7.f, line2, 1.1f, fc);
             }
         }
     }

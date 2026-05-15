@@ -154,6 +154,7 @@ static int         s_changelogLen = 0;
 static bool        s_changelogFetched = false;
 static float       s_changelogScroll = 0.f;
 static DWORD       s_changelogLastTick = 0;
+static bool        s_changelogPaused = false;
 
 static bool IsWrapSpace(char c) { return c == ' ' || c == '\t'; }
 
@@ -501,6 +502,7 @@ void Update_OnEnter()
     s_changelogFetched = false;
     s_changelogScroll = 0.f;
     s_changelogLastTick = 0;
+    s_changelogPaused = false;
     CloseFile();
     if (k_xbeDest[0] == '\0') Update_SetPaths("D:\\");
     if (s_state == UPST_AVAIL || s_state == UPST_UP_TO_DATE || s_state == UPST_WRITE_DONE)
@@ -555,6 +557,16 @@ static void Render(const DiagLogo& logo)
         s_state == UPST_RECV_VER2)  hint = "";
     else if (s_state == UPST_UP_TO_DATE) hint = "[A] Re-check    [X] Download anyway    [B] Back";
     else if (s_state == UPST_ERROR)      hint = "[A] Retry    [B] Back";
+
+    // Append changelog pause hint when log is loaded
+    static char s_hintBuf[96];
+    if (s_changelogLen > 0 && hint[0])
+    {
+        StrCopy(s_hintBuf, sizeof(s_hintBuf), hint);
+        StrCat2(s_hintBuf, sizeof(s_hintBuf), s_hintBuf,
+            s_changelogPaused ? "    [BLACK] Resume" : "    [BLACK] Pause");
+        hint = s_hintBuf;
+    }
 
     DrawPageChrome(logo, "SOFTWARE UPDATE", hint);
 
@@ -643,11 +655,34 @@ static void Render(const DiagLogo& logo)
 
             if (s_changelogLen > 0)
             {
-                // Auto-scroll — advance every 80ms
+                // Scroll speed — thumbstick Y controls rate, [A] pauses/resumes.
+                // Default: 0.5px every 80ms. Stick deflection scales speed up to 8x.
+                // Stick up (stickY > 0) scrolls back toward top, stick down speeds up auto-scroll.
+                int lx = 0, ly = 0, rx = 0, ry = 0;
+                GetSticks(lx, ly, rx, ry);
+
+                // ly range -32768..32767, dead zone ±4000
+                float stickY = 0.f;
+                if (ly > 4000)       stickY = (float)(ly - 4000) / 28767.f;
+                else if (ly < -4000) stickY = -(float)(-ly - 4000) / 28767.f;
+
+                bool paused = s_changelogPaused;
+
+                // stickY > 0 = stick up = scroll toward top (subtract)
+                // stickY < 0 = stick down = scroll faster toward bottom (add faster)
+                // stickY = 0 = no input = normal auto-scroll speed
+                float speedMult = 1.f + (-stickY) * 7.f;
+                if (speedMult < 0.1f) speedMult = 0.1f;
+                DWORD interval = (DWORD)(80.f / speedMult);
+                if (interval < 10) interval = 10;
+
                 DWORD now = GetTickCount();
-                if (now - s_changelogLastTick > 80)
+                if (!s_changelogPaused && now - s_changelogLastTick > interval)
                 {
-                    s_changelogScroll += 0.5f;
+                    if (stickY > 0.5f)
+                        s_changelogScroll -= 0.5f * (1.f + stickY * 7.f);
+                    else
+                        s_changelogScroll += 0.5f * speedMult;
                     s_changelogLastTick = now;
                 }
 
@@ -710,6 +745,7 @@ static void Render(const DiagLogo& logo)
                         while (pos2 < llen && IsWrapSpace(ls[pos2])) ++pos2;
                     } while (pos2 < llen);
                 }
+                if (s_changelogScroll < 0.f) s_changelogScroll = 0.f;
                 if (s_changelogScroll > totalH) s_changelogScroll = 0.f;
 
                 // Draw each line with word wrap clipped to frame
@@ -1166,8 +1202,6 @@ void Update_Tick(const DiagLogo& logo)
         }
     }
 
-    s_prevBtns = cur;
-
     // State machine advance
     switch (s_state)
     {
@@ -1245,5 +1279,10 @@ void Update_Tick(const DiagLogo& logo)
         break;
     }
 
+    // [BLACK] toggles changelog pause — [A] is used for primary update actions
+    if (EdgeDown(cur, s_prevBtns, BTN_BLACK) && s_changelogLen > 0)
+        s_changelogPaused = !s_changelogPaused;
+
+    s_prevBtns = cur;
     Render(logo);
 }

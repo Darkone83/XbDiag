@@ -121,6 +121,13 @@ static int  s_trigMinLT = 255, s_trigMaxLT = 0;
 static int  s_trigMinRT = 255, s_trigMaxRT = 0;
 static bool s_trigHasData = false;
 
+// Analog button VU card (s_stickTest == 4)
+// 6 buttons: A, B, X, Y, Black, White
+static int  s_abVal[6] = { 0, 0, 0, 0, 0, 0 };
+static int  s_abMin[6] = { 255, 255, 255, 255, 255, 255 };
+static int  s_abMax[6] = { 0, 0, 0, 0, 0, 0 };
+static bool s_abHas = false;
+
 // Per-port disconnect tracking.
 // s_wasConn:    connection state from the previous tick (for edge detection).
 // s_discCount:  running count of disconnect events seen this session.
@@ -608,7 +615,7 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
 {
     g_pDevice->BeginScene();
 
-    const char* testNames[4] = { "DEAD-ZONE", "CIRCULARITY", "DRIFT", "TRIGGERS" };
+    const char* testNames[5] = { "DEAD-ZONE", "CIRCULARITY", "DRIFT", "TRIGGERS", "ANALOG" };
     const char* hint = "[Left/Right] Switch test    [B] Exit";
     DrawPageChrome(logo, "STICK TEST", hint);
 
@@ -616,12 +623,12 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
 
     // ── Tab strip ──────────────────────────────────────────────────────────
     {
-        const float TW2 = 88.f;
+        const float TW2 = 70.f;
         const float TH = 16.f;
         const float TG = 4.f;
-        float tx = X_MID - (TW2 * 4.f + TG * 3.f) * 0.5f;
+        float tx = X_MID - (TW2 * 5.f + TG * 4.f) * 0.5f;
         float ty = B;
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < 5; ++i)
         {
             bool sel = (i == s_stickTest);
             float x0 = tx + (TW2 + TG) * (float)i;
@@ -1152,6 +1159,110 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
             contentY + 300.f, dzValStr, 1.0f, D3DCOLOR_XRGB(200, 80, 80));
     }
 
+
+    else if (s_stickTest == 4)
+    {
+        // ── Analog Button VU Card ─────────────────────────────────────────
+        // 6 vertical VU bars for A, B, X, Y, Black, White (0-255).
+        // Expected full-press line at 240. Min/max tracking per button.
+        // [X] resets min/max.
+
+        const char* k_labels[6] = { "A", "B", "X", "Y", "BLK", "WHT" };
+        const DWORD k_colors[6] = {
+            D3DCOLOR_XRGB(28, 200, 55),    // A - green
+            D3DCOLOR_XRGB(200, 55, 55),    // B - red
+            D3DCOLOR_XRGB(55, 100, 220),   // X - blue
+            D3DCOLOR_XRGB(220, 200, 30),   // Y - yellow
+            D3DCOLOR_XRGB(160, 160, 160),  // Black - gray
+            D3DCOLOR_XRGB(220, 220, 220),  // White - white
+        };
+
+        const float BAR_H = 200.f;
+        const float BAR_W = 52.f;
+        const float BAR_GAP = 14.f;
+        const float TOTAL_W = 6.f * BAR_W + 5.f * BAR_GAP;
+        const float START_X = (SW - TOTAL_W) * 0.5f;
+        const float BAR_TOP = B + 40.f;
+        const float BAR_BOT = BAR_TOP + BAR_H;
+
+        // Expected full-press threshold line
+        const int   FULL_THRESH = 240;
+        float threshY = BAR_BOT - BAR_H * ((float)FULL_THRESH / 255.f);
+
+        for (int i = 0; i < 6; ++i)
+        {
+            float x0 = START_X + i * (BAR_W + BAR_GAP);
+            float x1 = x0 + BAR_W;
+            float cx = x0 + BAR_W * 0.5f;
+
+            int val = s_abVal[i];
+            int vMin = s_abMin[i];
+            int vMax = s_abMax[i];
+
+            float fillH = BAR_H * ((float)val / 255.f);
+            float maxH = BAR_H * ((float)vMax / 255.f);
+
+            // Background
+            FillRect(x0, BAR_TOP, x1, BAR_BOT, D3DCOLOR_XRGB(10, 14, 32));
+
+            // Max watermark
+            if (s_abHas && vMax > 0)
+            {
+                float maxY = BAR_BOT - maxH;
+                FillRect(x0 + 1.f, maxY, x1 - 1.f, maxY + 3.f,
+                    D3DCOLOR_XRGB(80, 80, 80));
+            }
+
+            // Fill — colour shifts green→amber→red with pressure
+            if (fillH > 0.5f)
+            {
+                DWORD fc = (val < 128) ? k_colors[i] :
+                    (val < 210) ? D3DCOLOR_XRGB(200, 175, 20) :
+                    D3DCOLOR_XRGB(210, 55, 30);
+                FillRect(x0 + 1.f, BAR_BOT - fillH, x1 - 1.f, BAR_BOT, fc);
+            }
+
+            // Grid lines at 25/50/75%
+            HLine(BAR_TOP + BAR_H * 0.25f, x0, x1, D3DCOLOR_XRGB(25, 35, 65));
+            HLine(BAR_TOP + BAR_H * 0.50f, x0, x1, D3DCOLOR_XRGB(25, 35, 65));
+            HLine(BAR_TOP + BAR_H * 0.75f, x0, x1, D3DCOLOR_XRGB(25, 35, 65));
+
+            // Expected full-press line
+            HLine(threshY, x0, x1, D3DCOLOR_XRGB(60, 120, 60));
+
+            // Border
+            HLine(BAR_TOP, x0, x1, COL_BORDER);
+            HLine(BAR_BOT, x0, x1, COL_BORDER);
+            VLine(x0, BAR_TOP, BAR_BOT, COL_BORDER);
+            VLine(x1, BAR_TOP, BAR_BOT, COL_BORDER);
+
+            // Label above
+            DrawTextC(cx, BAR_TOP - 18.f, k_labels[i], 1.2f, k_colors[i]);
+
+            // Current value below
+            char vStr[6]; IntToStr(val, vStr, sizeof(vStr));
+            DrawTextC(cx, BAR_BOT + 6.f, vStr, 1.1f, COL_WHITE);
+
+            // Min/max below value
+            if (s_abHas)
+            {
+                char mmStr[12]; char tmp[6];
+                StrCopy(mmStr, sizeof(mmStr), "^");
+                IntToStr(vMax, tmp, sizeof(tmp));
+                StrCat2(mmStr, sizeof(mmStr), mmStr, tmp);
+                DrawTextC(cx, BAR_BOT + 22.f, mmStr, 0.95f, COL_DIM);
+            }
+        }
+
+        // Threshold label
+        DrawText(START_X + TOTAL_W + 6.f, threshY - 5.f, "240", 0.9f,
+            D3DCOLOR_XRGB(60, 160, 60));
+
+        // Hint
+        DrawText(g_marginL, BAR_BOT + 50.f,
+            "[X] Reset min/max    [DPAD] Change card    [BACK] Exit",
+            1.05f, COL_GRAY);
+    }
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
@@ -1438,16 +1549,18 @@ void ControllerTest_Tick(const DiagLogo& logo)
     // ── Stick test card ─────────────────────────────────────────────────────
     if (s_stickMode)
     {
-        if (Edge(cur, s_prev, BTN_B))
+        // On analog card [B] is under test -- use [BACK] to exit instead
+        WORD exitBtn = (s_stickTest == 4) ? BTN_BACK : BTN_B;
+        if (Edge(cur, s_prev, exitBtn))
         {
             s_stickMode = false;
             s_prev = cur;
             return;
         }
         if (Edge(cur, s_prev, BTN_DPAD_RIGHT))
-            s_stickTest = (s_stickTest + 1) % 4;
+            s_stickTest = (s_stickTest + 1) % 5;
         if (Edge(cur, s_prev, BTN_DPAD_LEFT))
-            s_stickTest = (s_stickTest + 3) % 4;
+            s_stickTest = (s_stickTest + 4) % 5;
         if (Edge(cur, s_prev, BTN_X))
         {
             if (s_stickTest == 1)
@@ -1471,6 +1584,12 @@ void ControllerTest_Tick(const DiagLogo& logo)
                 s_trigMinRT = 255; s_trigMaxRT = 0;
                 s_trigHasData = false;
             }
+            else if (s_stickTest == 4)
+            {
+                // Reset analog button min/max
+                for (int i = 0; i < 6; ++i) { s_abMin[i] = 255; s_abMax[i] = 0; }
+                s_abHas = false;
+            }
         }
         // Update trigger dead-zone card live values
         if (s_stickTest == 3)
@@ -1482,6 +1601,19 @@ void ControllerTest_Tick(const DiagLogo& logo)
             if (s_trigLT > s_trigMaxLT) s_trigMaxLT = s_trigLT;
             if (s_trigRT < s_trigMinRT) s_trigMinRT = s_trigRT;
             if (s_trigRT > s_trigMaxRT) s_trigMaxRT = s_trigRT;
+        }
+        // Update analog button VU card live values
+        if (s_stickTest == 4)
+        {
+            s_abVal[0] = btnA; s_abVal[1] = btnB;
+            s_abVal[2] = btnX; s_abVal[3] = btnY;
+            s_abVal[4] = blk;  s_abVal[5] = wht;
+            for (int i = 0; i < 6; ++i)
+            {
+                if (s_abVal[i] > 0) s_abHas = true;
+                if (s_abVal[i] < s_abMin[i]) s_abMin[i] = s_abVal[i];
+                if (s_abVal[i] > s_abMax[i]) s_abMax[i] = s_abVal[i];
+            }
         }
         s_prev = cur;
         RenderStickTest(logo, lx, ly, rx, ry, rawLX, rawLY, rawRX, rawRY);

@@ -39,9 +39,9 @@ The CPU stress kernel in `StressMath.cpp` has been updated with increased SSE pa
 | 05 | **EEPROM Viewer** | Full 256-byte EEPROM decode with hex view, field editor, checksum repair, and backup restore |
 | 06 | **Video Info** | Encoder type and chip ID, AV pack type, NV2A GPU/memory/pixel clocks, VRAM size, HD mod detection, NTSC/PAL color bar patterns, and live video mode switching test |
 | 07 | **HDD Info** | ATA IDENTIFY — model, serial, firmware, capacity, RPM/SSD, UDMA mode, partition sizes, SMART, HDD benchmark, and DVD drive detection |
-| 08 | **Controller Test** | Port connection status strip (all 4 ports), digital buttons, analog sticks, triggers, Black/White — live visualizer with stick sub-tests (dead-zone, circularity, drift, trigger dead-zone card) and rumble motor subcard |
+| 08 | **Controller Test** | Port connection status strip (all 4 ports), digital buttons, analog sticks, triggers, Black/White — live visualizer with stick sub-tests (dead-zone, circularity, drift, trigger dead-zone card, analog button VU card) and rumble motor subcard |
 | 09 | **Stress Test** | CPU and RAM stress tests with live temperature monitoring, fan speed readback, and configurable thermal auto-abort |
-| 10 | **File Explorer** | Full file manager with FTP server, file copy/move/delete, multi-select, new folder creation, file viewer, XBE launcher, and MU Utilities (format, Skeleton Key, ENDGAME creation) |
+| 10 | **File Explorer** | Full file manager with FTP server, file copy/move/delete, multi-select, new folder creation, file viewer, XBE launcher, ShadowC real-C access (Rocky5 softmods), and MU Utilities (format, Skeleton Key, ENDGAME creation) |
 | 11 | **Update** | GitHub OTA updater — checks latest release tag, downloads, and overwrites `D:\XbDiag.xbe` in place |
 | 12 | **About** | Version info, credits, and rotating Xbox hardware facts ticker |
 
@@ -80,17 +80,24 @@ Displays a full hardware snapshot captured on entry. The left column covers the 
 | Button | Action |
 |--------|--------|
 | `[A]` | Export snapshot to `sysinfo.txt` |
-| `[X]` | Open flash chip info popup |
+| `[X]` | Open TSOP Info panel |
 | `[Y]` | Dump BIOS to `bios.bin` (256KB or 1MB) |
 | `[B]` | Back to menu |
+| `[WHITE]` | Open X-Volt power rail overlay (only shown when X-Volt device is present) |
 
-### Flash Chip Info Popup
+### TSOP Info Popup
 
 <div align=center>
 <img src="https://github.com/Darkone83/XbDiag/blob/main/img/Sysinfo_flash.png">
 </div>
 
 Opened with `[X]` from the main view. Uses JEDEC autoselect to identify the TSOP flash chip — manufacturer ID, device ID, chip name, and whether the write-enable line is bridged. Two guards prevent accidental probing: the popup is suppressed when a modchip is active (LPC bus intercepted) and on rev 1.6/1.6b hardware (no TSOP present). Press `[B]` to close.
+
+### X-Volt Power Rail Monitor (Optional)
+
+If an X-Volt Xbox power rail monitor is present on the same LAN, XbDiag discovers it automatically via UDP broadcast — no configuration required. When a device is found a compact **X-VOLT POWER RAILS** section appears at the bottom of the right column showing live voltage readings for all three rails, colour-coded per rail. The section disappears automatically when the device goes offline.
+
+Pressing `[WHITE]` opens a full-screen overlay with per-rail bar graphs, current draw values, the source device IP, and a **RAIL FAULT** banner if any rail is outside tolerance. The `[WHITE]` hint only appears when an X-Volt device has been discovered.
 
 ---
 
@@ -339,7 +346,9 @@ Full-screen color bar patterns for display calibration. Press `[B]` to return to
 <img src="https://github.com/Darkone83/XbDiag/blob/main/img/Videoinfo_test.png">
 </div>
 
-Cycles through the video modes supported by the connected AV pack, applying each via D3D `Reset()` with the corresponding presentation flags. Full-screen color bars are displayed in the active mode with a live hardware verification readout showing the actual backbuffer dimensions as reported by `GetBackBuffer()`. This confirms whether the GPU framebuffer committed to the requested resolution.
+Before entering the test a general informational warning card is shown — explaining that the test programs the encoder hardware directly, that a blank display during a switch is normal, and that the display auto-reverts after 10 seconds if it does not recover. Press `[A]` to continue or `[B]` to cancel. On NKPatcher / Rocky5 softmod consoles a second amber warning card advises that the 480i-to-480p kernel patch may cause issues; `[A]` proceeds, `[B]` cancels.
+
+Once in the test, cycles through the video modes supported by the connected AV pack, applying each via D3D `Reset()` with the corresponding presentation flags. Full-screen color bars are displayed in the active mode with a live hardware verification readout showing the actual backbuffer dimensions as reported by `GetBackBuffer()`. This confirms whether the GPU framebuffer committed to the requested resolution.
 
 | Button | Action |
 |--------|--------|
@@ -369,9 +378,9 @@ The hardware verify readout (`HW: WxH  OK / MISMATCH`) is deferred by two frames
 
 Displays ATA IDENTIFY data for the primary HDD: model, serial number, firmware revision, capacity (LBA28 and LBA48), UDMA mode, buffer size, ATA version, SMART support status, and rotation rate (shown as `SSD` when word 217 reports a non-rotating medium).
 
-**Partition Sizes** — C, E, F, and G partition free/total sizes are shown once drive letters are mounted.
+**Partition Sizes** — C, E, F, and G partition free/total sizes are shown once drive letters are mounted. Sizes below 1 GB are shown in MB. Each partition bar displays the total size centred inside it. Cluster size is shown alongside the free space label using `XGetDiskClusterSizeA` and validated against FATX guidance (16 KB clusters up to 256 GB, doubling per power of two thereafter) — valid sizes are shown in green, undersized in red.
 
-**Security / EEPROM** — HDD key, region, and online key sourced via the kernel, shown in the right column.
+**Security** — HDD security status shown as a single meaningful state: Not Supported, Not Enabled, Locked, or Enabled / Unlocked. Not Enabled is normal on hardmodded consoles with replacement drives.
 
 | Button | Action |
 |--------|--------|
@@ -478,14 +487,15 @@ Displays all digital buttons (A, B, X, Y, Black, White, Start, Back, D-pad, thum
 <img src="https://github.com/Darkone83/XbDiag/blob/main/img/Controllertest_dead.png">
 </div>
 
-Four sub-tests selectable with `[DPad Left]` / `[DPad Right]`:
+Five sub-tests selectable with `[DPad Left]` / `[DPad Right]`:
 
 - **Dead-zone** — raw XY scatter plot with configurable dead-zone ring
 - **Circularity** — traces the stick gate path vs an ideal circle. `[X]` clears the trace.
 - **Drift** — samples at-rest position over ~3 seconds and reports average XY offset for both sticks. `[X]` resets the sample buffer.
 - **Triggers** — dedicated trigger dead-zone card (see below)
+- **Analog** — six vertical VU bars showing live 0–255 pressure readings for A, B, X, Y, Black, and White. A green threshold line at 240 marks expected full-press. Min/max tracked per button; `[X]` resets. Because `[B]` is under test on this card, press `[BACK]` to exit instead of `[B]`.
 
-Press `[B]` to exit back to the main visualizer.
+Press `[B]` to exit back to the main visualizer (press `[BACK]` from the Analog card).
 
 ### Trigger Dead-Zone Card
 
@@ -587,7 +597,7 @@ Hold `[Back+A]` simultaneously for 5 seconds to abort while a test is in progres
 <img src="https://github.com/Darkone83/XbDiag/blob/main/img/Fileexplorer.png">
 </div>
 
-A full single-pane file manager for navigating and managing files on your Xbox HDD partitions.
+A full single-pane file manager for navigating and managing files on all Xbox HDD partitions, including cache partitions X, Y, and Z. On Rocky5 / NKPatcher softmod consoles with ShadowC active, the real C partition is hidden by the softmod. File Explorer detects this automatically and mounts it as **N: (Real C)** using `IoCreateSymbolicLink` so you can access the physical boot partition directly.
 
 ### Navigation
 
@@ -709,6 +719,8 @@ A navigation bar links all pages and highlights the active tab. The root URL (`/
 |------|-----|-------------|
 | System Info | `http://<ip>/sysinfo` | Live hardware snapshot — CPU, memory, board, video, thermal, storage, network. Auto-refreshes every 30 seconds. Shows live stress test data when a stress test is running. |
 | SMART | `http://<ip>/smart` | Decoded SMART attribute table for the installed HDD. Shows attribute ID, name, normalised CUR/WST/THR values, and decoded raw value. Rows highlighted red when a critical attribute threshold is tripped, amber for critical attributes not yet tripped. Requires HDD Info to have been run this session. |
+| Files | `http://<ip>/files` | Browser-based file manager. Browse all drives, upload files from your PC (including whole folders via drag-and-drop), download files, create folders, and delete files or folders. |
+| Live | `http://<ip>/live` | Framebuffer snapshot of the Xbox display at native resolution. Toggle Live ON for 5-second auto-refresh or click Capture Now for a manual snapshot. Useful for remote monitoring without a TV connected. |
 | Report | `http://<ip>/report` | Views diagnostic report files saved to `D:\`. Auto-detects the most recent report. File switcher links to all text exports. |
 | Settings | `http://<ip>/settings` | Full automation settings editor — all module toggles, stress durations, loop count, and run options. Saves directly to `D:\XbDiag.set` using the same write path as the on-screen editor. |
 | Power | `http://<ip>/power` | Console power control — Reset, Power Cycle, and Power Off via PIC SMBus register 0x02. All actions require a confirmation step before the command is sent. |
@@ -782,6 +794,7 @@ smart.txt      (written by HDD Info SMART export)
 hddbench.txt   (written by HDD Info benchmark export)
 bios.bin       (written by System Info BIOS dump)
 ramresult.csv  (written by Memory Test export)
+screen.set     (written by Screen Calibration on confirm)
 smbid.id       (created automatically if not present; user-editable SMBus device database)
 ```
 
@@ -792,6 +805,25 @@ MU Utilities asset cache (downloaded on first use, retained for subsequent write
 \resources\ENDGAME.xba  (ENDGAME archive — downloaded from update server on demand)
 \resources\tmp\         (temporary extraction directory — created and cleaned up per operation)
 ```
+
+---
+
+## Screen Calibration
+
+On first boot XbDiag checks for `screen.set` in its directory. If the file is not found, a calibration screen runs automatically before the update check. Pulsing corner brackets are positioned at the true chrome boundary edges — adjust the margins until all four brackets are fully visible on your display, then press `[A]` to save. On modern flat panel displays the defaults are correct and you can press `[A]` immediately.
+
+`[BLACK]` on the main menu re-runs calibration at any time.
+
+| Button | Action |
+|--------|--------|
+| `[DPad Left/Right]` | Adjust left/right margins |
+| `[DPad Up/Down]` | Adjust top/bottom margins (symmetrical) |
+| `[RT]` | Coarse step (4 px) — default is fine step (1 px) |
+| `[BLACK]` | Reverse direction (back off if you overshoot) |
+| `[A]` | Confirm and save to `screen.set` |
+| `[B]` | Cancel without saving |
+
+All chrome elements — top bar, bottom bar, content area — derive their positions from the calibration globals so the entire interface shifts as a unit.
 
 ---
 
@@ -810,7 +842,7 @@ When present, the display shows live system data cycling through four pages ever
 
 A splash screen showing the XbDiag version and Team Resurgent / Darkone83 credits is shown at startup until SysInfo data is loaded.
 
-When the FTP server is active, the display locks to an FTP status page mirroring the on-screen overlay: connection state, IP:21, current filename, and a live progress bar (determinate for GET, animated for PUT).
+When the FTP server is active, the display locks to an FTP status page mirroring the on-screen overlay: connection state, IP:21, current filename, and a live progress bar. GET transfers show a deterministic fill bar with real percentage. PUT and DIR transfers show a ping-pong animated spinner to indicate activity without implying false progress.
 
 **Key combos** (hold all three simultaneously):
 

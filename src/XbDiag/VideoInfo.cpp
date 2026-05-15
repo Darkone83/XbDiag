@@ -43,7 +43,7 @@ static const float CY = CONTENT_Y + 6.f;
 static const float COL_L = LM;
 static const float COL_R = SW * 0.5f + 4.f;
 static const float COL_VL = COL_L + 110.f;
-static const float COL_VR = COL_R + 64.f;   // was +110; tightened to fit longest value at LM=48
+static const float COL_VR = COL_R + 110.f;
 static const float LH = LINE_H - 1.f;
 static const float GAP = 8.f;
 
@@ -152,11 +152,11 @@ struct ModeEntry
 
 static const ModeEntry s_allModes[] =
 {
-    { "480i",     640,  480, D3DPRESENTFLAG_INTERLACED,                             60, false, 0 },
+    { "480i",     640,  480, D3DPRESENTFLAG_INTERLACED,                             30, false, 0 },
     { "480p",     640,  480, D3DPRESENTFLAG_PROGRESSIVE,                            60, false, 1 },
-    { "576i PAL", 720,  576, D3DPRESENTFLAG_INTERLACED,                             50, true,  0 },
+    { "576i PAL", 720,  576, D3DPRESENTFLAG_INTERLACED,                             25, true,  0 },
     { "720p",    1280,  720, D3DPRESENTFLAG_PROGRESSIVE | D3DPRESENTFLAG_WIDESCREEN, 60, false, 2 },
-    { "1080i",   1920, 1080, D3DPRESENTFLAG_INTERLACED | D3DPRESENTFLAG_WIDESCREEN, 60, false, 2 },
+    { "1080i",   1920, 1080, D3DPRESENTFLAG_INTERLACED | D3DPRESENTFLAG_WIDESCREEN, 30, false, 2 },
 };
 static const int ALL_MODE_COUNT = sizeof(s_allModes) / sizeof(s_allModes[0]);
 
@@ -192,6 +192,8 @@ static DWORD s_eepVideoFlags = 0;
 static bool  s_eepFlagsOK = false;  // false if EEPROM read failed
 static int   s_settleFrames = 0;
 static bool  s_resetOK = false;    // result of most recent SwitchMode Reset()
+static bool  s_nkWarnActive = false; // true while NKPatcher mode-test warning is shown
+static bool  s_modeWarnActive = false; // true while general mode test warning is shown
 static DWORD s_bbW = 0, s_bbH = 0; // backbuffer dims after last switch
 
 // Encoder type detected at OnEnter — governs whether EncReprogramMode can work
@@ -310,20 +312,19 @@ static void BuildProbeTable()
         // Encoder capability checks — only applied once encoder is known
         if (e.width == 1920 && e.height == 1080)
         {
-            // Xcalibur: no known register map — hard block 1080i
+            // Xcalibur (rev 1.6): kernel programs the encoder internally via
+            // XVideoSetMode -- no userspace register map needed. Mark EXPERIMENTAL
+            // same as Conexant so the user can test their hardware.
             if (s_encType == ENC_XCALIBUR)
             {
-                p.status = PROBE_BLOCKED_EEPROM;  // reuse blocked status
-                StrCopy(p.reason, sizeof(p.reason), "NO XCALIBUR MAP");
-                continue;
+                p.status = PROBE_UNKNOWN;
+                StrCopy(p.reason, sizeof(p.reason), "EXPERIMENTAL");
             }
-            // Conexant: register values are unverified for 1080i — mark experimental
-            // Still added to selectable list but flagged PROBE_UNKNOWN
+            // Conexant: register values unverified for 1080i — mark experimental
             if (s_encType == ENC_CONEXANT)
             {
                 p.status = PROBE_UNKNOWN;
                 StrCopy(p.reason, sizeof(p.reason), "EXPERIMENTAL");
-                // Fall through — still add to mode list for forced/manual test
             }
         }
 
@@ -790,6 +791,8 @@ static void EncReprogramMode(int modeIdx)
 // Generic path  — A8R8G8B8, depth stencil on, DISCARD
 // 1080i path    — X8R8G8B8, depth stencil off, COPY
 // Both          — INTERVAL_IMMEDIATE (avoids blocking Present on unsupported modes)
+// xbox.h provides XVideoSetMode and other kernel video exports
+
 static bool SwitchMode(int allIdx)
 {
     if (allIdx < 0 || allIdx >= ALL_MODE_COUNT) return false;
@@ -893,9 +896,10 @@ static void DrawModeTest()
     g_pDevice->BeginScene();
     DrawColorBarsContent(m.isPAL);
 
-    // ---- Overlay -----------------------------------------------------------
+    // Overlay anchored to calibrated bottom margin -- respects screen.set
+    // so hint text and mode list are never cut off on overscanned displays.
     const float OVH = 136.f;
-    const float OY = SH - OVH;
+    const float OY = g_marginB - OVH;
 
     FillRect(0.f, OY, SW, SH, D3DCOLOR_ARGB(220, 0, 0, 0));
     HLine(OY, 0.f, SW, COL_BORDER);
@@ -1234,6 +1238,7 @@ void VideoInfo_OnEnter()
     s_modeTimeout = 0;
     s_forceMode = false;
     s_forceAllIdx = -1;
+    s_nkWarnActive = false;
     s_bbW = 0; s_bbH = 0;
     s_settleFrames = 0;
     // ---- Capture original presentation parameters for mode test restoration ----
@@ -1319,6 +1324,119 @@ static void DrawRow(float lx, float vx, float y,
     DrawText(lx, y, label, 1.2f, COL_GRAY);
     DrawText(vx, y, val, 1.2f, vc);
 }
+
+// Forward declaration — Render is defined after RenderNKWarn which calls it
+static void Render(const DiagLogo& logo);
+
+// ── General mode test warning overlay ────────────────────────────────────────
+static void RenderModeTestWarn(const DiagLogo& logo)
+{
+    g_pDevice->BeginScene();
+    DrawPageChrome(logo, "VIDEO INFO", "[X] NTSC Bars  [Y] PAL Bars  [WHITE] Mode Test  [B] Back");
+
+    FillRect(0.f, 0.f, SW, SH, D3DCOLOR_ARGB(160, 0, 0, 0));
+
+    const float CW = 500.f;
+    const float CH = 220.f;
+    const float CX = (SW - CW) * 0.5f;
+    const float CY = (SH - CH) * 0.5f;
+    const float CX1 = CX + CW;
+    const float CY1 = CY + CH;
+    const float LH = LINE_H;
+
+    FillRect(CX + 4.f, CY + 4.f, CX1 + 4.f, CY1 + 4.f, D3DCOLOR_ARGB(120, 0, 0, 0));
+    FillRectGrad(CX, CY, CX1, CY1, D3DCOLOR_XRGB(10, 30, 50), D3DCOLOR_XRGB(6, 18, 32));
+    HLine(CY, CX, CX1, D3DCOLOR_XRGB(0, 140, 220));
+    HLine(CY1, CX, CX1, D3DCOLOR_XRGB(0, 140, 220));
+    VLine(CX, CY, CY1, D3DCOLOR_XRGB(0, 140, 220));
+    VLine(CX1, CY, CY1, D3DCOLOR_XRGB(0, 140, 220));
+
+    FillRect(CX + 1.f, CY + 1.f, CX1 - 1.f, CY + LH + 6.f, D3DCOLOR_XRGB(0, 40, 70));
+    HLine(CY + LH + 6.f, CX + 1.f, CX1 - 1.f, D3DCOLOR_XRGB(0, 140, 220));
+    DrawTextC(SW * 0.5f, CY + 3.f, "VIDEO MODE TEST", 1.2f, COL_CYAN);
+
+    float y = CY + LH + 16.f;
+    DrawTextC(SW * 0.5f, y,
+        "This test directly programs the video encoder hardware.",
+        1.1f, COL_WHITE);   y += LH;
+    DrawTextC(SW * 0.5f, y,
+        "Your display may go blank during a mode switch - this is normal.",
+        1.1f, COL_WHITE);   y += LH;
+    DrawTextC(SW * 0.5f, y,
+        "Not all modes are supported by every display or adapter.",
+        1.1f, COL_WHITE);   y += LH;
+    DrawTextC(SW * 0.5f, y,
+        "If the display does not recover, wait 10 seconds to auto-revert.",
+        1.1f, COL_WHITE);   y += LH;
+    DrawTextC(SW * 0.5f, y,
+        "CerBIOS users: video modes are managed by the BIOS, not this tool.",
+        1.1f, COL_GRAY);    y += LH + 8.f;
+    DrawTextC(SW * 0.5f, y,
+        "[A] Continue    [B] Cancel",
+        1.2f, COL_YELLOW);
+
+    g_pDevice->EndScene();
+    g_pDevice->Present(NULL, NULL, NULL, NULL);
+}
+
+// ── NKPatcher mode test warning overlay ──────────────────────────────────────
+static void RenderNKWarn(const DiagLogo& logo)
+{
+    g_pDevice->BeginScene();
+
+    // Draw full info screen as background first
+    DrawPageChrome(logo, "VIDEO INFO", "[X] NTSC Bars  [Y] PAL Bars  [WHITE] Mode Test  [B] Back");
+
+    // Dim backdrop
+    FillRect(0.f, 0.f, SW, SH, D3DCOLOR_ARGB(160, 0, 0, 0));
+
+    const float CW = 460.f;
+    const float CH = 180.f;
+    const float CX = (SW - CW) * 0.5f;
+    const float CY = (SH - CH) * 0.5f;
+    const float CX1 = CX + CW;
+    const float CY1 = CY + CH;
+    const float LH = LINE_H;
+
+    // Card shadow
+    FillRect(CX + 4.f, CY + 4.f, CX1 + 4.f, CY1 + 4.f, D3DCOLOR_ARGB(120, 0, 0, 0));
+    FillRectGrad(CX, CY, CX1, CY1, D3DCOLOR_XRGB(40, 18, 8), D3DCOLOR_XRGB(24, 10, 4));
+    HLine(CY, CX, CX1, D3DCOLOR_XRGB(200, 100, 0));
+    HLine(CY1, CX, CX1, D3DCOLOR_XRGB(200, 100, 0));
+    VLine(CX, CY, CY1, D3DCOLOR_XRGB(200, 100, 0));
+    VLine(CX1, CY, CY1, D3DCOLOR_XRGB(200, 100, 0));
+
+    // Title bar
+    FillRect(CX + 1.f, CY + 1.f, CX1 - 1.f, CY + LH + 6.f, D3DCOLOR_XRGB(50, 22, 4));
+    HLine(CY + LH + 6.f, CX + 1.f, CX1 - 1.f, D3DCOLOR_XRGB(200, 100, 0));
+    DrawTextC(SW * 0.5f, CY + 3.f, "NKPATCHER DETECTED", 1.2f, COL_ORANGE);
+
+    float y = CY + LH + 14.f;
+    DrawTextC(SW * 0.5f, y,
+        "NKPatcher may patch AvSetDisplayMode to convert",
+        1.1f, COL_WHITE);
+    y += LH;
+    DrawTextC(SW * 0.5f, y,
+        "480i to 480p. This can cause a hardlock during",
+        1.1f, COL_WHITE);
+    y += LH;
+    DrawTextC(SW * 0.5f, y,
+        "the mode test. Disable the 480i->480p patch",
+        1.1f, COL_WHITE);
+    y += LH;
+    DrawTextC(SW * 0.5f, y,
+        "in NKPatcher Settings before proceeding.",
+        1.1f, COL_WHITE);
+
+    y += LH + 8.f;
+    DrawTextC(SW * 0.5f, y,
+        "[A] Proceed anyway    [B] Cancel",
+        1.2f, COL_YELLOW);
+
+    g_pDevice->EndScene();
+    g_pDevice->Present(NULL, NULL, NULL, NULL);
+}
+
 
 static void Render(const DiagLogo& logo)
 {
@@ -1632,15 +1750,80 @@ void VideoInfo_Tick(const DiagLogo& logo)
     }
     if (EdgeDown(cur, s_prevBtns, BTN_WHITE))
     {
-        // Probe table was built at OnEnter — just enter mode test and switch to first supported mode
-        s_modeIdx = 0;
-        s_forceMode = false;
-        s_forceAllIdx = -1;
-        s_settleFrames = 0;
-        s_bbW = 0; s_bbH = 0;
-        s_subState = VSS_MODE_TEST;
-        if (s_modeCount > 0)
-            SwitchMode(s_modeList[0]);
+        // Always show the general mode test warning first
+        s_modeWarnActive = true;
+        s_prevBtns = cur;
+        return;
+    }
+
+    // General mode test warning active — [A] proceed, [B] cancel
+    if (s_modeWarnActive)
+    {
+        RenderModeTestWarn(logo);
+        if (EdgeDown(cur, s_prevBtns, BTN_B))
+        {
+            s_modeWarnActive = false;
+        }
+        else if (EdgeDown(cur, s_prevBtns, BTN_A))
+        {
+            s_modeWarnActive = false;
+            // Check for NKPatcher before entering mode test
+            bool nkPresent = false;
+            {
+                static const char* k_nkp[] = {
+                    "E:\\NKP11\\",
+                    "E:\\NKP10\\",
+                    "E:\\NKPatcher\\",
+                    NULL
+                };
+                for (int ki = 0; k_nkp[ki] && !nkPresent; ++ki)
+                {
+                    DWORD a = GetFileAttributesA(k_nkp[ki]);
+                    if (a != 0xFFFFFFFF && (a & FILE_ATTRIBUTE_DIRECTORY))
+                        nkPresent = true;
+                }
+            }
+            if (nkPresent)
+            {
+                s_nkWarnActive = true;
+            }
+            else
+            {
+                // Enter mode test directly
+                s_modeIdx = 0;
+                s_forceMode = false;
+                s_forceAllIdx = -1;
+                s_settleFrames = 0;
+                s_bbW = 0; s_bbH = 0;
+                s_subState = VSS_MODE_TEST;
+                if (s_modeCount > 0)
+                    SwitchMode(s_modeList[0]);
+            }
+        }
+        s_prevBtns = cur;
+        return;
+    }
+
+    // NKPatcher warning active — [A] proceed, [B] cancel
+    if (s_nkWarnActive)
+    {
+        RenderNKWarn(logo);
+        if (EdgeDown(cur, s_prevBtns, BTN_B))
+        {
+            s_nkWarnActive = false;
+        }
+        else if (EdgeDown(cur, s_prevBtns, BTN_A))
+        {
+            s_nkWarnActive = false;
+            s_modeIdx = 0;
+            s_forceMode = false;
+            s_forceAllIdx = -1;
+            s_settleFrames = 0;
+            s_bbW = 0; s_bbH = 0;
+            s_subState = VSS_MODE_TEST;
+            if (s_modeCount > 0)
+                SwitchMode(s_modeList[0]);
+        }
         s_prevBtns = cur;
         return;
     }
@@ -1648,6 +1831,7 @@ void VideoInfo_Tick(const DiagLogo& logo)
     s_prevBtns = cur;
     Render(logo);
 }
+
 // ============================================================================
 // AutoRun — headless data gather for XbSet automation
 // ============================================================================

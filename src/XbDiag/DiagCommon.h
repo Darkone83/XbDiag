@@ -49,7 +49,7 @@ static const float CONTENT_Y = TOP_BAR_H + 2.0f;
 static const float TEXT_SCALE = 1.5f;
 static const float LINE_H = 18.0f;
 static const float GROUP_GAP = 10.0f;
-static const float LM = 48.0f;
+static const float LM = 32.0f;
 static const float VM = 200.0f;
 
 // Video mode info - set by DetectVideoMode() in main.cpp
@@ -126,6 +126,15 @@ struct DiagLogo
 // Call after any textured draw to restore plain XYZRHW|DIFFUSE shader.
 void DiagResetShader();
 
+// ── Runtime calibration margins ───────────────────────────────────────────────
+// Populated by ScreenCalib_Init() from screen.set. Default to compile-time
+// constants. DrawPageChrome uses these for chrome positioning so calibration
+// affects all modules without touching module content layout.
+extern float g_marginL;   // left margin   (default = LM       = 48)
+extern float g_marginR;   // right margin  (default = LM       = 48)
+extern float g_marginT;   // top content Y (default = CONTENT_Y = 58)
+extern float g_marginB;   // bottom bar Y  (default = BOT_BAR_Y = 416)
+
 // --- Safe float->int (no __ftol2_sse) ---
 int  Ftoi(float f);
 
@@ -137,6 +146,7 @@ void VLine(float x, float y0, float y1, DWORD col);
 
 // --- Text measurement & drawing ---
 float TW(const char* s, float scale);                                // measure width
+void  DrawTextC(float cx, float y, const char* s, float scale, DWORD col); // centred
 void  DrawTextR(float rightX, float y, const char* s, float sc, DWORD col); // right-aligned
 void  DrawLabelValue(float x, float y,
     const char* label, const char* value,

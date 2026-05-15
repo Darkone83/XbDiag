@@ -16,7 +16,6 @@ struct SysSnapshot
     const char* serialNum;
     const char* modchip;
     const char* hdMod;
-    const char* biosVer;
     const char* encName;
     const char* avPack;
     const char* tempCPU;

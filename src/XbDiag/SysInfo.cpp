@@ -60,13 +60,14 @@
 //              reg 0x09 = CPU temp (°C)
 //              reg 0x0A = board temp (°C)
 //
-// [A] Export to D:\sysinfo.txt     [X] Flash chip info     [Y] Dump BIOS     [B] Back
+// [A] Export to D:\sysinfo.txt     [X] TSOP Info     [Y] Dump BIOS     [B] Back
 //
 // Network: IP via UDP connect trick (no DNS, no blocking).
 
 #include "SysInfo.h"
 #include "font.h"
 #include "input.h"
+#include "XVoltUdp.h"
 #include <xtl.h>
 #include <winsockx.h>   // XNetStartup, XNetGetTitleXnAddr, XNADDR
 
@@ -106,11 +107,9 @@ struct SysData
     char  hdModVer[24];         // e.g. "X-HD V255.255.255 BL" (20 chars + null)
 
     // BIOS
-    char biosVer[32];
 
     // Video
     char encName[28];
-    char encId[8];
     char avPack[24];
 
     // Thermal
@@ -172,6 +171,7 @@ static FlashInfo s_flashInfo;
 static WORD      s_prevBtns = 0;
 static bool      s_dataLoaded = false;
 static bool      s_flashPopupOpen = false;
+static bool      s_xvoltPopupOpen = false;   // [WHITE] X-Volt rail overlay
 
 // Forward declaration — defined after MmMapIoSpace extern block below
 static void DetectFlashChip(FlashInfo& fi);
@@ -951,38 +951,30 @@ static void ReadSysData()
         IntToHex(pciRevByte, 2, t, sizeof(t)); StrCat2(d.chipRev, sizeof(d.chipRev), "0x", t);
     }
 
-    // --- BIOS version ---
-    // Reliable version detection requires parsing mod-chip-specific flash layouts
-    // (Evox, X2, Cerbios, retail all differ). Not safe to scan flash blindly.
-    // Report a placeholder - the VideoInfo module will surface encoder/AV info
-    // which is more actionable than a BIOS string anyway.
-    StrCopy(d.biosVer, sizeof(d.biosVer), "See VideoInfo");
-
     // --- Video encoder: probe Conexant (0x8A), Focus (0xD4), Xcalibur (0xE0) ---
     // PrometheOS reference: getEncoderString() tries 0x8A then 0xD4, else Xcalibur.
     BYTE encId = 0;
     {
+        char t[4];
         if (SMBusRead(SMBADDR_ENC_CNXT, 0x00, encId))
         {
-            char t[4]; IntToHex(encId, 2, t, sizeof(t));
-            StrCat2(d.encId, sizeof(d.encId), "0x", t);
             switch (encId)
             {
             case 0x76: StrCopy(d.encName, sizeof(d.encName), "Conexant CX25871"); break;
             default:
+                IntToHex(encId, 2, t, sizeof(t));
                 StrCopy(d.encName, sizeof(d.encName), "Conexant 0x");
                 StrCat2(d.encName, sizeof(d.encName), d.encName, t);
             }
         }
         else if (SMBusRead(SMBADDR_ENC_FOCUS, 0x00, encId))
         {
-            char t[4]; IntToHex(encId, 2, t, sizeof(t));
-            StrCat2(d.encId, sizeof(d.encId), "0x", t);
             switch (encId)
             {
             case 0x54: StrCopy(d.encName, sizeof(d.encName), "Focus FS454");  break;
             case 0x09: StrCopy(d.encName, sizeof(d.encName), "Focus FS455");  break;
             default:
+                IntToHex(encId, 2, t, sizeof(t));
                 StrCopy(d.encName, sizeof(d.encName), "Focus 0x");
                 StrCat2(d.encName, sizeof(d.encName), d.encName, t);
             }
@@ -991,7 +983,6 @@ static void ReadSysData()
         {
             // Xcalibur is integrated into Xcalibur ASIC — no separate I2C response
             StrCopy(d.encName, sizeof(d.encName), "Xcalibur (1.6)");
-            StrCopy(d.encId, sizeof(d.encId), "N/A");
         }
     }
 
@@ -1050,8 +1041,15 @@ static void ReadSysData()
             }
             if (goodSamples > 0)
             {
-                d.rawTempAmbient = (BYTE)(accAmb / goodSamples);
-                d.rawTempCPU = (BYTE)(accCPU / goodSamples);
+                int rawAmb = accAmb / goodSamples;
+                int rawCPU = accCPU / goodSamples;
+                // Apply 0.8x scaling to ambient on rev 1.6 PIC path.
+                // Matches TempMonitor and PrometheOS xboxConfig reference.
+                // Without this correction SysInfo reads ambient high vs
+                // every other tool on 1.6 hardware.
+                rawAmb = rawAmb * 4 / 5;
+                d.rawTempAmbient = (BYTE)rawAmb;
+                d.rawTempCPU = (BYTE)rawCPU;
                 d.tempOK = true;
             }
             else
@@ -1652,7 +1650,6 @@ static void ExportSysInfo()
     }
     WriteLine(hf, "Modchip:       ", d.modchipName);
     WriteLine(hf, "HD Mod:        ", d.hdModVer);
-    WriteLine(hf, "BIOS:          ", d.biosVer);
     WriteLine(hf, "Encoder:       ", d.encName);
     WriteLine(hf, "AV Pack:       ", d.avPack);
     WriteLine(hf, "Temp Ambient:  ", d.tempAmbient);
@@ -1677,6 +1674,7 @@ void SysInfo_OnEnter()
     s_prevBtns = 0;
     s_dataLoaded = false;
     s_flashPopupOpen = false;
+    s_xvoltPopupOpen = false;
     s_data.exportDone = false;
     s_data.exportOK = false;
     s_data.biosDumpDone = false;
@@ -1848,6 +1846,232 @@ static void DrawRow(float lx, float y, float vx,
     DrawText(vx, y, val, 1.2f, vc);
 }
 
+// ── X-Volt: format voltage / current strings (no CRT sprintf) ────────────────
+
+static void FmtVolts(float v, char* out, int len)
+{
+    // Round to nearest 0.01 first to avoid float precision errors
+    // e.g. 5.10 * 100 = 509.999... truncates to 509 without rounding
+    int total = Ftoi(v * 100.f + 0.5f);  // round to nearest cent
+    int whole = total / 100;
+    int frac = total % 100;
+    int d1 = frac / 10;
+    int d2 = frac % 10;
+    char t[8];
+    IntToStr(whole, t, sizeof(t));
+    StrCopy(out, len, t);
+    StrCat2(out, len, out, ".");
+    IntToStr(d1, t, sizeof(t)); StrCat2(out, len, out, t);
+    IntToStr(d2, t, sizeof(t)); StrCat2(out, len, out, t);
+    StrCat2(out, len, out, "V");
+}
+
+static void FmtMilliAmps(float mA, char* out, int len)
+{
+    // e.g. 2345.6 mA -> "2345 mA"  (whole mA, no decimal)
+    int whole = Ftoi(mA);
+    char t[8];
+    IntToStr(whole, t, sizeof(t));
+    StrCopy(out, len, t);
+    StrCat2(out, len, out, " mA");
+}
+
+// ── X-Volt: rail colour based on expected voltage band ───────────────────────
+// Expected bands: 12V = 11.4-12.6, 5V = 4.75-5.25, 3.3V = 3.14-3.47
+static DWORD RailColour(float v, float lo, float hi)
+{
+    if (v < lo || v > hi) return COL_RED;
+    float margin = (hi - lo) * 0.1f;   // warn if within 10% of limit
+    if (v < lo + margin || v > hi - margin) return COL_ORANGE;
+    return COL_GREEN;
+}
+
+// ── X-Volt: inline section drawn at bottom of right column ───────────────────
+static void DrawXVoltInline(float x, float y, float vx)
+{
+    const float LH = LINE_H - 1.f;
+    XVoltReading rd;
+    bool fresh = XVoltUdp_GetData(rd);
+
+    DrawSection(x, y, 280.f, "X-VOLT POWER RAILS");
+    y += LH + 4.f;
+
+    if (rd.noSensor)
+    {
+        DrawRow(x, y, vx, "RAILS  :", "No sensor detected", COL_DIM);
+        return;
+    }
+    if (!fresh)
+    {
+        DrawRow(x, y, vx, "RAILS  :", "Waiting for data...", COL_DIM);
+        return;
+    }
+
+    // Single compact line: colour-coded voltages separated by slashes.
+    // Current draw detail lives in the [WHITE] overlay — keep this minimal.
+    {
+        char v12s[10], v5s[10], v33s[10];
+        char line[40];
+        DWORD c12 = RailColour(rd.v12, 11.4f, 12.6f);
+        DWORD c5 = RailColour(rd.v5, 4.75f, 5.25f);
+        DWORD c33 = RailColour(rd.v33, 3.14f, 3.47f);
+
+        FmtVolts(rd.v12, v12s, sizeof(v12s));
+        FmtVolts(rd.v5, v5s, sizeof(v5s));
+        FmtVolts(rd.v33, v33s, sizeof(v33s));
+
+        // All rails healthy — single line, dominant colour
+        // Any fault — draw each value individually so colour conveys which rail
+        bool allSame = (c12 == c5 && c5 == c33);
+        if (allSame)
+        {
+            StrCopy(line, sizeof(line), v12s);
+            StrCat2(line, sizeof(line), line, "  /  ");
+            StrCat2(line, sizeof(line), line, v5s);
+            StrCat2(line, sizeof(line), line, "  /  ");
+            StrCat2(line, sizeof(line), line, v33s);
+            DrawRow(x, y, vx, "RAILS  :", line, c12);
+        }
+        else
+        {
+            // Draw label then each voltage individually with its own colour
+            DrawText(x, y, "RAILS  :", 1.2f, COL_GRAY);
+            float px = vx;
+            char sep[6];
+            StrCopy(sep, sizeof(sep), "  /  ");
+            DrawText(px, y, v12s, 1.2f, c12); px += TW(v12s, 1.2f);
+            DrawText(px, y, sep, 1.2f, COL_DIM);  px += TW(sep, 1.2f);
+            DrawText(px, y, v5s, 1.2f, c5);  px += TW(v5s, 1.2f);
+            DrawText(px, y, sep, 1.2f, COL_DIM);  px += TW(sep, 1.2f);
+            DrawText(px, y, v33s, 1.2f, c33);
+        }
+    }
+}
+
+// ── X-Volt: full rail overlay popup ──────────────────────────────────────────
+static void DrawXVoltPopup()
+{
+    XVoltReading rd;
+    bool fresh = XVoltUdp_GetData(rd);
+
+    const float CW = 420.f;
+    const float CH = 240.f;
+    const float CX = (SW - CW) * 0.5f;
+    const float CY = (480.f - CH) * 0.5f;
+    const float CX1 = CX + CW;
+    const float CY1 = CY + CH;
+    const float PAD = 14.f;
+    const float LH = LINE_H;
+    const float VX = CX + PAD + 84.f;   // value column
+
+    // Shadow
+    FillRect(CX + 4.f, CY + 4.f, CX1 + 4.f, CY1 + 4.f,
+        D3DCOLOR_ARGB(140, 0, 0, 0));
+
+    // Background
+    FillRectGrad(CX, CY, CX1, CY1,
+        D3DCOLOR_XRGB(10, 20, 48),
+        D3DCOLOR_XRGB(6, 12, 32));
+
+    // Border
+    HLine(CY, CX, CX1, COL_BORDER);
+    HLine(CY1, CX, CX1, COL_BORDER);
+    VLine(CX, CY, CY1, COL_BORDER);
+    VLine(CX1, CY, CY1, COL_BORDER);
+
+    // Title bar
+    FillRect(CX + 1.f, CY + 1.f, CX1 - 1.f, CY + LH + 6.f,
+        D3DCOLOR_XRGB(10, 40, 70));
+    HLine(CY + LH + 6.f, CX + 1.f, CX1 - 1.f, COL_BORDER);
+    DrawText(CX + PAD, CY + 3.f, "X-VOLT POWER RAILS", 1.2f, COL_CYAN);
+
+    // Source IP right-aligned in title bar
+    if (rd.sourceIP[0])
+    {
+        char src[28];
+        StrCopy(src, sizeof(src), "@ ");
+        StrCat2(src, sizeof(src), src, rd.sourceIP);
+        DrawTextR(CX1 - PAD, CY + 3.f, src, 1.1f, COL_DIM);
+    }
+
+    float y = CY + LH + 12.f;
+
+    if (!fresh)
+    {
+        DrawText(CX + PAD, y, "Waiting for data from X-Volt...", 1.2f, COL_DIM);
+        y += LH * 2.f;
+        DrawText(CX + PAD, y, "Ensure X-Volt is powered and on the same network.", 1.1f, COL_DIM);
+        DrawTextR(CX1 - PAD, CY1 - LH - 4.f, "[WHITE] / [B]  Close", 1.1f, COL_DIM);
+        return;
+    }
+
+    // ── Per-rail rows with bar graphs ────────────────────────────────────────
+    struct RailDef { const char* label; float v; float i; float lo; float hi; float nom; };
+    RailDef rails[3];
+    rails[0].label = "12V    :"; rails[0].v = rd.v12; rails[0].i = rd.i12; rails[0].lo = 11.4f; rails[0].hi = 12.6f; rails[0].nom = 12.0f;
+    rails[1].label = "5V     :"; rails[1].v = rd.v5;  rails[1].i = rd.i5;  rails[1].lo = 4.75f; rails[1].hi = 5.25f; rails[1].nom = 5.0f;
+    rails[2].label = "3.3V   :"; rails[2].v = rd.v33; rails[2].i = rd.i33; rails[2].lo = 3.14f; rails[2].hi = 3.47f; rails[2].nom = 3.3f;
+
+    const float BAR_X = CX + PAD;
+    const float BAR_W = CW - PAD * 2.f;
+    const float BAR_H = 12.f;
+    const float ROW_H = LH + BAR_H + 6.f;
+
+    for (int ri = 0; ri < 3; ++ri)
+    {
+        const RailDef& r = rails[ri];
+        DWORD col = RailColour(r.v, r.lo, r.hi);
+
+        char vs[12], is[12];
+        FmtVolts(r.v, vs, sizeof(vs));
+        FmtMilliAmps(r.i, is, sizeof(is));
+
+        // Label + voltage + current
+        DrawText(CX + PAD, y, r.label, 1.2f, COL_GRAY);
+        DrawText(VX, y, vs, 1.3f, col);
+        {
+            float cx2 = VX + TW(vs, 1.3f) + 10.f;
+            DrawText(cx2, y, is, 1.1f, COL_DIM);
+        }
+        y += LH + 2.f;
+
+        // Bar graph: fill = (v - lo) / (hi - lo), clamped 0..1
+        float span = r.hi - r.lo;
+        float fill = (span > 0.f) ? (r.v - r.lo) / span : 0.f;
+        if (fill < 0.f) fill = 0.f;
+        if (fill > 1.f) fill = 1.f;
+
+        // Track
+        FillRect(BAR_X, y, BAR_X + BAR_W, y + BAR_H,
+            D3DCOLOR_XRGB(20, 24, 48));
+        HLine(y, BAR_X, BAR_X + BAR_W, COL_BORDER);
+        HLine(y + BAR_H, BAR_X, BAR_X + BAR_W, COL_BORDER);
+
+        // Fill
+        float fillW = BAR_W * fill;
+        if (fillW > 1.f)
+            FillRect(BAR_X, y + 1.f, BAR_X + fillW, y + BAR_H - 1.f, col);
+
+        // Nominal marker (centre of expected band)
+        float nomFill = (r.nom - r.lo) / span;
+        float nomX = BAR_X + BAR_W * nomFill;
+        VLine(nomX, y, y + BAR_H, COL_DIM);
+
+        y += BAR_H + 8.f;
+    }
+
+    // Rail fault banner
+    if (rd.railFault)
+    {
+        HLine(y, CX + PAD, CX1 - PAD, D3DCOLOR_XRGB(80, 20, 20));
+        y += 4.f;
+        DrawText(CX + PAD, y, "RAIL FAULT — one or more rails outside expected band", 1.1f, COL_RED);
+        y += LH;
+    }
+
+    DrawTextR(CX1 - PAD, CY1 - LH - 4.f, "[WHITE] / [B]  Close", 1.1f, COL_DIM);
+}
+
 // ============================================================================
 // Render
 // ============================================================================
@@ -1857,31 +2081,39 @@ static void Render(const DiagLogo& logo)
     g_pDevice->BeginScene();
 
     const char* hint;
-    if (s_flashPopupOpen)
+    if (s_xvoltPopupOpen)
+    {
+        // Auto-close overlay if X-Volt goes stale while it's open
+        if (!XVoltUdp_IsDiscovered()) s_xvoltPopupOpen = false;
+        hint = "[WHITE] / [B]  Close X-Volt";
+    }
+    else if (s_flashPopupOpen)
         hint = "[B] Close flash info";
     else if (s_data.biosDumpDone)
         if (s_data.biosDumpOK)
-            hint = "[A] Export  [X] Flash  [Y] BIOS dumped OK  [B] Back";
+            hint = "[A] Export  [X] TSOP Info  [Y] BIOS dumped OK  [B] Back";
         else if (s_data.biosDumpError == 1)
-            hint = "[A] Export  [X] Flash  [Y] FAIL: map err  [B] Back";
+            hint = "[A] Export  [X] TSOP Info  [Y] FAIL: map err  [B] Back";
         else if (s_data.biosDumpError == 2)
         {
             static char s_fileErrHint[64];
-            StrCopy(s_fileErrHint, sizeof(s_fileErrHint), "[A] Export  [X] Flash  [Y] FAIL:file ");
+            StrCopy(s_fileErrHint, sizeof(s_fileErrHint), "[A] Export  [X] TSOP Info  [Y] FAIL:file ");
             char tmp[12]; IntToStr((int)s_data.biosDumpLastErr, tmp, sizeof(tmp));
             StrCat2(s_fileErrHint, sizeof(s_fileErrHint), s_fileErrHint, tmp);
             StrCat2(s_fileErrHint, sizeof(s_fileErrHint), s_fileErrHint, "  [B] Back");
             hint = s_fileErrHint;
         }
         else if (s_data.biosDumpError == 3)
-            hint = "[A] Export  [X] Flash  [Y] FAIL: write err  [B] Back";
+            hint = "[A] Export  [X] TSOP Info  [Y] FAIL: write err  [B] Back";
         else
-            hint = "[A] Export  [X] Flash  [Y] BIOS dump FAIL  [B] Back";
+            hint = "[A] Export  [X] TSOP Info  [Y] BIOS dump FAIL  [B] Back";
     else if (s_data.exportDone)
-        hint = s_data.exportOK ? "[A] Exported OK  [X] Flash  [Y] Dump BIOS  [B] Back"
-        : "[A] Export fail  [X] Flash  [Y] Dump BIOS  [B] Back";
+        hint = s_data.exportOK ? "[A] Exported OK  [X] TSOP Info  [Y] Dump BIOS  [B] Back"
+        : "[A] Export fail  [X] TSOP Info  [Y] Dump BIOS  [B] Back";
+    else if (XVoltUdp_IsDiscovered())
+        hint = "[A] Export  [X] TSOP Info  [Y] Dump BIOS  [WHITE] X-Volt  [B] Back";
     else
-        hint = "[A] Export    [X] Flash    [Y] Dump BIOS    [B] Back";
+        hint = "[A] Export    [X] TSOP Info    [Y] Dump BIOS    [B] Back";
 
     DrawPageChrome(logo, "SYSTEM INFO", hint);
 
@@ -1924,7 +2156,6 @@ static void Render(const DiagLogo& logo)
     // ---- LEFT: Chipset + Revision ----
     DrawSection(C1, y1, RULEW, "CHIPSET / REVISION");           y1 += LH + 4.f;
     DrawRow(C1, y1, V1, "DEVICE :", d.chipDevId, COL_CYAN);    y1 += LH;
-    DrawRow(C1, y1, V1, "BIOS   :", d.biosVer, COL_WHITE);   y1 += LH;
     DrawRow(C1, y1, V1, "SERIAL :", d.serialNum, COL_WHITE);   y1 += LH;
 
     // Revision row — final string in green, raw PIC bytes dimmed alongside
@@ -1974,7 +2205,6 @@ static void Render(const DiagLogo& logo)
     }
     DrawSection(C2, y2, RULEW, "VIDEO");                         y2 += LH + 4.f;
     DrawRow(C2, y2, V2, "ENCODER:", d.encName, COL_CYAN);       y2 += LH;
-    DrawRow(C2, y2, V2, "ENC ID :", d.encId, COL_WHITE);      y2 += LH;
     DrawRow(C2, y2, V2, "AV PACK:", d.avPack, COL_WHITE);      y2 += LH + GAP;
 
     // ---- RIGHT: Thermal ----
@@ -2005,6 +2235,13 @@ static void Render(const DiagLogo& logo)
     DrawRow(C2, y2, V2, "IP     :", d.ipAddr,
         d.ipOK ? COL_GREEN : COL_DIM);
 
+    // ---- RIGHT: X-Volt (only when device discovered on LAN) ----
+    if (XVoltUdp_IsDiscovered())
+    {
+        y2 += LH + GAP;
+        DrawXVoltInline(C2, y2, V2);
+    }
+
     // ---- BOTTOM STRIP: CPU / GPU speed (text only) ----
     {
         const float STRIP_H = 22.f;
@@ -2029,6 +2266,9 @@ static void Render(const DiagLogo& logo)
     if (s_flashPopupOpen)
         DrawFlashPopup();
 
+    if (s_xvoltPopupOpen)
+        DrawXVoltPopup();
+
     g_pDevice->EndScene();
     g_pDevice->Present(NULL, NULL, NULL, NULL);
 }
@@ -2049,6 +2289,18 @@ void SysInfo_Tick(const DiagLogo& logo)
     }
 
     WORD cur = GetButtons();
+
+    if (s_xvoltPopupOpen)
+    {
+        // While X-Volt overlay is open only WHITE or B closes it
+        if (EdgeDown(cur, s_prevBtns, BTN_WHITE) ||
+            EdgeDown(cur, s_prevBtns, BTN_B) ||
+            EdgeDown(cur, s_prevBtns, BTN_BACK))
+            s_xvoltPopupOpen = false;
+        s_prevBtns = cur;
+        Render(logo);
+        return;
+    }
 
     if (s_flashPopupOpen)
     {
@@ -2072,6 +2324,8 @@ void SysInfo_Tick(const DiagLogo& logo)
         s_flashPopupOpen = true;
     if (EdgeDown(cur, s_prevBtns, BTN_Y))
         DumpBios();
+    if (EdgeDown(cur, s_prevBtns, BTN_WHITE) && XVoltUdp_IsDiscovered())
+        s_xvoltPopupOpen = true;
 
     s_prevBtns = cur;
     Render(logo);
@@ -2133,7 +2387,6 @@ bool SysInfo_GetSnapshot(SysSnapshot& out)
         out.serialNum = "";
         out.modchip = "";
         out.hdMod = "";
-        out.biosVer = "";
         out.encName = "";
         out.avPack = "";
         out.tempCPU = "";
@@ -2155,7 +2408,6 @@ bool SysInfo_GetSnapshot(SysSnapshot& out)
     out.serialNum = s_data.serialNum;
     out.modchip = s_data.modchipName;
     out.hdMod = s_data.hdModVer;
-    out.biosVer = s_data.biosVer;
     out.encName = s_data.encName;
     out.avPack = s_data.avPack;
     out.tempCPU = s_data.tempCPU;

@@ -23,11 +23,9 @@
 extern "C" LONG __stdcall ExQueryNonVolatileSetting(
     ULONG ValueIndex, ULONG* Type, void* Value, ULONG ValueLength, ULONG* ResultLength);
 
-// For CerBIOS E: partition mount in CerBiosOwnsLCD()
-typedef struct { USHORT Length; USHORT MaximumLength; char* Buffer; } LCD_XBOX_STRING;
-extern "C" LONG WINAPI IoCreateSymbolicLink(LCD_XBOX_STRING* symLink, LCD_XBOX_STRING* target);
-
 // Forward declarations
+typedef struct { USHORT Length; USHORT MaximumLength; char* Buffer; } XBOX_STRING;
+extern "C" LONG WINAPI IoCreateSymbolicLink(XBOX_STRING* symLink, XBOX_STRING* target);
 static void LCDCmd(BYTE cmd);
 static void LCDGoto(int row, int col);
 static void LCDChar(BYTE data);
@@ -260,16 +258,17 @@ static bool StrEq(const char* a, const char* b)
 
 static bool CerBiosOwnsLCD(BYTE addr7bit)
 {
-    // E: = \Device\Harddisk0\Partition1.  If XbDiag launched from C: or a
-    // modchip, E: may not be mounted yet.  Mount it now — 0xC0000035
-    // (already exists) is fine, any other error means no HDD, return false.
+    // E: may not be mounted yet at LCD_Begin() startup time.
+    // Mount it the same way HddInfo does — 0xC0000035 means already mounted.
     {
-        char linkBuf[] = "\\??\\E:";
-        char devBuf[] = "\\Device\\Harddisk0\\Partition1";
-        LCD_XBOX_STRING sLink = { 6,  7,  linkBuf };
-        LCD_XBOX_STRING sDev = { 28, 29, devBuf };
+        static const char k_lnk[] = "\\??\\E:";
+        static const char k_dev[] = "\\Device\\Harddisk0\\Partition1";
+        int devLen = 0; while (k_dev[devLen]) devLen++;
+        XBOX_STRING sLink = { 6, 7, (char*)k_lnk };
+        XBOX_STRING sDev = { (USHORT)devLen, (USHORT)(devLen + 1), (char*)k_dev };
         LONG r = IoCreateSymbolicLink(&sLink, &sDev);
-        // 0 = mounted fresh, 0xC0000035 = already mounted — both fine
+        // 0 = mounted fresh, 0xC0000035 = already mounted -- both fine
+        // anything else = no HDD accessible, bail
         if (r != 0 && r != (LONG)0xC0000035)
             return false;
     }
@@ -547,26 +546,44 @@ static void DrawPageFTP()
         StrCat2(line, sizeof(line), line, g_ftp.xferName);
         LCDGoto(2, 0); LCDPuts(line, LCD_COLS);
 
-        int pct = 0;
-        if (g_ftp.xferType == XFER_RETR && g_ftp.xferTotal > 0)
-        {
-            pct = (int)(((DWORD)100 * g_ftp.xferDone) / g_ftp.xferTotal);
-            if (pct > 100) pct = 100;
-        }
-        else if (g_ftp.xferType == XFER_STOR)
-            pct = (int)((GetTickCount() / 50) % 101);
-        else pct = 50;
-
         int pos = 0;
         const int BAR_W = 12;
-        int filled = (pct * BAR_W) / 100;
-        line[pos++] = '[';
-        for (int i = 0; i < BAR_W; ++i) line[pos++] = (i < filled) ? '#' : ' ';
-        line[pos++] = ']'; line[pos++] = ' ';
-        char pctBuf[8]; IntToStr(pct, pctBuf, sizeof(pctBuf));
-        int pl = 0; while (pctBuf[pl]) ++pl;
-        while (pl < 3) { line[pos++] = ' '; ++pl; }
-        for (int i = 0; pctBuf[i]; ++i) line[pos++] = pctBuf[i];
+        int filled = 0;
+        bool showPct = false;
+
+        if (g_ftp.xferType == XFER_RETR && g_ftp.xferTotal > 0)
+        {
+            // GET: deterministic fill bar
+            int pct = (int)(((DWORD)100 * g_ftp.xferDone) / g_ftp.xferTotal);
+            if (pct > 100) pct = 100;
+            filled = (pct * BAR_W) / 100;
+            showPct = true;
+
+            line[pos++] = '[';
+            for (int i = 0; i < BAR_W; ++i) line[pos++] = (i < filled) ? '#' : ' ';
+            line[pos++] = ']'; line[pos++] = ' ';
+            char pctBuf[8]; IntToStr(pct, pctBuf, sizeof(pctBuf));
+            int pl = 0; while (pctBuf[pl]) ++pl;
+            while (pl < 3) { line[pos++] = ' '; ++pl; }
+            for (int i = 0; pctBuf[i]; ++i) line[pos++] = pctBuf[i];
+        }
+        else
+        {
+            // PUT / DIR: ping-pong spinner — '>' bounces across the bar
+            DWORD t = GetTickCount() / 120;
+            int cycle = BAR_W * 2 - 2;
+            int phase = (int)(t % (DWORD)cycle);
+            int dotPos = (phase < BAR_W) ? phase : (cycle - phase);
+
+            line[pos++] = '[';
+            for (int i = 0; i < BAR_W; ++i)
+                line[pos++] = (i == dotPos) ? '>' : '-';
+            line[pos++] = ']'; line[pos++] = ' ';
+            // Show transfer type label instead of meaningless pct
+            const char* lbl = (g_ftp.xferType == XFER_STOR) ? "PUT" : "DIR";
+            line[pos++] = lbl[0]; line[pos++] = lbl[1]; line[pos++] = lbl[2];
+        }
+
         line[pos] = '\0';
         LCDGoto(3, 0); LCDPuts(line, LCD_COLS);
     }
@@ -614,7 +631,10 @@ void LCD_Begin()
     // corrupt the display or cause a bus collision.
     // CerBiosOwnsLCD() reads E:\Cerbios\cerbios.ini — if InAppLCDEnable=True
     // on bus 0 at our address, stay off the bus entirely.
-    if (CerBiosOwnsLCD(0x3C))
+    if (CerBiosOwnsLCD((BYTE)(LCD_ADDR >> 1)))
+        return;
+
+    if (CerBiosOwnsLCD((BYTE)(LCD_ADDR >> 1)))
         return;
 
     BYTE dummy = 0;

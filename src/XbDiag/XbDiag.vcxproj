@@ -29,12 +29,15 @@
     <ClCompile Include="HddBench.cpp" />
     <ClCompile Include="HddInfo.cpp" />
     <ClCompile Include="HddSmart.cpp" />
+    <ClCompile Include="HttpCap.cpp" />
+    <ClCompile Include="HttpFiles.cpp" />
     <ClCompile Include="HttpRptSrv.cpp" />
     <ClCompile Include="input.cpp" />
     <ClCompile Include="Keyboard.cpp" />
     <ClCompile Include="Lcd.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="RamTest.cpp" />
+    <ClCompile Include="Screencalib.cpp" />
     <ClCompile Include="SmBusScan.cpp" />
     <ClCompile Include="StressMath.cpp" />
     <ClCompile Include="StressTest.cpp" />
@@ -47,6 +50,7 @@
     <ClCompile Include="VideoInfo.cpp" />
     <ClCompile Include="xba.cpp" />
     <ClCompile Include="XbSet.cpp" />
+    <ClCompile Include="XVoltUDP.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Text Include="Media\Copy Assets Here.txt" />
@@ -71,11 +75,14 @@
     <ClInclude Include="HddInfo.h" />
     <ClInclude Include="HddSmart.h" />
     <ClInclude Include="HddSmartDB.hpp" />
+    <ClInclude Include="HttpCap.h" />
+    <ClInclude Include="HttpFiles.h" />
     <ClInclude Include="HttpRptSrv.h" />
     <ClInclude Include="input.h" />
     <ClInclude Include="Keyboard.h" />
     <ClInclude Include="Lcd.h" />
     <ClInclude Include="RamTest.h" />
+    <ClInclude Include="Screencalib.h" />
     <ClInclude Include="SmBusScan.h" />
     <ClInclude Include="StressMath.h" />
     <ClInclude Include="StressTest.h" />
@@ -88,6 +95,7 @@
     <ClInclude Include="VideoInfo.h" />
     <ClInclude Include="xba.h" />
     <ClInclude Include="XbSet.h" />
+    <ClInclude Include="XVoltUDP.h" />
   </ItemGroup>
   <ItemGroup>
     <Image Include="Media\tex\crystal_cube.dds" />

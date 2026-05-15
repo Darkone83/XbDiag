@@ -38,6 +38,9 @@
 #include "XbSet.h"
 #include "Update.h"
 #include "HttpRptSrv.h"
+#include "XVoltUdp.h"
+#include "ScreenCalib.h"
+#include "HttpCap.h"
 #include "lcd.h"
 
 #include <xtl.h>
@@ -332,6 +335,9 @@ void __cdecl main()
             DrawText(LM, cy, "Press [B] to cancel", 1.2f, COL_DIM);
             g_pDevice->EndScene();
             g_pDevice->Present(NULL, NULL, NULL, NULL);
+            WORD cur2 = GetButtons();
+            LCD_Tick(cur2, g_lcdPrevBtns);
+            g_lcdPrevBtns = cur2;
         }
         if (!cancelled)
             XbSet_AutoRun(g_logo);
@@ -340,8 +346,13 @@ void __cdecl main()
     // ---- Boot-time update check ----------------------------------------
     // Kick off the background version check immediately after autorun.
     // The result is polled below before entering the main game loop.
+    ScreenCalib_Init(g_logo);
+    if (ScreenCalib_NeedsRun())
+        ScreenCalib_Run(g_logo);
+
     Update_StartBootCheck();
     HttpRptSrv_Start();
+    HttpCap_Init();
 
     // Poll the update check while rendering a holding frame.
     // The check is fast (DNS + one TCP round trip) but non-blocking,
@@ -358,12 +369,20 @@ void __cdecl main()
             DrawPageChrome(g_logo, "XbDiag", "Checking for updates...");
             g_pDevice->EndScene();
             g_pDevice->Present(NULL, NULL, NULL, NULL);
+            WORD cur3 = GetButtons();
+            LCD_Tick(cur3, g_lcdPrevBtns);
+            g_lcdPrevBtns = cur3;
         }
     }
 
     // Initial state — jump straight to Update screen if a newer version was found
     g_state = Update_BootFoundUpdate() ? STATE_UPDATE : STATE_MENU;
     g_prevState = STATE_MENU;
+
+    // Network is confirmed up — start X-Volt discovery now.
+    // Starting here rather than before the update loop ensures XNetGetTitleXnAddr
+    // has resolved and the stack is ready to receive UDP broadcasts from the LAN.
+    XVoltUdp_Start();
 
     // Notify the menu it's the first entry
     DiagMenu_OnEnter();
@@ -444,6 +463,8 @@ void __cdecl main()
         // ensures the listen socket accepts connections and keepalive NOOPs
         // are serviced even when the user has navigated away from FileExplorer.
         FtpServ_Tick();
+        HttpCap_CaptureFrame();
         HttpRptSrv_Poll();
+        XVoltUdp_Poll();
     }
 }

@@ -26,6 +26,7 @@ struct HddData
     bool  lba48supported;
     bool  isLocked;
     bool  securitySupported;
+    bool  secEnabled;          // security feature enabled (bit 1 of word 128)
     bool  isSSD;
     char  rpmStr[12];
     char  ataVersion[8];
@@ -48,6 +49,8 @@ struct HddData
         char   totalStr[12];
         char   freeStr[12];
         float  freeRatio;
+        int    clusterKB;   // cluster size in KB (0 = unknown)
+        bool   clusterOK;   // false if undersized for partition total
     } parts[4];
 
     // Export

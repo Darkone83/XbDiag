@@ -126,6 +126,18 @@
     <ClCompile Include="HttpRptSrv.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="XVoltUDP.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Screencalib.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="HttpFiles.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="HttpCap.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Text Include="Media\Copy Assets Here.txt">
@@ -239,6 +251,18 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="HddSmartDB.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="XVoltUDP.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Screencalib.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="HttpFiles.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="HttpCap.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
