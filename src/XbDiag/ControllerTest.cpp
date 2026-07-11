@@ -76,7 +76,10 @@ static bool s_rumbleSkip = false;  // skip first tick on rumble entry — flush 
 // Four sub-tests cycled with LEFT/RIGHT dpad:
 //   0 = Dead-zone   — raw XY + dead-zone radius ring visualised on stick plot
 //   1 = Circularity — traces stick path, shows gate shape vs ideal circle
-//   2 = Drift       — samples at-rest position, reports average XY offset
+//   2 = Drift       — samples at-rest position, reports average XY offset.
+//                     DPAD UP/DOWN set a warn gate (0-20%); [X] resets samples,
+//                     [Y] captures the gate from the current drift so a known-
+//                     good pad sets the bar and suspect pads test against it
 //   3 = Triggers    — large trigger bars with dead-zone band + min/max tracking
 // ============================================================================
 static bool s_stickMode = false;
@@ -106,6 +109,20 @@ static int  s_driftAvgRX = 0, s_driftAvgRY = 0;
 // Xbox ADC has 2-4% noise at rest (~655-1310 counts) — clamp covers that floor.
 static const int ADC_JITTER = 655;  // 2% of 32767 — nulls expected ADC noise
 static const int BASELINE_FRAMES = 10;  // frames to average for the baseline
+
+// Drift warn gate (test 2). The pass/fail threshold is normally a FIXED 4%
+// (DRIFT_WARN_FIXED). This lets the user override it with a configurable gate,
+// 0-20% of full scale, to kill false positives: set the bar from a known-good
+// controller, then test a new or suspect one against the same number. 0 = off
+// (use the fixed 4% default, nothing changes).
+//   DPAD UP / DOWN : nudge the gate +/- 1%
+//   [Y]            : capture the gate from the CURRENT measured drift + margin
+static const int DRIFT_WARN_FIXED = 1310;   // 4% of 32767 — the standard default
+static const int DRIFT_GATE_MAX = 6553;   // 20% of 32767 — small ceiling
+static const int DRIFT_GATE_STEP = 328;    // ~1% of 32767 per DPAD press
+static const int DRIFT_GATE_MARGIN = 655;    // 2% headroom over measured drift
+static int  s_driftGate = 0;                // 0 = off (use DRIFT_WARN_FIXED)
+static bool s_driftGateFromCap = false;     // true once [Y] captured it
 static int  s_driftBaselineLX = 0, s_driftBaselineLY = 0;
 static int  s_driftBaselineRX = 0, s_driftBaselineRY = 0;
 static int  s_driftBaselineCount = 0;   // 0 = not yet captured
@@ -255,6 +272,7 @@ void ControllerTest_OnEnter()
     s_driftHead = 0; s_driftCount = 0; s_driftWarmup = 60; s_driftBaselineCount = 0; s_driftBaselineAccLX = 0; s_driftBaselineAccLY = 0; s_driftBaselineAccRX = 0; s_driftBaselineAccRY = 0;
     s_driftAvgLX = 0; s_driftAvgLY = 0;
     s_driftAvgRX = 0; s_driftAvgRY = 0; s_driftBaselineLX = 0; s_driftBaselineLY = 0; s_driftBaselineRX = 0; s_driftBaselineRY = 0;
+    s_driftGate = 0; s_driftGateFromCap = false;
     for (int p = 0; p < 4; ++p)
     {
         s_wasConn[p] = IsPortConnected(p);
@@ -884,10 +902,10 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
         }
 
         const float PR = 70.f;
-        // DRIFT_WARN: 4% of 32767 = ~1310. ADC noise floor is 2-4% so we warn
-        // only above that — genuine hardware drift on worn sticks typically
-        // starts at 5-15% and causes visible input creep in games.
-        const int DRIFT_WARN = 1310;
+        // DRIFT_WARN: normally 4% of 32767 = ~1310 (ADC noise floor is 2-4%, so
+        // we warn only above that; real stick wear starts ~5-15% and causes
+        // visible in-game creep). When the user gate is set it overrides this.
+        const int DRIFT_WARN = (s_driftGate > 0) ? s_driftGate : DRIFT_WARN_FIXED;
 
         // Helper: format axis value + percentage for display
         // e.g. "1234 (3.8%)"
@@ -984,8 +1002,31 @@ static void RenderStickTest(const DiagLogo& logo, int lx, int ly, int rx, int ry
 
         DrawText(X_MID - TW("Release both sticks and hold still", 1.05f) * 0.5f,
             contentY + 272.f, "Release both sticks and hold still", 1.05f, COL_DIM);
-        DrawText(X_MID - TW("[X] Reset samples", 1.05f) * 0.5f,
-            contentY + 286.f, "[X] Reset samples", 1.05f, COL_DIM);
+
+        // Warn-gate readout: value + source. DRIFT_WARN is in raw counts; show it
+        // as a percentage of full scale (32767) with one decimal.
+        {
+            int gc = DRIFT_WARN;
+            int gp100 = gc * 1000 / 32767;    // tenths of a percent
+            int gpI = gp100 / 10, gpD = gp100 % 10;
+            char gi[6], gd[4];
+            IntToStr(gpI, gi, sizeof(gi));
+            IntToStr(gpD, gd, sizeof(gd));
+            char gate[40];
+            StrCopy(gate, sizeof(gate), "WARN GATE ");
+            StrCat2(gate, sizeof(gate), gate, gi);
+            StrCat2(gate, sizeof(gate), gate, ".");
+            StrCat2(gate, sizeof(gate), gate, gd);
+            if (s_driftGate > 0)
+                StrCat2(gate, sizeof(gate), gate,
+                    s_driftGateFromCap ? "%  (captured)" : "%  (manual)");
+            else
+                StrCat2(gate, sizeof(gate), gate, "%  (fixed default)");
+            DWORD gcol = (s_driftGate > 0) ? COL_CYAN : COL_DIM;
+            DrawText(X_MID - TW(gate, 1.05f) * 0.5f, contentY + 286.f, gate, 1.05f, gcol);
+        }
+        DrawText(X_MID - TW("[X] reset   DPAD U/D gate   [Y] gate from drift", 1.0f) * 0.5f,
+            contentY + 300.f, "[X] reset   DPAD U/D gate   [Y] gate from drift", 1.0f, COL_DIM);
     }
 
     else if (s_stickTest == 3)
@@ -1561,6 +1602,42 @@ void ControllerTest_Tick(const DiagLogo& logo)
             s_stickTest = (s_stickTest + 1) % 5;
         if (Edge(cur, s_prev, BTN_DPAD_LEFT))
             s_stickTest = (s_stickTest + 4) % 5;
+
+        // Drift warn gate: DPAD UP/DOWN nudge it 1% (test 2 only). Guard on START
+        // not held so it never eats the START+DPAD_UP that enters this card.
+        if (s_stickTest == 2 && !(cur & BTN_START))
+        {
+            if (Edge(cur, s_prev, BTN_DPAD_UP))
+            {
+                s_driftGate += DRIFT_GATE_STEP;
+                if (s_driftGate > DRIFT_GATE_MAX) s_driftGate = DRIFT_GATE_MAX;
+                s_driftGateFromCap = false;   // manual override supersedes a capture
+            }
+            if (Edge(cur, s_prev, BTN_DPAD_DOWN))
+            {
+                s_driftGate -= DRIFT_GATE_STEP;
+                if (s_driftGate < 0) s_driftGate = 0;
+                s_driftGateFromCap = false;
+            }
+        }
+
+        // [Y] on the drift test: capture the gate from the CURRENT measured drift.
+        // Takes the worse stick's average drift magnitude, adds a margin, clamps
+        // to the 0-20% window. Run it with a known-good pad to park the bar just
+        // above that pad's real drift; a worse pad then trips the gate only when
+        // it genuinely exceeds the good one.
+        if (Edge(cur, s_prev, BTN_Y) && s_stickTest == 2)
+        {
+            int magL = ISqrt(s_driftAvgLX * s_driftAvgLX + s_driftAvgLY * s_driftAvgLY);
+            int magR = ISqrt(s_driftAvgRX * s_driftAvgRX + s_driftAvgRY * s_driftAvgRY);
+            int worst = (magL > magR) ? magL : magR;
+            int g = worst + DRIFT_GATE_MARGIN;
+            if (g < 0) g = 0;
+            if (g > DRIFT_GATE_MAX) g = DRIFT_GATE_MAX;
+            s_driftGate = g;
+            s_driftGateFromCap = true;
+        }
+
         if (Edge(cur, s_prev, BTN_X))
         {
             if (s_stickTest == 1)

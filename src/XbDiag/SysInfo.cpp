@@ -571,11 +571,23 @@ static void DetectBoardRevision(SysData& d, BYTE nvRev)
 //   Xtremium  0x00C  low nibble 1-10  (XTREMIUM_REGISTER_BANKING; distinct from Xenium)
 //   Xenium    0x00EF low nibble 1-10  (XENIUM_REGISTER_BANKING; also Smartxx fallback,
 //                                      but Smartxx caught above via 0xF701)
+//   EOS       same 0x00EF banking as Xenium, PLUS 0x00EE == 0x55 (Darkone tag).
+//             Detected as a REFINEMENT of the Xenium branch -- see note below.
 //
 // Xenium/Xtremium/Smartxx were commented out of PrometheOS's detectModchip()
 // because PrometheOS defaults to Xenium (it knows it launched from one).
 // XbDiag cannot default — we use safe read-only bank-register probes instead.
 // On an unmodded LPC bus, floating pulls return 0xFF; valid bank IDs are 0x01-0x0A.
+//
+// EOS vs Xenium — both bank at 0x00EF, told apart by 0x00EE:
+//   EOS (Team Resurgent / Darkone) is a clean-room chip that implements the
+//   Xenium banking convention on purpose, so the 0x00EF probe matches it exactly
+//   as it matches a real Xenium -- banking alone cannot separate them.
+//   EOS additionally decodes I/O 0x00EE and returns a FIXED 0x55 on read (a
+//   Darkone signature byte; unconditional, read-only, no side effects). A real
+//   Xenium's 0x00EE is a 2-bit LED/control field (reads 0x00-0x03), so it can
+//   never read back 0x55. When the 0x00EF banking probe matches, we read 0x00EE
+//   once more: 0x55 means EOS, anything else means Xenium.
 // ============================================================================
 
 static const char* DetectModchip()
@@ -625,7 +637,7 @@ static const char* DetectModchip()
         if (bank >= 1 && bank <= 10) return "Xtremium";
     }
 
-    // ---- Xenium: XENIUM_REGISTER_BANKING = 0x00EF ----
+    // ---- Xenium / EOS: XENIUM_REGISTER_BANKING = 0x00EF ----
     // Same low-nibble bank encoding (1-10).
     // If we reach here Smartxx is already excluded (caught via 0xF701 above).
     __asm { mov dx, 0x00EF }
@@ -633,7 +645,17 @@ static const char* DetectModchip()
     __asm { mov val, al    }
     {
         BYTE bank = val & 0x0F;
-        if (bank >= 1 && bank <= 10) return "Xenium";
+        if (bank >= 1 && bank <= 10)
+        {
+            // Banking matched -- Xenium OR EOS. Read 0x00EE to tell them apart:
+            // EOS returns a fixed 0x55 there, a Xenium does not.
+            BYTE tag = 0;
+            __asm { mov dx, 0x00EE }
+            __asm { in  al, dx     }
+            __asm { mov tag, al    }
+            if (tag == 0x55) return "EOS";
+            return "Xenium";
+        }
     }
 
     // No known signature matched — TSOP or softmod boot

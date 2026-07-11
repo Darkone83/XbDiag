@@ -113,6 +113,7 @@ struct KnownDevice
 // 0x69 = ICS clock  (sw 0xD2)  -- also X-HD HDMI adapter (Ryzee119/XboxHDMI) when installed
 //        X-HD replaces ICS clock on SMBus; cmd 5 reads mode (1=bootloader 2=application)
 // 0x6A = Focus FS454 video encoder  (sw 0xD4)
+// 0x6E = EOS modchip (Team Resurgent / Darkone)  (sw 0xDC)
 // 0x70 = Xcalibur video encoder  (sw 0xE0)
 static const KnownDevice s_known[] =
 {
@@ -150,6 +151,11 @@ static const KnownDevice s_known[] =
         0x70, "XCALIBUR",
         "Xcalibur integrated video encoder  (1.6, 1.6b)",
         "Reg 0x00=chip ID  0x6E=misc control  (Conexant-derived)"
+    },
+    {
+        0x6E, "EOS",
+        "EOS LPC BIOS-loader modchip  (Team Resurgent / Darkone)",
+        "Reg 0x00=magic(0xD8)  0x01-03=ver  0x04=status  0x05=engine  0x0B-0C=lock"
     },
     {
         0x68, "X-RTC",
@@ -247,6 +253,25 @@ static const RegDesc s_regs_oled[] =
 {
     { 0x00, "CMD REG " },
 };
+// EOS modchip register map -- labels verbatim from eos_i2c.v readmux().
+// All read-only; SMBusRead writes the reg index then reads one byte, which is
+// exactly the EOS per-transaction model (first write byte selects the register).
+// The detail panel shows at most MAX_DETAIL_ROWS (8) registers, so this lists
+// the 8 most useful for a passive scan: identity + live state. The CRC result
+// (0x07-0x0A) and last-command echo (0x10) are update-flow internals and are
+// intentionally omitted here -- they mean nothing outside an active update.
+static const RegDesc s_regs_eos[] =
+{
+    { 0x00, "MAGIC   " },   // 0xD8 Darkone signature
+    { 0x01, "VER MAJ " },   // firmware major
+    { 0x02, "VER MIN " },   // firmware minor
+    { 0x03, "VER PAT " },   // firmware patch
+    { 0x04, "STATUS  " },   // b0 preload_done b1 mode16 b2 d0_active b3 abort b4 slot1_ready
+    { 0x05, "ENGINE  " },   // b0 armed b1 staged b2 crc_set b3 busy b4 err b5 commit_ok
+    { 0x0B, "LOCK LO " },   // lock-mask low byte  (default 0x02)
+    { 0x0C, "LOCK HI " },   // lock-mask high byte (default 0x04)
+};
+
 static const RegDesc s_regs_generic[] =
 {
     { 0x00, "REG 0x00" },
@@ -268,6 +293,7 @@ static const DeviceRegs s_devRegs[] =
     { 0x68, s_regs_rtc,    4 },   // X-RTC DS1307
     { 0x3C, s_regs_oled,   1 },   // OLED 0x3C
     { 0x3D, s_regs_oled,   1 },   // OLED 0x3D
+    { 0x6E, s_regs_eos,    8 },   // EOS modchip -- magic, version, status, engine, lock
 };
 static const int s_devRegsCount = sizeof(s_devRegs) / sizeof(s_devRegs[0]);
 
